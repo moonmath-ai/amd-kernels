@@ -1,3 +1,6 @@
 *.so
 *.o
 *.out
+rocprof_out/
+.rocprofv3/
+.rocprof_app_*.sh
