@@ -91,4 +91,10 @@ def run(batch=2, heads=24, seq_len=8192, head_dim=128):
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--warmup-iters", type=int, default=0)
+    args = ap.parse_args()
+    for _ in range(args.warmup_iters):
+        run()
     run()
