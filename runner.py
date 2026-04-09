@@ -40,9 +40,9 @@ def run(batch=2, heads=24, seq_len=8192, head_dim=128):
 
     rng = np.random.default_rng(42)
     shape = (batch, heads, seq_len, head_dim)
-    Q = rng.standard_normal(shape).astype(np.float32)
-    K = rng.standard_normal(shape).astype(np.float32)
-    V = rng.standard_normal(shape).astype(np.float32)
+    Q = rng.standard_normal(shape).astype(np.float16)
+    K = rng.standard_normal(shape).astype(np.float16)
+    V = rng.standard_normal(shape).astype(np.float16)
     Out = np.zeros(shape, dtype=np.float32)
 
     try:
@@ -61,19 +61,19 @@ def run(batch=2, heads=24, seq_len=8192, head_dim=128):
 
     HIP_MEMCPY_H2D = 1
     HIP_MEMCPY_D2H = 2
-    nbytes = Q.nbytes
+    out_nbytes = Out.nbytes
 
     def hip_alloc(host_arr):
         ptr = ctypes.c_void_p()
-        assert hip.hipMalloc(ctypes.byref(ptr), nbytes) == 0
-        assert hip.hipMemcpy(ptr, host_arr.ctypes.data, nbytes, HIP_MEMCPY_H2D) == 0
+        assert hip.hipMalloc(ctypes.byref(ptr), host_arr.nbytes) == 0
+        assert hip.hipMemcpy(ptr, host_arr.ctypes.data, host_arr.nbytes, HIP_MEMCPY_H2D) == 0
         return ptr
 
     d_Q = hip_alloc(Q)
     d_K = hip_alloc(K)
     d_V = hip_alloc(V)
     d_Out = ctypes.c_void_p()
-    assert hip.hipMalloc(ctypes.byref(d_Out), nbytes) == 0
+    assert hip.hipMalloc(ctypes.byref(d_Out), out_nbytes) == 0
 
     err = lib.launch_attention_forward(
         d_Q, d_K, d_V, d_Out,
@@ -83,7 +83,7 @@ def run(batch=2, heads=24, seq_len=8192, head_dim=128):
     assert err == 0, f"Kernel launch failed with error {err}"
     hip.hipDeviceSynchronize()
 
-    assert hip.hipMemcpy(Out.ctypes.data, d_Out, nbytes, HIP_MEMCPY_D2H) == 0
+    assert hip.hipMemcpy(Out.ctypes.data, d_Out, out_nbytes, HIP_MEMCPY_D2H) == 0
     print(f"Done. Output shape: {Out.shape}")
 
     for ptr in [d_Q, d_K, d_V, d_Out]:
@@ -93,8 +93,12 @@ def run(batch=2, heads=24, seq_len=8192, head_dim=128):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--heads", type=int, default=24)
+    ap.add_argument("--seq-len", type=int, default=8192)
+    ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--warmup-iters", type=int, default=0)
     args = ap.parse_args()
     for _ in range(args.warmup_iters):
-        run()
-    run()
+        run(args.batch, args.heads, args.seq_len, args.head_dim)
+    run(args.batch, args.heads, args.seq_len, args.head_dim)

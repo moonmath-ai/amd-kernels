@@ -1,183 +1,277 @@
-#include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
 #include <cmath>
-#include <cstdio>
 
-#define TILE_SIZE 16
+namespace {
 
-// Tiled scaled dot-product attention kernel.
-// Each block handles one (batch*heads, query_tile_n) where query_tile_n has TILE_SIZE rows.
-// Q, K, V: [batch, heads, seq_len, head_dim]
-// Out:     [batch, heads, seq_len, head_dim]
-__global__ void attention_forward(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
+using fp16_t = _Float16;
+using fp16x4_t = __attribute__((vector_size(4 * sizeof(fp16_t)))) fp16_t;
+using fp32x4_t = __attribute__((vector_size(4 * sizeof(float)))) float;
+
+constexpr int kWaveSize = 64;
+constexpr int kSeqTile = 16;
+constexpr int kKTile = 16;
+constexpr int kMaxHeadDim = 128;
+constexpr int kMaxHeadTiles = kMaxHeadDim / kKTile;
+constexpr float kLog2e = 1.4426950408889634f;
+
+__device__ __forceinline__ fp16x4_t zero_f16x4() {
+    return fp16x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+}
+
+__device__ __forceinline__ fp32x4_t zero_f32x4() {
+    return fp32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+}
+
+__device__ __forceinline__ float wave_reduce_max_16(float x) {
+    x = fmaxf(x, __shfl_xor(x, 8, 16));
+    x = fmaxf(x, __shfl_xor(x, 4, 16));
+    x = fmaxf(x, __shfl_xor(x, 2, 16));
+    x = fmaxf(x, __shfl_xor(x, 1, 16));
+    return x;
+}
+
+__device__ __forceinline__ float wave_reduce_sum_16(float x) {
+    x += __shfl_xor(x, 8, 16);
+    x += __shfl_xor(x, 4, 16);
+    x += __shfl_xor(x, 2, 16);
+    x += __shfl_xor(x, 1, 16);
+    return x;
+}
+
+__device__ __forceinline__ fp32x4_t mfma16x16x16(fp16x4_t a, fp16x4_t b, fp32x4_t c) {
+    return __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
+}
+
+__device__ __forceinline__ fp16x4_t load_contiguous4(
+    const fp16_t* base,
+    int row,
+    int col,
+    int head_dim,
+    bool row_valid
+) {
+    if (!row_valid || col + 3 >= head_dim) {
+        fp16x4_t frag = zero_f16x4();
+        if (!row_valid || col >= head_dim) {
+            return frag;
+        }
+        const fp16_t* src = base + row * head_dim + col;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (col + i < head_dim) {
+                frag[i] = src[i];
+            }
+        }
+        return frag;
+    }
+
+    const fp16_t* src = base + row * head_dim + col;
+    return *reinterpret_cast<const fp16x4_t*>(src);
+}
+
+__device__ __forceinline__ fp16x4_t load_v_fragment(
+    const fp16_t* base,
+    int key_base,
+    int dim,
+    int row_group,
+    int seq_len,
+    int head_dim
+) {
+    fp16x4_t frag = zero_f16x4();
+    if (dim >= head_dim) {
+        return frag;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int key = key_base + 4 * row_group + i;
+        if (key < seq_len) {
+            frag[i] = base[key * head_dim + dim];
+        }
+    }
+    return frag;
+}
+
+__global__ __launch_bounds__(kWaveSize) void attention_forward(
+    const fp16_t* __restrict__ Q,
+    const fp16_t* __restrict__ K,
+    const fp16_t* __restrict__ V,
     float* __restrict__ Out,
     int seq_len,
     int head_dim,
-    float scale
+    float scale_log2e
 ) {
-    int bh = blockIdx.y;
-    int kv_local = threadIdx.x;
-    int q_local = threadIdx.y;
-    int q_tile_n = blockIdx.x;
-    int q_row = q_tile_n * TILE_SIZE + q_local;
-    int offset = bh * seq_len * head_dim;
-    bool q_valid = (q_row < seq_len);
+    // For 16x16x16 MFMA, lane_col selects the 16-way row/column coordinate and
+    // lane_group selects the 4-element fragment within that coordinate.
+    const int lane = threadIdx.x;
+    const int lane_col = lane & 15;
+    const int lane_group = lane >> 4;
+    const int bh = blockIdx.y;
+    const int q_tile = blockIdx.x;
+    const int head_tiles = head_dim / kKTile;
+    const int q_tile_base = q_tile * kSeqTile;
+    const int q_load_row = q_tile_base + lane_col;
+    const int out_row_base = q_tile_base + 4 * lane_group;
 
-    // log2(e) lets us use exp2 for softmax while preserving exp semantics.
-    float scale_log2e = scale * 1.4426950408889634f;
+    const fp16_t* q_slice = Q + static_cast<long long>(bh) * seq_len * head_dim;
+    const fp16_t* k_slice = K + static_cast<long long>(bh) * seq_len * head_dim;
+    const fp16_t* v_slice = V + static_cast<long long>(bh) * seq_len * head_dim;
+    float* out_slice = Out + static_cast<long long>(bh) * seq_len * head_dim;
 
-    __shared__ float q_sub[TILE_SIZE][TILE_SIZE];
-    __shared__ float k_sub[TILE_SIZE][TILE_SIZE];
-    __shared__ float v_sub[TILE_SIZE][TILE_SIZE];
-    __shared__ float score_sub[TILE_SIZE][TILE_SIZE];
-    __shared__ float prob_sub[TILE_SIZE][TILE_SIZE];
-    __shared__ float row_m[TILE_SIZE];
-    __shared__ float row_l[TILE_SIZE];
-    __shared__ float row_beta[TILE_SIZE];
-    __shared__ float row_m_new[TILE_SIZE];
+    fp16x4_t q_regs[kMaxHeadTiles];
+    fp32x4_t o_regs[kMaxHeadTiles];
+    float row_max[4];
+    float row_sum[4];
 
-    if (q_valid) {
-        for (int d = kv_local; d < head_dim; d += TILE_SIZE) {
-            int out_idx = offset + q_row * head_dim + d;
-            Out[out_idx] = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < kMaxHeadTiles; ++t) {
+        q_regs[t] = zero_f16x4();
+        o_regs[t] = zero_f32x4();
+        if (t < head_tiles) {
+            q_regs[t] = load_contiguous4(
+                q_slice,
+                q_load_row,
+                t * kKTile + 4 * lane_group,
+                head_dim,
+                q_load_row < seq_len
+            );
         }
     }
-    if (kv_local == 0) {
-        row_m[q_local] = -INFINITY;
-        row_l[q_local] = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        row_max[i] = -INFINITY;
+        row_sum[i] = 0.0f;
     }
-    __syncthreads();
 
-    int m_tiles = (seq_len + TILE_SIZE - 1) / TILE_SIZE;
+    __shared__ fp16_t prob_tile[kSeqTile][kSeqTile];
 
+    const int m_tiles = (seq_len + kSeqTile - 1) / kSeqTile;
     for (int m = 0; m < m_tiles; ++m) {
-        float score = 0.0f;
-        for (int k_tile = 0; k_tile < head_dim; k_tile += TILE_SIZE) {
-            int d = k_tile + kv_local;
-            int q_idx = offset + q_row * head_dim + d;
-            int kv_load = m * TILE_SIZE + q_local;
-            int k_idx = offset + kv_load * head_dim + d;
+        const int key_col = m * kSeqTile + lane_col;
 
-            if (q_valid && d < head_dim) {
-                q_sub[q_local][kv_local] = Q[q_idx];
-            } else {
-                q_sub[q_local][kv_local] = 0.0f;
-            }
-            if (kv_load < seq_len && d < head_dim) {
-                k_sub[q_local][kv_local] = K[k_idx];
-            } else {
-                k_sub[q_local][kv_local] = 0.0f;
-            }
-            __syncthreads();
-
-            #pragma unroll
-            for (int d_local = 0; d_local < TILE_SIZE; ++d_local) {
-                score += q_sub[q_local][d_local] * k_sub[kv_local][d_local];
-            }
-            __syncthreads();
-        }
-
-        int kv = m * TILE_SIZE + kv_local;
-        float scaled = q_valid && kv < seq_len ? (score * scale_log2e) : -INFINITY;
-        score_sub[q_local][kv_local] = scaled;
-        __syncthreads();
-
-        if (kv_local == 0) {
-            if (!q_valid) {
-                row_m_new[q_local] = 0.0f;
-                row_beta[q_local] = 0.0f;
-                row_m[q_local] = 0.0f;
-                row_l[q_local] = 0.0f;
-            } else {
-                float tile_max = -INFINITY;
-                for (int j = 0; j < TILE_SIZE; ++j) {
-                    tile_max = fmaxf(tile_max, score_sub[q_local][j]);
-                }
-                float prev_m = row_m[q_local];
-                float new_m = fmaxf(prev_m, tile_max);
-                float beta = 0.0f;
-                if (isfinite(prev_m) && isfinite(new_m)) {
-                    beta = exp2f(prev_m - new_m);
-                }
-                row_m_new[q_local] = new_m;
-                row_beta[q_local] = beta;
+        fp32x4_t scores = zero_f32x4();
+        #pragma unroll
+        for (int t = 0; t < kMaxHeadTiles; ++t) {
+            if (t < head_tiles) {
+                fp16x4_t k_reg = load_contiguous4(
+                    k_slice,
+                    key_col,
+                    t * kKTile + 4 * lane_group,
+                    head_dim,
+                    key_col < seq_len
+                );
+                scores = mfma16x16x16(q_regs[t], k_reg, scores);
             }
         }
-        __syncthreads();
 
-        float p = 0.0f;
-        if (q_valid && kv < seq_len) {
-            p = exp2f(score_sub[q_local][kv_local] - row_m_new[q_local]);
+        float alpha[4];
+        float prob[4];
+        fp16x4_t prob_half = zero_f16x4();
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = out_row_base + i;
+            const bool row_valid = row < seq_len;
+            const bool score_valid = row_valid && key_col < seq_len;
+            const float score = score_valid ? scores[i] * scale_log2e : -INFINITY;
+            const float tile_max = wave_reduce_max_16(score);
+            const float next_max = row_valid ? fmaxf(row_max[i], tile_max) : 0.0f;
+            const float prev_scale = row_sum[i] > 0.0f ? exp2f(row_max[i] - next_max) : 0.0f;
+            const float p = score_valid ? exp2f(score - next_max) : 0.0f;
+            const float tile_sum = wave_reduce_sum_16(p);
+
+            alpha[i] = prev_scale;
+            prob[i] = p;
+            prob_half[i] = static_cast<fp16_t>(p);
+            row_max[i] = next_max;
+            row_sum[i] = row_valid ? row_sum[i] * prev_scale + tile_sum : 0.0f;
+            prob_tile[4 * lane_group + i][lane_col] = prob_half[i];
         }
-        prob_sub[q_local][kv_local] = p;
+
         __syncthreads();
 
-        if (kv_local == 0 && q_valid) {
-            float tile_sum = 0.0f;
-            for (int j = 0; j < TILE_SIZE; ++j) {
-                tile_sum += prob_sub[q_local][j];
-            }
-            row_l[q_local] = row_l[q_local] * row_beta[q_local] + tile_sum;
-            row_m[q_local] = row_m_new[q_local];
-        }
-        __syncthreads();
+        // Softmax probabilities come out in MFMA accumulator layout, so stage
+        // them once in LDS and reload them in MFMA-A layout for the PV step.
+        fp16x4_t p_reg =
+            *reinterpret_cast<const fp16x4_t*>(&prob_tile[lane_col][4 * lane_group]);
 
-        for (int d_tile = 0; d_tile < head_dim; d_tile += TILE_SIZE) {
-            int d = d_tile + kv_local;
-            int kv_load = m * TILE_SIZE + q_local;
-            int v_idx = offset + kv_load * head_dim + d;
-
-            if (kv_load < seq_len && d < head_dim) {
-                v_sub[q_local][kv_local] = V[v_idx];
-            } else {
-                v_sub[q_local][kv_local] = 0.0f;
-            }
-            __syncthreads();
-
-            if (q_valid && d < head_dim) {
-                float acc = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < kMaxHeadTiles; ++t) {
+            if (t < head_tiles) {
                 #pragma unroll
-                for (int j = 0; j < TILE_SIZE; ++j) {
-                    acc += prob_sub[q_local][j] * v_sub[j][kv_local];
+                for (int i = 0; i < 4; ++i) {
+                    o_regs[t][i] *= alpha[i];
                 }
-                int out_idx = offset + q_row * head_dim + d;
-                Out[out_idx] = Out[out_idx] * row_beta[q_local] + acc;
+
+                fp16x4_t v_reg = load_v_fragment(
+                    v_slice,
+                    m * kSeqTile,
+                    t * kKTile + lane_col,
+                    lane_group,
+                    seq_len,
+                    head_dim
+                );
+                o_regs[t] = mfma16x16x16(p_reg, v_reg, o_regs[t]);
             }
-            __syncthreads();
         }
+
+        __syncthreads();
     }
 
-    if (q_valid) {
-        float inv_l = 1.0f / fmaxf(row_l[q_local], 1e-20f);
-        for (int d = kv_local; d < head_dim; d += TILE_SIZE) {
-            int out_idx = offset + q_row * head_dim + d;
-            Out[out_idx] *= inv_l;
+    #pragma unroll
+    for (int t = 0; t < kMaxHeadTiles; ++t) {
+        if (t >= head_tiles) {
+            continue;
+        }
+
+        const int dim = t * kKTile + lane_col;
+        if (dim >= head_dim) {
+            continue;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = out_row_base + i;
+            if (row < seq_len) {
+                const float denom = row_sum[i] > 0.0f ? row_sum[i] : 1.0f;
+                out_slice[row * head_dim + dim] = o_regs[t][i] / denom;
+            }
         }
     }
 }
 
-// C interface for Python ctypes
+}  // namespace
+
 extern "C" {
 
 hipError_t launch_attention_forward(
-    const float* Q, const float* K, const float* V, float* Out,
-    int batch, int heads, int seq_len, int head_dim,
+    const fp16_t* Q,
+    const fp16_t* K,
+    const fp16_t* V,
+    float* Out,
+    int batch,
+    int heads,
+    int seq_len,
+    int head_dim,
     hipStream_t stream
 ) {
-    float scale = 1.0f / sqrtf((float)head_dim);
-    int bh = batch * heads;
-    int q_tiles = (seq_len + TILE_SIZE - 1) / TILE_SIZE;
+    if (seq_len <= 0 || head_dim <= 0 || head_dim > kMaxHeadDim || (head_dim % kKTile) != 0) {
+        return hipErrorInvalidValue;
+    }
+
+    const float scale_log2e = kLog2e / sqrtf(static_cast<float>(head_dim));
+    const int bh = batch * heads;
+    const int q_tiles = (seq_len + kSeqTile - 1) / kSeqTile;
 
     dim3 grid(q_tiles, bh);
-    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 block(kWaveSize);
 
     hipLaunchKernelGGL(
         attention_forward,
         grid, block, 0, stream,
-        Q, K, V, Out, seq_len, head_dim, scale
+        Q, K, V, Out, seq_len, head_dim, scale_log2e
     );
 
     return hipGetLastError();
