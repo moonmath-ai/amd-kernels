@@ -2,7 +2,7 @@ HIPCC ?= hipcc
 TARGET = libattention.so
 ARCH = gfx942  # CDNA3 (MI300X)
 
-HIPCC_FLAGS = -shared -fPIC -O2 -g --offload-arch=$(ARCH)
+HIPCC_FLAGS = -shared -fPIC -O3 --offload-arch=$(ARCH) -g -gdwarf-4
 
 all: $(TARGET)
 
