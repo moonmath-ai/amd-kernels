@@ -83,6 +83,11 @@ def float32_to_bf16_bits(x: np.ndarray) -> np.ndarray:
     return (u >> np.uint32(16)).astype(np.uint16)
 
 
+def bf16_bits_to_float32(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.uint16)
+    return (x.astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+
 def make_inputs(batch: int, heads: int, seq_len: int, head_dim: int, dtype: str):
     rng = np.random.default_rng(42)
     shape = (batch, heads, seq_len, head_dim)
@@ -103,19 +108,26 @@ def hip_alloc(hip, host_arr):
     return ptr
 
 
-def copy_out(hip, d_out, shape):
-    out = np.zeros(shape, dtype=np.float32)
-    assert hip.hipMemcpy(out.ctypes.data, d_out, out.nbytes, 2) == 0
-    return out
+def copy_out(hip, d_out, shape, dtype: str):
+    if dtype == "bf16":
+        out = np.zeros(shape, dtype=np.uint16)
+        assert hip.hipMemcpy(out.ctypes.data, d_out, out.nbytes, 2) == 0
+        return bf16_bits_to_float32(out)
+    if dtype == "fp32":
+        out = np.zeros(shape, dtype=np.float32)
+        assert hip.hipMemcpy(out.ctypes.data, d_out, out.nbytes, 2) == 0
+        return out
+    raise ValueError(f"Unsupported output dtype: {dtype}")
 
 
-def benchmark_path(hip, lib_path: Path, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters):
+def benchmark_path(hip, lib_path: Path, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters, out_dtype: str):
     lib = load_kernel(lib_path)
     shape = q.shape
     d_q, d_k = hip_alloc(hip, q), hip_alloc(hip, k)
     d_v = hip_alloc(hip, v)
     d_out = ctypes.c_void_p()
-    assert hip.hipMalloc(ctypes.byref(d_out), int(np.prod(shape)) * 4) == 0
+    out_bpe = 2 if out_dtype == "bf16" else 4
+    assert hip.hipMalloc(ctypes.byref(d_out), int(np.prod(shape)) * out_bpe) == 0
 
     for _ in range(max(0, warmup_iters)):
         assert launch(lib, d_q, d_k, d_v, d_out, batch, heads, seq_len, head_dim) == 0
@@ -134,7 +146,7 @@ def benchmark_path(hip, lib_path: Path, q, k, v, batch, heads, seq_len, head_dim
     hip.hipEventDestroy(stop)
     avg_ms = ms.value / n
 
-    out = copy_out(hip, d_out, shape)
+    out = copy_out(hip, d_out, shape, out_dtype)
     for p in (d_q, d_k, d_v, d_out):
         hip.hipFree(p)
 
@@ -165,17 +177,22 @@ def run(
     hip_dtype="bf16",
     report=True,
 ):
+    if hip_dtype != "bf16":
+        raise ValueError("Current HIP and AITER attention kernels expect bf16 inputs and produce bf16 outputs.")
+
     ensure_lib(HIP_LIB_PATH, "all")
-    if hip_dtype == "bf16":
-        ensure_lib(AITER_LIB_PATH, "aiter")
+    ensure_lib(AITER_LIB_PATH, "aiter")
 
     hip = load_hip_runtime()
     q, k, v = make_inputs(batch, heads, seq_len, head_dim, hip_dtype)
 
-    hip_r = benchmark_path(hip, HIP_LIB_PATH, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters)
+    hip_r = benchmark_path(
+        hip, HIP_LIB_PATH, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters, "bf16"
+    )
     aiter_r = None
-    if hip_dtype == "bf16":
-        aiter_r = benchmark_path(hip, AITER_LIB_PATH, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters)
+    aiter_r = benchmark_path(
+        hip, AITER_LIB_PATH, q, k, v, batch, heads, seq_len, head_dim, warmup_iters, benchmark_iters, "bf16"
+    )
 
     ok_cmp = head_dim == 128 and seq_len >= 256
     correctness = compare_outputs(aiter_r["out"], hip_r["out"]) if aiter_r and ok_cmp else None
@@ -184,7 +201,7 @@ def run(
         print(f"shape={hip_r['out'].shape}  dtype={hip_dtype}  flops={hip_r['flops']:.3e} (4*B*H*S^2*D)")
         print(f"HIP   {hip_r['avg_ms']:.4f} ms  {hip_r['tflops']:.1f} TFLOP/s")
         if aiter_r:
-            print(f"AITER {aiter_r['avg_ms']:.4f} ms  {aiter_r['tflops']:.1f} TFLOP/s  (FMHA+bf16→fp32; non-causal, non-group)")
+            print(f"AITER {aiter_r['avg_ms']:.4f} ms  {aiter_r['tflops']:.1f} TFLOP/s")
             print(f"ratio HIP/AITER time: {hip_r['avg_ms'] / aiter_r['avg_ms']:.2f}x")
         if correctness:
             c = correctness

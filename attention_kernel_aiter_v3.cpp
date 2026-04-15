@@ -112,12 +112,6 @@ struct __attribute__((packed)) fmha_fwd_v3_args {
     p3 _p40;
 };
 
-struct Scratch {
-    bf16_t* o = nullptr;
-    size_t bytes = 0;
-};
-
-Scratch g_scratch;
 hipModule_t g_module = nullptr;
 hipFunction_t g_func = nullptr;
 bool g_loaded = false;
@@ -129,15 +123,6 @@ unsigned int g_s_opt = 5;
 inline void hip_check(hipError_t err) {
     if (err != hipSuccess) {
         abort();
-    }
-}
-
-__global__ void cvt_bf16_to_fp32(const bf16_t* __restrict__ src,
-                                 float* __restrict__ dst,
-                                 size_t n) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        dst[i] = static_cast<float>(src[i]);
     }
 }
 
@@ -191,14 +176,6 @@ std::filesystem::path find_hsaco_root() {
         }
     }
     return {};
-}
-
-void ensure_scratch(size_t elems) {
-    const size_t bytes = elems * sizeof(bf16_t);
-    if (bytes <= g_scratch.bytes) return;
-    if (g_scratch.o) hip_check(hipFree(g_scratch.o));
-    hip_check(hipMalloc(&g_scratch.o, bytes));
-    g_scratch.bytes = bytes;
 }
 
 void ensure_kernel_loaded() {
@@ -262,7 +239,7 @@ void launch_aiter(const fmha_fwd_v3_args& args, hipStream_t stream, int gdx, int
 extern "C" hipError_t launch_attention_forward(const bf16_t* Q,
                                                 const bf16_t* K,
                                                 const bf16_t* V,
-                                                float* Out,
+                                                bf16_t* Out,
                                                 int batch,
                                                 int heads,
                                                 int seq_len,
@@ -271,12 +248,7 @@ extern "C" hipError_t launch_attention_forward(const bf16_t* Q,
     if (batch <= 0 || heads <= 0 || seq_len <= 0) return hipErrorInvalidValue;
     if (head_dim != 128) return hipErrorInvalidValue;
 
-    const size_t elems = static_cast<size_t>(batch) * heads * seq_len * head_dim;
-    ensure_scratch(elems);
     ensure_kernel_loaded();
-
-    const dim3 block(256);
-    const dim3 grid((elems + block.x - 1) / block.x);
 
     const unsigned int in_bpe = sizeof(bf16_t);
     const unsigned int out_bpe = sizeof(bf16_t);
@@ -286,7 +258,7 @@ extern "C" hipError_t launch_attention_forward(const bf16_t* Q,
     const unsigned int ts_qo = 256;
 
     fmha_fwd_v3_args args{};
-    args.ptr_o         = g_scratch.o;
+    args.ptr_o         = Out;
     args.ptr_q         = Q;
     args.ptr_k         = K;
     args.ptr_v         = V;
@@ -332,7 +304,5 @@ extern "C" hipError_t launch_attention_forward(const bf16_t* Q,
     const int gdy = heads;
     const int gdz = batch;
     launch_aiter(args, stream, gdx, gdy, gdz);
-
-    hipLaunchKernelGGL(cvt_bf16_to_fp32, grid, block, 0, stream, g_scratch.o, Out, elems);
     return hipGetLastError();
 }

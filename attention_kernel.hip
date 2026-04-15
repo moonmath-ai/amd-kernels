@@ -127,7 +127,7 @@ extern "C" __global__ __launch_bounds__(64, 1)
 void attn_fwd_16x16(const bf16_t* __restrict__ q,
                     const bf16_t* __restrict__ k,
                     const bf16_t* __restrict__ v,
-                    float* __restrict__ out,
+                    bf16_t* __restrict__ out,
                     int seq_len,
                     float scale) {
 
@@ -139,7 +139,7 @@ void attn_fwd_16x16(const bf16_t* __restrict__ q,
   const bf16_t* qh = q + blockIdx.y * hstride;
   const bf16_t* kh = k + blockIdx.y * hstride;
   const bf16_t* vh = v + blockIdx.y * hstride;
-  float*        oh = out + blockIdx.y * hstride;
+  bf16_t*       oh = out + blockIdx.y * hstride;
   const int qbase  = blockIdx.x * QBLOCK;
 
   buffer_rsrc_t kr = make_rsrc(kh);  bcast_rsrc(kr);
@@ -280,7 +280,7 @@ void attn_fwd_16x16(const bf16_t* __restrict__ q,
       int qrow = qbase + g * 16 + blk * 4 + e;
       #pragma unroll
       for (int h = 0; h < HDGROUPS; ++h)
-        oh[qrow * HD + h * 16 + lane] = O[g][h][e] * inv;
+        oh[qrow * HD + h * 16 + lane] = static_cast<bf16_t>(O[g][h][e] * inv);
     }
   }
 }
@@ -301,6 +301,6 @@ extern "C" int launch_attention_forward(const void* q, const void* k,
   hipLaunchKernelGGL(attn_fwd_16x16,
                      grid, block, 0, (hipStream_t)stream,
                      (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-                     (float*)out, seq_len, scale);
+                     (bf16_t*)out, seq_len, scale);
   return 0;
 }
