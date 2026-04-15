@@ -89,6 +89,12 @@ if [[ -z "${ROC_PROFILE_LD_PREFIX:-}" && -n "${CONDA_PREFIX:-}" && -d "${CONDA_P
   export ROC_PROFILE_LD_PREFIX="${CONDA_PREFIX}/lib"
 fi
 
+if [[ -n "${ROC_PROFILE_RUNNER_ARGS:-}" ]]; then
+  read -r -a ROC_PROFILE_RUNNER_ARGV <<<"${ROC_PROFILE_RUNNER_ARGS}"
+else
+  ROC_PROFILE_RUNNER_ARGV=()
+fi
+
 # Write a temp app launcher (rocprofiler-sdk execs a new process and resets LD_LIBRARY_PATH,
 # so we need a real file to re-prepend the conda lib path before running runner.py).
 _APP_SH="${SCRIPT_DIR}/.rocprof_app_$$.sh"
@@ -117,7 +123,7 @@ fi
 [[ -n "${ROCPROF_UI_ATT_GPU_INDEX:-}" ]]   && _rv3+=(--att-gpu-index  "${ROCPROF_UI_ATT_GPU_INDEX}")
 [[ "${ROCPROF_UI_ATT_SERIALIZE_ALL:-1}" == "0" ]] && _rv3=(${_rv3[@]/--att-serialize-all 1/})
 
-if ! "${_rv3[@]}" -- bash "${_APP_SH}"; then
+if ! "${_rv3[@]}" -- bash "${_APP_SH}" "${ROC_PROFILE_RUNNER_ARGV[@]}"; then
   echo "warning: rocprofv3 ATT failed (missing librocprof-trace-decoder.so?)" >&2
   echo "  Set ROCPROF_UI_ATT_LIBRARY_PATH or install ROCprof Trace Decoder." >&2
   exit 1

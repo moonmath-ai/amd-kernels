@@ -135,6 +135,12 @@ if [[ -z "${ROC_PROFILE_LD_PREFIX:-}" && -n "${CONDA_PREFIX:-}" && -d "${CONDA_P
   export ROC_PROFILE_LD_PREFIX="${CONDA_PREFIX}/lib"
 fi
 
+if [[ -n "${ROC_PROFILE_RUNNER_ARGS:-}" ]]; then
+  read -r -a ROC_PROFILE_RUNNER_ARGV <<<"${ROC_PROFILE_RUNNER_ARGS}"
+else
+  ROC_PROFILE_RUNNER_ARGV=(--warmup-iters "${WARMUP_ITERS}")
+fi
+
 # Write a temp app launcher (rocprofiler-sdk execs a new process and resets LD_LIBRARY_PATH,
 # so we need a real file to re-prepend the conda lib path before running runner.py).
 _APP_SH="${SCRIPT_DIR}/.rocprof_app_$$.sh"
@@ -158,7 +164,7 @@ echo "  workload: ${WORKLOAD_NAME}  path: ${WORKLOAD_PATH}"
   -n "${WORKLOAD_NAME}" \
   -p "${WORKLOAD_PATH}" \
   -- \
-  bash "${_APP_SH}" --warmup-iters "${WARMUP_ITERS}"
+  bash "${_APP_SH}" "${ROC_PROFILE_RUNNER_ARGV[@]}"
 
 echo "PMC profile done: ${WORKLOAD_PATH}"
 
@@ -178,7 +184,7 @@ if [[ -z "${ROCPROF_NO_UI_TRACE:-}" ]]; then
   [[ "${ROCPROF_UI_ATT_SERIALIZE_ALL:-1}" == "0" ]] && _rv3=(${_rv3[@]/--att-serialize-all 1/})
 
   _rv3_ok=0
-  if "${_rv3[@]}" -- bash "${_APP_SH}"; then
+  if "${_rv3[@]}" -- bash "${_APP_SH}" "${ROC_PROFILE_RUNNER_ARGV[@]}"; then
     _rv3_ok=1
   else
     echo "warning: rocprofv3 ATT failed (missing librocprof-trace-decoder.so?)" >&2
@@ -209,7 +215,7 @@ def from_dispatch_info():
     p = wp / "pmc_dispatch_info.csv"
     if not p.is_file(): return ""
     rows = list(csv.DictReader(p.open(newline="", encoding="utf-8")))
-    hits = [int(r["Dispatch_ID"]) for r in rows if "attention_forward" in (r.get("Kernel_Name") or "")]
+hits = [int(r["Dispatch_ID"]) for r in rows if any(k in (r.get("Kernel_Name") or "") for k in ("attention_forward", "attn_fwd_"))]
     if hits: return str(max(hits))
     if rows:
         try: return str(int(rows[-1]["Dispatch_ID"]))
@@ -221,7 +227,7 @@ def from_pmc_perf():
     if not p.is_file(): return ""
     rows = list(csv.DictReader(p.open(newline="", encoding="utf-8")))
     by_id = {int(r["Dispatch_ID"]): r.get("Kernel_Name","") for r in rows if r.get("Dispatch_ID","").isdigit()}
-    hits = [d for d,n in by_id.items() if "attention_forward" in n]
+hits = [d for d,n in by_id.items() if any(k in n for k in ("attention_forward", "attn_fwd_"))]
     if hits: return str(max(hits))
     if by_id: return str(max(by_id.keys()))
     return ""

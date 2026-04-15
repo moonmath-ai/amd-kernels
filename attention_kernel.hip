@@ -1,218 +1,306 @@
-// =====================================================================================
-//  CDNA3 / MI300 (gfx942) — K LDS double-buffering skeleton.
+// Flash-attention forward — CDNA3 gfx942, single-wave, 16x16x16 MFMA, bf16.
 //
-//  Minimal kernel used to verify the prefetch pipeline in isolation.
-//  Each iteration body:
-//      1. issue prefetch for NEXT 2 K-tiles into LDS (direct global→LDS)
-//      2. s_waitcnt vmcnt(16)  — drain OLD prefetch only; NEW stays in flight
-//      3. s_barrier + ds_read  — consume OLD tiles into VGPRs
-//      4. 32 × mfma            — NEW VMEM lands during these MFMAs
+// MFMA output mapping:
+//   Thread t, element e stores D[(t/16)*4+e, t%16]
+//     blk  = t/16  (0-3)   → selects which 4 output ROWS
+//     lane = t%16  (0-15)  → output COLUMN
 //
-//  Softmax / V / PV are intentionally absent
-// =====================================================================================
+// QK trick: call mfma16(K, Q, acc) so D = K × Q^T = QK^T.
+//   Then D[blk*4+e, lane] = QK^T[blk*4+e, lane] = QK[lane, blk*4+e].
+//   Each thread holds 4 COLUMNS of the same QK ROW (lane).
+//   Softmax reduces across blk groups (XOR 16,32)
+//   No probability transpose needed.
 
-#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
 #include <cstdint>
 
-using bf16_t = __hip_bfloat16;
-using bf16x4 = short __attribute__((ext_vector_type(4)));
-using f32x16 = float __attribute__((ext_vector_type(16)));
-using i32x4  = int   __attribute__((ext_vector_type(4)));
+using bf16_t     = __hip_bfloat16;
+using bf16x4_t   = short  __attribute__((ext_vector_type(4)));
+using buffer_rsrc_t = int __attribute__((ext_vector_type(4)));
+using acc4_t     = float  __attribute__((ext_vector_type(4)));
 
-static constexpr int HD           = 128;
-static constexpr int BM           = 128;     // Q rows / block
-static constexpr int BN           = 32;      // K rows / tile
-static constexpr int TH           = 256;     // 4 waves × 64
-static constexpr int K_ROW_STRIDE = HD + 8;  // pad for LDS banks
-static constexpr int K_LDS_BF16   = BN * K_ROW_STRIDE;
+static constexpr int HD       = 128;
+static constexpr int QBLOCK   = 64;
+static constexpr int KVTILE   = 16;
+static constexpr int WAVE     = 64;
+static constexpr int QGROUPS  = QBLOCK / 16;   // 4
+static constexpr int HDGROUPS = HD / 16;        // 8
+static constexpr int KSTEPS   = HD / 16;        // 8
 
-// -------------------------------------------------------------------------------------
-//  Intrinsics
-// -------------------------------------------------------------------------------------
-__device__ __forceinline__ f32x16 mfma(bf16x4 a, bf16x4 b, f32x16 c) {
-  return __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a, b, c, 0, 0, 0);
+static constexpr int LDS_ROW   = 130;
+static constexpr int LDS_ROW_B = LDS_ROW * 2;  // 260 bytes
+
+__device__ __forceinline__ buffer_rsrc_t make_rsrc(const void* p) {
+  auto r = __builtin_amdgcn_make_buffer_rsrc(
+      const_cast<void*>(p), short(0), 0xFFFFFFFFu, 0x20000u);
+  buffer_rsrc_t o;
+  __builtin_memcpy(&o, &r, sizeof(o));
+  return o;
 }
 
-__device__ __forceinline__ i32x4 make_buffer_rsrc(const void* p) {
-  auto r = __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), (short)0,
-                                             0xFFFFFFFFu, 0x00020000u);
-  i32x4 out; __builtin_memcpy(&out, &r, sizeof(out)); return out;
-}
-
-__device__ __forceinline__ i32x4 to_sgpr(i32x4 v) {
-  v[0] = __builtin_amdgcn_readfirstlane(v[0]);
-  v[1] = __builtin_amdgcn_readfirstlane(v[1]);
-  v[2] = __builtin_amdgcn_readfirstlane(v[2]);
-  v[3] = __builtin_amdgcn_readfirstlane(v[3]);
-  return v;
+__device__ __forceinline__ void bcast_rsrc(buffer_rsrc_t& r) {
+  r[0] = __builtin_amdgcn_readfirstlane(r[0]);
+  r[1] = __builtin_amdgcn_readfirstlane(r[1]);
+  r[2] = __builtin_amdgcn_readfirstlane(r[2]);
+  r[3] = __builtin_amdgcn_readfirstlane(r[3]);
 }
 
 extern "C" __device__ void
-llvm_amdgcn_raw_buffer_load_lds(i32x4 rsrc,
-                                __attribute__((address_space(3))) unsigned* lds,
-                                unsigned size, unsigned voff, unsigned soff,
-                                unsigned off, unsigned aux)
+llvm_amdgcn_raw_buffer_load_lds(
+    buffer_rsrc_t rsrc,
+    __attribute__((address_space(3))) unsigned* lds,
+    unsigned size, unsigned voff, unsigned soff,
+    unsigned offset, unsigned aux)
   __asm("llvm.amdgcn.raw.buffer.load.lds");
 
-// s_waitcnt with independent VMCNT / LGKMCNT; 63 means "don't care".
 template <int vm, int lgkm>
 __device__ __forceinline__ void wait_cnt() {
-  constexpr unsigned enc = (vm & 0x0F) | (((vm & 0x30) >> 4) << 14)
-                         | (7u << 4) | ((lgkm & 0x3F) << 8);
+  constexpr unsigned enc =
+      ((vm & 0x0F))              |
+      (((vm & 0x30) >> 4) << 14) |
+      (7u << 4)                  |
+      ((lgkm & 0x3F) << 8);
   __builtin_amdgcn_s_waitcnt(enc);
 }
-template <int N> __device__ __forceinline__ void wait_vm()   { wait_cnt<N, 63>(); }
-template <int N> __device__ __forceinline__ void wait_lgkm() { wait_cnt<63, N>(); }
+#define WAIT_VM(n)   wait_cnt<n, 63>()
 
-// =====================================================================================
-//  Kernel
-// =====================================================================================
-extern "C" __global__ __launch_bounds__(TH, 1)
-void attn_fwd_32x32(const bf16_t* __restrict__ Q,
-                    const bf16_t* __restrict__ K,
-                    const bf16_t* __restrict__ /*V*/,
-                    float*        __restrict__ O,
-                    int /*B*/, int /*H*/, int S, int /*D*/,
-                    float /*scale*/)
-{
-  const int tid       = threadIdx.x;
-  const int lane      = tid & 63;
-  const int wave      = tid >> 6;
-  const int lane_row  = lane & 31;
-  const int lane_half = lane >> 5;
-
-  const int bh = blockIdx.y;
-  const int qb = blockIdx.x;
-
-  const int head_stride = S * HD;
-  const bf16_t* Qbh = Q + bh * head_stride;
-  const bf16_t* Kbh = K + bh * head_stride;
-  float*        Obh = O + bh * head_stride;
-
-  __shared__ __align__(16) bf16_t Klds[2][K_LDS_BF16];
-
-  const i32x4 rsrc_K = to_sgpr(make_buffer_rsrc(Kbh));
-
-  // Prefetch one K-tile into LDS buffer `buf` via direct global→LDS.
-  //   4 waves × 8 rows = BN=32 rows per tile. Each lane contributes 1 dword
-  //   (2 bf16) per kv_row, so the row is covered by 64 lanes × 4 B = 256 B = HD*2.
-  const unsigned lane_hd = (unsigned)lane * 2u;
-  const int      wave_s  = __builtin_amdgcn_readfirstlane(wave);
-  auto launch_K = [&, lane_hd, wave_s](int kt, int buf) {
-    const unsigned kt_base = (unsigned)(kt * BN * HD * 2);
-    auto* lds_u = (__attribute__((address_space(3))) unsigned*)&Klds[buf][0];
-    #pragma unroll
-    for (int c = 0; c < 8; ++c) {
-      unsigned kv_row = (unsigned)(wave_s * 8 + c);
-      unsigned voff   = kt_base + kv_row * (unsigned)(HD * 2) + lane_hd * 2u;
-      llvm_amdgcn_raw_buffer_load_lds(rsrc_K,
-          lds_u + kv_row * (unsigned)(K_ROW_STRIDE / 2),
-          4u, voff, 0u, 0u, 0u);
-    }
-  };
-
-  // 8 × ds_read_b128 per lane → 16 bf16x4 covering one K tile.
-  auto load_K_from_lds = [&](int buf, bf16x4 Kreg[16]) {
-    using i4 = int __attribute__((ext_vector_type(4)));
-    auto* lds_b  = (__attribute__((address_space(3))) char*)&Klds[buf][0];
-    auto* lds_i4 = (__attribute__((address_space(3))) i4*)(
-        lds_b + (unsigned)(lane_row * K_ROW_STRIDE * 2 + lane_half * 128));
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-      i4 v = lds_i4[p];
-      __builtin_memcpy(&Kreg[2*p    ], (const char*)&v,     8);
-      __builtin_memcpy(&Kreg[2*p + 1], (const char*)&v + 8, 8);
-    }
-  };
-
-  // Q stays in VGPRs — it's the B operand of the swapped MFMA (see comment below).
-  bf16x4 Qreg[16];
-  {
-    const int qrow = qb * BM + wave * 32 + lane_row;
-    #pragma unroll
-    for (int mk = 0; mk < 16; ++mk) {
-      int hd = mk * 8 + lane_half * 4;
-      long long v = *reinterpret_cast<const long long*>(&Qbh[qrow * HD + hd]);
-      __builtin_memcpy(&Qreg[mk], &v, 8);
-    }
-  }
-
-  f32x16 Sacc0 = {}, Sacc1 = {};
-  const int num_tiles = S / BN;
-
-  // --- Prime the pipe: 16 VMEM ops in flight after this (8 per launch_K). ---
-  launch_K(0, 0);
-  launch_K(1, 1);
-
-  // --- Main loop — double buffered K prefetch ---
-  //
-  //  VMCNT evolution per iter (per wave):
-  //      enter           : 16 in flight  (prev iter's prefetch)
-  //      launch 16 new   : 32 in flight
-  //      wait_vm<16>     : drain 16 old, keep 16 new traveling
-  //      ds_read + MFMAs : new VMEMs land during the MFMA window
-  //
-  //  Aliasing safety: ds_read latency (~20 cyc) ≪ buffer_load_lds latency
-  //  (~400 cyc), so the new VMEM write never lands on buf[k] before the
-  //  ds_read of the old data has drained. Within one buffer, VMEM writes
-  //  are FIFO so old-then-new is ordered correctly.
-  for (int kt = 2; kt < num_tiles; kt += 2) {
-    launch_K(kt,     0);
-    launch_K(kt + 1, 1);
-    wait_vm<16>();
-    __builtin_amdgcn_s_barrier();
-
-    bf16x4 Kreg0[16], Kreg1[16];
-    load_K_from_lds(0, Kreg0);
-    load_K_from_lds(1, Kreg1);
-    wait_lgkm<0>();
-
-    __builtin_amdgcn_iglp_opt(1);
-    #pragma unroll
-    for (int mk = 0; mk < 16; ++mk) {
-      Sacc0 = mfma(Kreg0[mk], Qreg[mk], Sacc0);
-      Sacc1 = mfma(Kreg1[mk], Qreg[mk], Sacc1);
-    }
-  }
-
-  // --- Drain last prefetched pair ---
-  {
-    wait_vm<0>();
-    __builtin_amdgcn_s_barrier();
-    bf16x4 Kreg0[16], Kreg1[16];
-    load_K_from_lds(0, Kreg0);
-    load_K_from_lds(1, Kreg1);
-    wait_lgkm<0>();
-    #pragma unroll
-    for (int mk = 0; mk < 16; ++mk) {
-      Sacc0 = mfma(Kreg0[mk], Qreg[mk], Sacc0);
-      Sacc1 = mfma(Kreg1[mk], Qreg[mk], Sacc1);
-    }
-  }
-
-  // Keep MFMAs live for the compiler.
-  float acc = 0.f;
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) acc += Sacc0[i] + Sacc1[i];
-  Obh[qb * BM * HD + tid] = acc;
+__device__ __forceinline__ acc4_t
+mfma16(bf16x4_t a, bf16x4_t b, acc4_t c) {
+  return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
 }
 
-// =====================================================================================
-//  Host entry
-// =====================================================================================
-extern "C" int launch_attention_forward(const void* q, const void* k, const void* v,
-                                        void* out, int batch, int heads,
-                                        int seq_len, int head_dim, void* stream)
-{
-  if (head_dim != HD)          return 1;
-  if (seq_len % BM)            return 2;
-  if ((seq_len / BN) % 2)      return 3;   // main loop processes tile pairs
+__device__ __forceinline__ unsigned pk_bf16(unsigned lo, unsigned hi) {
+  unsigned o;
+  asm volatile("v_perm_b32 %0, %1, %2, %3"
+               : "=v"(o) : "v"(lo), "v"(hi), "s"(0x07060302u));
+  return o;
+}
 
-  dim3 grid(seq_len / BM, batch * heads, 1);
-  dim3 block(TH, 1, 1);
-  hipLaunchKernelGGL(attn_fwd_32x32, grid, block, 0, (hipStream_t)stream,
+__device__ __forceinline__ bf16x4_t
+pack4(float a, float b, float c, float d) {
+  unsigned w0 = pk_bf16(__builtin_bit_cast(unsigned, b),
+                        __builtin_bit_cast(unsigned, a));
+  unsigned w1 = pk_bf16(__builtin_bit_cast(unsigned, d),
+                        __builtin_bit_cast(unsigned, c));
+  bf16x4_t o;
+  __builtin_memcpy(&o, &w0, 4);
+  __builtin_memcpy((char*)&o + 4, &w1, 4);
+  return o;
+}
+
+// Reduce across blk groups (XOR 16, 32) — 4 threads per QK row.
+__device__ __forceinline__ float bperm_xor(int xv, float v) {
+  int tid = __builtin_amdgcn_mbcnt_hi(-1u, __builtin_amdgcn_mbcnt_lo(-1u, 0));
+  int b   = __builtin_bit_cast(int, v);
+  int r   = __builtin_amdgcn_ds_bpermute(((tid ^ xv) << 2), b);
+  return __builtin_bit_cast(float, r);
+}
+
+__device__ __forceinline__ float row_max(float v) {
+  v = fmaxf(v, bperm_xor(16, v));
+  v = fmaxf(v, bperm_xor(32, v));
+  return v;
+}
+__device__ __forceinline__ float row_sum(float v) {
+  v += bperm_xor(16, v);
+  v += bperm_xor(32, v);
+  return v;
+}
+
+__device__ __forceinline__ void
+tile_to_lds(buffer_rsrc_t rsrc, bf16_t* lds, int tile) {
+  const unsigned base = unsigned(tile) * (KVTILE * HD * 2u);
+  #pragma unroll
+  for (int r = 0; r < KVTILE; ++r) {
+    unsigned voff = base + unsigned(r * 256 + threadIdx.x * 4);
+    unsigned loff = unsigned(r * LDS_ROW_B);
+    auto* lp = (__attribute__((address_space(3))) unsigned*)(
+        (__attribute__((address_space(3))) char*)lds + loff);
+    llvm_amdgcn_raw_buffer_load_lds(rsrc, lp, 4, voff, 0, 0, 0);
+  }
+}
+
+// =====================================================================
+
+extern "C" __global__ __launch_bounds__(64, 1)
+void attn_fwd_16x16(const bf16_t* __restrict__ q,
+                    const bf16_t* __restrict__ k,
+                    const bf16_t* __restrict__ v,
+                    float* __restrict__ out,
+                    int seq_len,
+                    float scale) {
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & 15;    // MFMA N-index = QK row = output column
+  const int blk  = tid >> 4;    // MFMA M-group; M-index = blk*4+e = KV col / output row-group
+
+  const int hstride = seq_len * HD;
+  const bf16_t* qh = q + blockIdx.y * hstride;
+  const bf16_t* kh = k + blockIdx.y * hstride;
+  const bf16_t* vh = v + blockIdx.y * hstride;
+  float*        oh = out + blockIdx.y * hstride;
+  const int qbase  = blockIdx.x * QBLOCK;
+
+  buffer_rsrc_t kr = make_rsrc(kh);  bcast_rsrc(kr);
+  buffer_rsrc_t vr = make_rsrc(vh);  bcast_rsrc(vr);
+
+  __shared__ __align__(16) bf16_t lds_k[2][KVTILE * LDS_ROW];
+  __shared__ __align__(16) bf16_t lds_v[KVTILE * LDS_ROW];
+
+  // Q: B-operand of QK MFMA.  B[lane, blk*4+0..3] = Q[lane_row, k_cols].
+  bf16x4_t Q[QGROUPS][KSTEPS];
+  #pragma unroll
+  for (int g = 0; g < QGROUPS; ++g) {
+    int qrow = qbase + g * 16 + lane;
+    #pragma unroll
+    for (int s = 0; s < KSTEPS; ++s) {
+      int kcol = s * 16 + blk * 4;
+      long long w = *reinterpret_cast<const long long*>(
+          &qh[qrow * HD + kcol]);
+      __builtin_memcpy(&Q[g][s], &w, sizeof(bf16x4_t));
+    }
+  }
+
+  // O[g][h][e] accumulates PV[(blk*4+e), h*16+lane]
+  acc4_t O[QGROUPS][HDGROUPS] = {};
+
+  // mx/sm: softmax state for Q-row `lane` (used for prob computation).
+  // mx_o[g][e]: running max for O-element's row (blk*4+e), gathered from lane=blk*4+e.
+  float mx[QGROUPS], sm[QGROUPS];
+  float mx_o[QGROUPS][4];
+  #pragma unroll
+  for (int g = 0; g < QGROUPS; ++g) {
+    mx[g] = -3e38f; sm[g] = 0.f;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) mx_o[g][e] = -3e38f;
+  }
+
+  const int ntiles = seq_len / KVTILE;
+  tile_to_lds(kr, lds_k[0], 0);
+
+  for (int t = 0; t < ntiles; ++t) {
+    const int cb = t & 1, nb = 1 - cb;
+
+    WAIT_VM(0);
+    // BARRIER_HERE for multi-wave
+
+    bf16x4_t K[KSTEPS];
+    #pragma unroll
+    for (int s = 0; s < KSTEPS; ++s) {
+      long long w = *reinterpret_cast<const long long*>(
+          &lds_k[cb][lane * LDS_ROW + s * 16 + blk * 4]);
+      __builtin_memcpy(&K[s], &w, sizeof(bf16x4_t));
+    }
+
+    // Issue V loads FIRST so they are oldest in vmcnt queue.
+    // This lets vmcnt(16) drain V while K prefetch stays in flight.
+    tile_to_lds(vr, lds_v, t);
+
+    if (t + 1 < ntiles)
+      tile_to_lds(kr, lds_k[nb], t + 1);
+
+    acc4_t qk[QGROUPS];
+    #pragma unroll
+    for (int g = 0; g < QGROUPS; ++g) {
+      qk[g] = {};
+      #pragma unroll
+      for (int s = 0; s < KSTEPS; ++s)
+        qk[g] = mfma16(K[s], Q[g][s], qk[g]);
+    }
+
+    // Online softmax. qk[g][0..3] = QK[lane, blk*4+0..3].
+    bf16x4_t P[QGROUPS];
+    #pragma unroll
+    for (int g = 0; g < QGROUPS; ++g) {
+      float lm = fmaxf(fmaxf(qk[g][0], qk[g][1]),
+                        fmaxf(qk[g][2], qk[g][3]));
+      float tm = row_max(lm);
+      float nm = fmaxf(mx[g], tm);
+
+      // Gather nm for each O-row (blk*4+e) and rescale O accumulators.
+      #pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        int b = __builtin_bit_cast(int, nm);
+        float nm_e = __builtin_bit_cast(float,
+            __builtin_amdgcn_ds_bpermute((blk * 4 + e) * 4, b));
+        float c = __builtin_amdgcn_exp2f((mx_o[g][e] - nm_e) * scale);
+        #pragma unroll
+        for (int h = 0; h < HDGROUPS; ++h)
+          O[g][h][e] *= c;
+        mx_o[g][e] = nm_e;
+      }
+
+      float corr = __builtin_amdgcn_exp2f((mx[g] - nm) * scale);
+      float nms = -nm * scale;
+      float p[4], ps = 0.f;
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        p[i] = __builtin_amdgcn_exp2f(
+            __builtin_fmaf(qk[g][i], scale, nms));
+        ps += p[i];
+      }
+      sm[g] = sm[g] * corr + row_sum(ps);
+      mx[g] = nm;
+      P[g]  = pack4(p[0], p[1], p[2], p[3]);
+    }
+
+    // V loads (oldest 16) are done; K prefetch (newest 16) stays in flight.
+    if (t + 1 < ntiles)
+      WAIT_VM(16);
+    else
+      WAIT_VM(0);
+    // BARRIER_HERE for multi-wave
+
+    #pragma unroll
+    for (int h = 0; h < HDGROUPS; ++h) {
+      short vv[4];
+      #pragma unroll
+      for (int e = 0; e < 4; ++e)
+        vv[e] = *reinterpret_cast<const short*>(
+            &lds_v[(blk * 4 + e) * LDS_ROW + h * 16 + lane]);
+      bf16x4_t Vr;
+      __builtin_memcpy(&Vr, vv, sizeof(bf16x4_t));
+
+      #pragma unroll
+      for (int g = 0; g < QGROUPS; ++g)
+        O[g][h] = mfma16(P[g], Vr, O[g][h]);
+    }
+  }
+
+  // Epilogue: gather sm for each O-row and normalize.
+  #pragma unroll
+  for (int g = 0; g < QGROUPS; ++g) {
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      int b = __builtin_bit_cast(int, sm[g]);
+      float sm_e = __builtin_bit_cast(float,
+          __builtin_amdgcn_ds_bpermute((blk * 4 + e) * 4, b));
+      float inv = __builtin_amdgcn_rcpf(sm_e);
+      int qrow = qbase + g * 16 + blk * 4 + e;
+      #pragma unroll
+      for (int h = 0; h < HDGROUPS; ++h)
+        oh[qrow * HD + h * 16 + lane] = O[g][h][e] * inv;
+    }
+  }
+}
+
+extern "C" int launch_attention_forward(const void* q, const void* k,
+                                        const void* v, void* out,
+                                        int batch, int heads,
+                                        int seq_len, int head_dim,
+                                        void* stream) {
+  if (head_dim != HD)             return 1;
+  if ((seq_len % KVTILE) != 0)   return 2;
+  if ((seq_len % QBLOCK) != 0)   return 3;
+
+  dim3 grid(seq_len / QBLOCK, batch * heads, 1);
+  dim3 block(WAVE, 1, 1);
+  float scale = (1.f / sqrtf(float(head_dim))) * 1.44269504088896f;
+
+  hipLaunchKernelGGL(attn_fwd_16x16,
+                     grid, block, 0, (hipStream_t)stream,
                      (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-                     (float*)out, batch, heads, seq_len, head_dim, 0.f);
+                     (float*)out, seq_len, scale);
   return 0;
 }
