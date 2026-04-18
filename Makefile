@@ -22,7 +22,6 @@ EXTRA_LLVM_FLAGS ?=
 HIPCC_FLAGS = -shared -fPIC -O3 --offload-arch=$(ARCH) \
               -ffast-math -fno-math-errno \
               -mllvm -amdgpu-early-inline-all=true \
-              -mllvm --amdgpu-mfma-vgpr-form \
               $(EXTRA_LLVM_FLAGS)
 
 CK_FLAGS = $(HIPCC_FLAGS) -std=c++17 -I$(CK_TILE_INC) -DCK_TILE_FMHA_FWD_FAST_EXP2=1
