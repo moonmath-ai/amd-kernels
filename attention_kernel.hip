@@ -22,7 +22,7 @@ constexpr int kWaveSize  = 64;
 constexpr int kNumWaves  = 4;
 constexpr int kBlockSize = kWaveSize * kNumWaves;
 constexpr int kNBlock    = 64;
-constexpr int kNSub      = 4;     // 4 MFMA sub-tiles along the N dim per K-block (kNBlock / kKTile)
+constexpr int kNSub      = 4;     // 4 MFMA sub-tiles along the KV-row dim per K-block (kNBlock / kKTile)
 constexpr int kKTile     = 16;    // 16-row MFMA tile
 constexpr int kHeadDim   = 128;
 constexpr int kDTiles    = kHeadDim / kKTile;
@@ -223,7 +223,7 @@ void attention_forward(
                 //                  d selects the 16-wide d-tile within head_dim (0..kDTiles-1),
                 //                  quad (lane >> 4, 0..3) selects which 4-element group within
                 //                  that tile (at offsets 0, 4, 8, 12) — matching the MFMA
-                //                  A-matrix lane layout where each lane owns 4 consecutive
+                //                  B-matrix lane layout where each lane owns 4 consecutive
                 //                  K-dimension elements for one row.
                 //   * kHeadDim   = row stride (128 bf16 elements per row)
                 //   * 2          = bytes per bf16
@@ -262,10 +262,10 @@ void attention_forward(
         *reinterpret_cast<bf16x8_t*>(&lds_k[buf][kvrow][kcol + 8]) = b;
     };
 
-    // V transpose store: write 8 consecutive head_dim bytes from one thread as
-    // 8 scattered ds_write_b16 to column kvrow of the dv-th LDS slab. The
-    // source is a short-vector (bf16x8_t); bit-cast each lane to bf16 (bf16 is
-    // a class type, so vector-element reference is illegal).
+    // V transpose store: write 8 consecutive head_dim bf16 values from one
+    // thread as 8 scattered ds_write_b16 to column kvrow of the dt-th LDS slab.
+    // The source is a short-vector (bf16x8_t); bit-cast each element to bf16
+    // (bf16 is a class type, so vector-element reference is illegal).
     auto vstore8 = [&](int dt, int d0, bf16x8_t src) {
         #pragma unroll
         for (int i = 0; i < 8; ++i)
@@ -288,12 +288,12 @@ void attention_forward(
     // Main K-block loop. Pipelining DAG per iteration:
     //
     //   [PREFETCH]  issue K[nb+1] (4× b128), V[nb] as V_a + V_b (4× b128)
-    //   [QK]        S = Q · K[nb]^T                   — 64 MFMAs, reads lds_k
-    //   [SOFTMAX]   online-rescale O, produce P       — wave-reductions + exp2
+    //   [QK]        S = K[nb] · Qᵀ                    — 64 MFMAs, reads lds_k
+    //   [SOFTMAX]   online-rescale O, produce Pᵀ      — wave-reductions + exp2
     //   [STORE V_a] wait_vmcnt<2>, transpose V_a → lds_v ; stash K[nb+1] → lds_k
-    //   [PV half 0] O[0..3] += P · V_a                — 32 MFMAs, reads lds_v
+    //   [PV half 0] O[0..3] += Vᵀ_a · Pᵀ             — 32 MFMAs, reads lds_v
     //   [STORE V_b] wait_vmcnt<0>, transpose V_b → lds_v
-    //   [PV half 1] O[4..7] += P · V_b                — 32 MFMAs, reads lds_v
+    //   [PV half 1] O[4..7] += Vᵀ_b · Pᵀ             — 32 MFMAs, reads lds_v
     //
     // The V global loads are hoisted to the top so their vmcnt drains during the
     // QK phase; V_b is held until after PV half 0 so lds_v can be reused.
@@ -312,9 +312,8 @@ void attention_forward(
         bf16x8_t vb0 = bld16(vr, vbase + (64 + vdim) * 2);
         bf16x8_t vb1 = bld16(vr, vbase + (96 + vdim) * 2);
 
-        // ── QK: S = Q · K[nb]^T ─────────────────────────────────────────────
-        // sched_group_barriers cluster (4 ds_reads, 8 MFMAs) ×8 — load-bearing
-        // on gfx942, see feedback_ablation_results.md (+18 TFLOP/s).
+        // ── QK: S = K[nb] · Qᵀ  (A=kf, B=q) ──────────────────────────────────
+        // sched_group_barriers cluster (4 ds_reads, 8 MFMAs) ×8.
         #pragma unroll
         for (int g = 0; g < 8; ++g) {
             __builtin_amdgcn_sched_group_barrier(0x100, 4, 0);
@@ -355,7 +354,7 @@ void attention_forward(
         lds_barrier();
         if (has_next) { store_k(0, kn0a, kn0b); store_k(1, kn1a, kn1b); }
 
-        // ── PV: O += P · V, in two halves ───────────────────────────────────
+        // ── PV: O += Vᵀ · Pᵀ, in two halves  (A=vf, B=p) ─────────────────────
         // lds_v is reused across both halves, so between them we drain phase-1
         // ds_reads (lgkmcnt) AND the pending V_b global loads (vmcnt) before
         // overwriting. The two halves otherwise execute the same MFMA pattern.
