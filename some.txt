@@ -1,0 +1,4 @@
+Q tile = | 16 x 16 | 16 x 16 | 16 x 16 | 16 x 16 | 16 x 16 | 16 x 16 | 16 x 16 | 16 x 16 |
+64 threads
+1 threads 2 vgprs x 2
+

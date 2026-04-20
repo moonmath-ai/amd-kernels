@@ -38,18 +38,38 @@ __device__ __forceinline__ fp32x4_t mfma(bf16x4_t a, bf16x4_t b, fp32x4_t c) {
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
 }
 
+// Buffer resource config bits used for raw-buffer operations on gfx9+.
+// This becomes the "config" dword in the 128-bit buffer resource descriptor.
+// The code uses RAW buffer ops (buffer_load/store), so we build a descriptor
+// once and then access memory via byte offsets (`off`).
 constexpr uint32_t kBufCfg = 0x00020000u;
+
+// Build an AMDGPU buffer resource descriptor pointing at `p`.
+// - Base pointer: `p`
+// - Stride: 0 (not used for raw buffer ops here)
+// - Num records / bound: 0xFFFFFFFF (effectively "large"; we rely on kernel
+//   logic for safety rather than descriptor bounds)
+// - Config: `kBufCfg` (see above)
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t mkr(const void* p) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0xFFFFFFFFu, kBufCfg);
 }
+
+// Load 8 bytes (64-bit) from buffer resource `r` at byte offset `off`,
+// reinterpret as 4 packed bf16 values (bf16x4_t).
 __device__ __forceinline__ bf16x4_t bld8(__amdgpu_buffer_rsrc_t r, int off) {
     u32x2_t raw = __builtin_amdgcn_raw_buffer_load_b64(r, off, 0, 0);
     bf16x4_t o; __builtin_memcpy(&o, &raw, sizeof(o)); return o;
 }
+
+// Load 16 bytes (128-bit) from buffer resource `r` at byte offset `off`,
+// reinterpret as 8 packed bf16 values (bf16x8_t).
 __device__ __forceinline__ bf16x8_t bld16(__amdgpu_buffer_rsrc_t r, int off) {
     u32x4_t raw = __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 0);
     bf16x8_t o; __builtin_memcpy(&o, &raw, sizeof(o)); return o;
 }
+
+// Store 8 bytes (64-bit) to buffer resource `r` at byte offset `off` from
+// 4 packed bf16 values (bf16x4_t).
 __device__ __forceinline__ void bst8(__amdgpu_buffer_rsrc_t r, int off, bf16x4_t v) {
     u32x2_t b; __builtin_memcpy(&b, &v, 8);
     __builtin_amdgcn_raw_buffer_store_b64(b, r, off, 0, 0);
@@ -162,13 +182,19 @@ void attention_forward(
     int seq_len, int q_tiles, float scale_log2e
 ) {
     const int tid  = threadIdx.x;
-    const int wid  = tid >> 6;
+    const int wid  = tid >> 6; // wave index
     const int lane = tid & 63;
     const int col  = lane & 15;        // 0..15, the 16-lane MFMA column
     const int quad = lane >> 4;        // 0..3, which 16-lane quad within the wave
 
+    // Each CTA covers kNumWaves*2 = 8 consecutive 16-row Q tiles.
+    // blockIdx.x selects the group of 8; wid*2 picks this wave's lo/hi pair
+    // within that group (wave 0→tiles 0,1 ; wave 1→2,3 ; wave 2→4,5 ; wave 3→6,7).
     const int qtile_base = blockIdx.x * kNumWaves * 2 + wid * 2;
+    // Bounds-check both tiles; the tail CTA may not have a full hi tile.
     const bool valid[2]  = {qtile_base < q_tiles, qtile_base + 1 < q_tiles};
+    // Convert tile index → absolute first row index (tile × 16 rows/tile).
+    // Fall back to row 0 for invalid tiles; those lanes are masked out later.
     const int  qbase[2]  = {valid[0] ? qtile_base * 16       : 0,
                             valid[1] ? (qtile_base + 1) * 16 : 0};
     const int bh         = blockIdx.y;
@@ -189,6 +215,18 @@ void attention_forward(
         #pragma unroll
         for (int d = 0; d < kDTiles; ++d)
             q[qg][d] = valid[qg]
+                // Byte offset into Q for this lane's 4 bf16 elements (= 8 bytes):
+                //   row          = qbase[qg] + col
+                //                  col (lane & 15) maps the 16-lane column-group
+                //                  onto the 16 rows of this MFMA tile.
+                //   elem_in_row  = d * kKTile + 4 * quad
+                //                  d selects the 16-wide d-tile within head_dim (0..kDTiles-1),
+                //                  quad (lane >> 4, 0..3) selects which 4-element group within
+                //                  that tile (at offsets 0, 4, 8, 12) — matching the MFMA
+                //                  A-matrix lane layout where each lane owns 4 consecutive
+                //                  K-dimension elements for one row.
+                //   * kHeadDim   = row stride (128 bf16 elements per row)
+                //   * 2          = bytes per bf16
                 ? bld8(qr, ((qbase[qg] + col) * kHeadDim + d * kKTile + 4 * quad) * 2)
                 : bf16x4_t{0,0,0,0};
 
