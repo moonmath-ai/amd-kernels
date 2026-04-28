@@ -44,6 +44,7 @@ def _kernel(round_mode):
 
 
 def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
+            out: torch.Tensor | None = None,
             round_mode: str = "rtne") -> torch.Tensor:
     """Fused forward attention: O = softmax(QKᵀ / √D) V on MI300X.
 
@@ -52,6 +53,8 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                  Contiguous. head_dim=128, seq_len % 64 == 0.
                  CPU tensors are copied to the AMD GPU under the hood; ROCm-built
                  torch tensors on a CUDA/HIP device are used in place.
+        out: optional preallocated output tensor. Must match q's shape, dtype,
+             device, and be contiguous. If None, a new tensor is allocated.
         round_mode: "rtne" (default; ~0.5 ULP error) or "rtz" (cheaper; ~1 ULP).
 
     Returns:
@@ -80,7 +83,19 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
 
     hip = _hip_runtime()
     lib = _kernel(round_mode)
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
+    else:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"out must be torch.Tensor; got {type(out).__name__}")
+        if out.dtype != torch.bfloat16:
+            raise TypeError(f"out must be torch.bfloat16; got dtype={out.dtype}")
+        if tuple(out.shape) != tuple(q.shape):
+            raise ValueError(f"out shape must match q; got {tuple(out.shape)} vs {tuple(q.shape)}")
+        if out.device != q.device:
+            raise ValueError(f"out must be on the same device as q; got {out.device} vs {q.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     if q.device.type == "cpu":
         # bf16 → uint16 view + .numpy() share storage with the torch tensors,

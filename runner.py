@@ -145,11 +145,18 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
 
     flops = 4.0 * B * H * S * S * D
 
+    # HIP: preallocate output per variant — allocation outside the timed loop;
+    # the correctness section reuses each buffer's last value from the loop.
+    # AITER's high-level wrapper allocates internally; the timing reflects that.
+    out_hip_rtne = torch.empty_like(q)
+    out_hip_rtz  = torch.empty_like(q)
+
+    aiter_last = {"rtne": None, "rtz": None}
     fns = {
-        "HIP   RTNE": lambda: ma.forward(q, k, v, round_mode="rtne"),
-        "HIP   RTZ":  lambda: ma.forward(q, k, v, round_mode="rtz"),
-        "AITER RTNE": lambda: flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE),
-        "AITER RTZ":  lambda: flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ),
+        "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne"),
+        "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz"),
+        "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
+        "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
 
     max_mod = max_skip_reason = None
@@ -175,18 +182,18 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
         d = (a - b).abs()
         return d.max().item(), d.pow(2).mean().sqrt().item()
 
-    out_hip_rtne   = fns["HIP   RTNE"]()
-    out_hip_rtz    = fns["HIP   RTZ"]()
-    out_aiter_rtne = fns["AITER RTNE"]().transpose(1, 2).contiguous()
-    out_aiter_rtz  = fns["AITER RTZ"]().transpose(1, 2).contiguous()
-    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, out_aiter_rtne)
-    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  out_aiter_rtz)
+    # Buffers already hold each kernel's last output from the timing loop.
+    # Re-layout AITER outputs from (B, S, H, D) to (B, H, S, D) for comparison.
+    aiter_rtne_bhsd = aiter_last["rtne"].transpose(1, 2).contiguous()
+    aiter_rtz_bhsd  = aiter_last["rtz"].transpose(1, 2).contiguous()
+    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_rtne_bhsd)
+    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_rtz_bhsd)
 
     out_max_f32 = None
     if max_mod is not None:
         out_max_f32 = _max_buf_to_fp32_bhsd(fns["MAX"](), max_mod)
         max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
-        max_vs_aiter = diff_stats(out_max_f32, out_aiter_rtne)
+        max_vs_aiter = diff_stats(out_max_f32, aiter_rtne_bhsd)
 
     print(f"inputs={pattern}  shape=({B},{H},{S},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
     print(f"              ms      TFLOP/s    ratios")
@@ -218,7 +225,7 @@ if __name__ == "__main__":
     ap.add_argument("--seq-len", type=int, default=8192)
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--benchmark-iters", type=int, default=20)
-    ap.add_argument("--warmup-iters", type=int, default=0)
+    ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--inputs", choices=["random", "ones", "linear", "diag"], default="random")
     ap.add_argument("--no-max", action="store_true",
                     help="Do not run Modular MAX flash_attention_gpu (if installed)")
