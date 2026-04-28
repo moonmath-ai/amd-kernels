@@ -1,18 +1,29 @@
+# Compiled libraries / objects
 *.so
 *.o
 *.out
+
+# Python
+__pycache__/
+*.pyc
+
+# hipcc --save-temps output
+*-hip-amdgcn-amd-amdhsa-gfx942.bc
+*-hip-amdgcn-amd-amdhsa-gfx942.hipi
+*-hip-amdgcn-amd-amdhsa-gfx942.o
+*-hip-amdgcn-amd-amdhsa-gfx942.out
+*-hip-amdgcn-amd-amdhsa-gfx942.out.resolution.txt
+*-hip-amdgcn-amd-amdhsa-gfx942.s
+*-host-x86_64-unknown-linux-gnu.bc
+*-host-x86_64-unknown-linux-gnu.hipi
+*-host-x86_64-unknown-linux-gnu.o
+*-host-x86_64-unknown-linux-gnu.s
+*.hip-hip-amdgcn-amd-amdhsa.hipfb
+
+# Profiling output
 rocprof_out/
 .rocprofv3/
 .rocprof_app_*.sh
-__pycache__/
 
-# Experiments, alternate kernels, profiling dumps, hipcc -save-temps output
+# Local scratch
 temp/
-# If save-temps lands in repo root before `make isa-report` moves it:
-attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.bc
-attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.o
-attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.out
-attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.out.resolution.txt
-attention_kernel.hip-hip-amdgcn-amd-amdhsa.hipfb
-attention_kernel-host-x86_64-unknown-linux-gnu.bc
-attention_kernel-host-x86_64-unknown-linux-gnu.o
