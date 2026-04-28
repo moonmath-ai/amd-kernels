@@ -43,12 +43,40 @@ under the hood; if you have a ROCm-built torch and place tensors on a
 - `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces RTNE + RTZ root-level `.so`).
 - `runner.py` — standalone benchmark harness comparing against AITER.
-- `attention_kernel_aiter_v3.cpp` — AITER reference for comparison.
+- `third_party/aiter/` — AITER as a git submodule, called through its Python API.
 
 ## Bench
 
+`runner.py` compares the package's `ma.forward` against
+[AITER](https://github.com/ROCm/aiter)'s `flash_attn_func` (V3 ASM forward),
+RTNE and RTZ, on the same inputs.
+
+From scratch:
+
 ```sh
+# 1. clone with the AITER submodule
+#    AITER's own 3rdparty/composable_kernel)
+git clone https://github.com/moonmath-ai/cdna3-attention.git
+cd cdna3-attention
+git submodule update --init third_party/aiter
+
+# 2. python env. AITER JIT-compiles a Python-ABI-bound .so, so pin 3.11.
+conda create -n cdna3 python=3.11 ninja -y
+conda activate cdna3
+
+# 3. ROCm-built torch + AITER's runtime deps (skipping flydsl/matplotlib/pytest)
+pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
+pip install pandas pybind11 einops pyyaml psutil
+
+# 4. install our package (compiles RTNE + RTZ kernels via hipcc)
+pip install -e .
+
+# 5. run. First call JIT-builds two AITER modules (~50s, then cached
+#    under third_party/aiter/aiter/jit/build/).
 python runner.py --warmup-iters 8 --benchmark-iters 30
 ```
+
+`ninja` must be on `$PATH` for AITER's JIT, not just installed — the
+conda recipe above takes care of it.
 
 See `examples/basic.py` for a small correctness check using a fp32 reference.
