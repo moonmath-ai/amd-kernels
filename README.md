@@ -62,12 +62,12 @@ cd cdna3-attention
 git submodule update --init third_party/aiter
 
 # 2. python env. AITER JIT-compiles a Python-ABI-bound .so, so pin 3.11.
-conda create -n cdna3 python=3.11 ninja -y
+conda create -n cdna3 python=3.10 ninja -y
 conda activate cdna3
 
 # 3. ROCm-built torch + AITER's runtime deps (skipping flydsl/matplotlib/pytest)
 pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
-pip install pandas pybind11 einops pyyaml psutil
+pip install pandas pybind11 einops pyyaml psutil flydsl==0.1.3
 
 # 4. install our package (compiles RTNE + RTZ kernels via hipcc)
 pip install -e .
