@@ -2,7 +2,9 @@
 //
 // Block: 4 waves × 64 threads, occupancy 2 (8 waves/CU). 16×16×16 MFMA tiles,
 // head_dim = 128. Each wave handles 2 × 16-row Q tiles (lo/hi), so a CTA
-// covers 8 consecutive tiles along the Q axis. Output is RTNE-packed bf16.
+// covers 8 consecutive tiles along the Q axis. Output and softmax-P pack to
+// bf16 with rounding selected at compile time: -DBF16_ROUND=RTNE (default,
+// lower error) or RTZ (cheaper, no bias add).
 //
 // LDS layout:
 //   lds_k[2][64][68]  double-buffered K block, slab 0 = low-half-dim,
@@ -54,7 +56,15 @@ constexpr int kDTiles    = kHeadDim / kKTile;
 constexpr int kHalfDim   = kHeadDim / 2;
 constexpr int kLdsStride = 68;
 constexpr float kLog2e   = 1.4426950408889634f;
-constexpr int kBarrierLgkm = 1;
+constexpr int kBarrierLgkm = 0;
+
+// fp32 → bf16 rounding mode, compile-time selectable. RTNE adds a bias before
+// the high-16 truncation (1 ULP → 0.5 ULP max error); RTZ truncates directly.
+enum class BF16Round { RTNE, RTZ };
+#ifndef BF16_ROUND
+#define BF16_ROUND RTNE
+#endif
+inline constexpr BF16Round kBf16Round = BF16Round::BF16_ROUND;
 
 __device__ __forceinline__ fp32x4_t zero4() { return fp32x4_t{0,0,0,0}; }
 __device__ __forceinline__ float    exp2c(float x) { return __builtin_amdgcn_exp2f(x); }
@@ -105,19 +115,23 @@ __device__ __forceinline__ void wait_vmcnt() {
     __builtin_amdgcn_s_waitcnt(0x0F70 | N);
 }
 
-// fp32 → bf16 round-to-nearest-even. bias = 0x7FFF + (high-bit-of-low-half),
-// then take high 16 bits of (u + bias). NaN handling skipped — softmax P ≥ 0.
-__device__ __forceinline__ unsigned rtne_round32(float f) {
-    const unsigned u    = __builtin_bit_cast(unsigned, f);
-    const unsigned lsb  = (u >> 16) & 1u;
-    const unsigned bias = 0x7FFFu + lsb;
-    return u + bias;
+// fp32 → bf16 with kBf16Round. RTNE: u += 0x7FFF + (bit16 of u) before taking
+// the high 16. RTZ: take the high 16 of u directly. v_perm_b32 with mask
+// 0x07060302 packs two rounded fp32s into a 32-bit dword of two bf16s.
+__device__ __forceinline__ unsigned bf16_round(float f) {
+    const unsigned u = __builtin_bit_cast(unsigned, f);
+    if constexpr (kBf16Round == BF16Round::RTNE) {
+        const unsigned bias = 0x7FFFu + ((u >> 16) & 1u);
+        return u + bias;
+    } else {
+        return u;
+    }
 }
 __device__ __forceinline__ bf16x4_t pack4_bf16(float a, float b, float c, float d) {
-    const unsigned ua = rtne_round32(a);
-    const unsigned ub = rtne_round32(b);
-    const unsigned uc = rtne_round32(c);
-    const unsigned ud = rtne_round32(d);
+    const unsigned ua = bf16_round(a);
+    const unsigned ub = bf16_round(b);
+    const unsigned uc = bf16_round(c);
+    const unsigned ud = bf16_round(d);
     const unsigned w0 = __builtin_amdgcn_perm(ub, ua, 0x07060302u);
     const unsigned w1 = __builtin_amdgcn_perm(ud, uc, 0x07060302u);
     bf16x4_t o;
@@ -446,7 +460,7 @@ void attention_forward(
         asm volatile("s_setprio 0");
     }
 
-    // Epilogue: normalize O by 1/l, RTNE-pack to bf16, b64 store.
+    // Epilogue: normalize O by 1/l, pack to bf16 (RTNE/RTZ), b64 store.
     #pragma unroll
     for (int qg = 0; qg < 2; ++qg) {
         if (!valid[qg]) continue;

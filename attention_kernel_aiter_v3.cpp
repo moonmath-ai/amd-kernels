@@ -236,6 +236,21 @@ void launch_aiter(const fmha_fwd_v3_args& args, hipStream_t stream, int gdx, int
 
 } // namespace
 
+// Switch the loaded AITER kernel variant ("rtne" | "rtna" | "rtz"). Unloads
+// the current HSACO if a different variant is requested; the next launch
+// reloads with the new variant. Returns 0 on success, 1 on bad input.
+extern "C" int set_aiter_variant(const char* variant) {
+    if (!variant) return 1;
+    const std::string v = variant;
+    if (v != "rtne" && v != "rtna" && v != "rtz") return 1;
+    if (g_loaded && v == g_kernel_variant) return 0;
+    if (g_module) { hip_check(hipModuleUnload(g_module)); g_module = nullptr; }
+    g_func = nullptr;
+    g_loaded = false;
+    g_kernel_variant = v;
+    return 0;
+}
+
 extern "C" hipError_t launch_attention_forward(const bf16_t* Q,
                                                 const bf16_t* K,
                                                 const bf16_t* V,
