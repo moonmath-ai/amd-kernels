@@ -42,20 +42,21 @@ under the hood; if you have a ROCm-built torch and place tensors on a
 - `attention_kernel.hip` — the kernel.
 - `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces RTNE + RTZ root-level `.so`).
-- `runner.py` — standalone benchmark harness comparing against AITER.
+- `runner.py` — standalone benchmark harness comparing against AITER and (optionally) Modular MAX.
 - `third_party/aiter/` — AITER as a git submodule, called through its Python API.
 
 ## Bench
 
 `runner.py` compares the package's `ma.forward` against
 [AITER](https://github.com/ROCm/aiter)'s `flash_attn_func` (V3 ASM forward),
-RTNE and RTZ, on the same inputs.
+RTNE and RTZ, on the same inputs. If the [Modular MAX](https://www.modular.com/max)
+package is installed, it also benches `max.nn.kernels.flash_attention_gpu`.
 
 From scratch:
 
 ```sh
 # 1. clone with the AITER submodule
-#    AITER's own 3rdparty/composable_kernel)
+#    (no recursion needed — we don't use AITER's own 3rdparty/composable_kernel)
 git clone https://github.com/moonmath-ai/cdna3-attention.git
 cd cdna3-attention
 git submodule update --init third_party/aiter
@@ -71,12 +72,19 @@ pip install pandas pybind11 einops pyyaml psutil
 # 4. install our package (compiles RTNE + RTZ kernels via hipcc)
 pip install -e .
 
-# 5. run. First call JIT-builds two AITER modules (~50s, then cached
+# 5. (optional) Modular MAX for the third bench row
+pip install max
+
+# 6. run. First call JIT-builds two AITER modules (~50s, then cached
 #    under third_party/aiter/aiter/jit/build/).
 python runner.py --warmup-iters 8 --benchmark-iters 30
 ```
 
 `ninja` must be on `$PATH` for AITER's JIT, not just installed — the
 conda recipe above takes care of it.
+
+If `max` isn't installed (or you pass `--no-max`), runner skips the MAX row
+and prints a one-line "skipped" notice. The MAX path round-trips through
+the host once at setup to seed its `Buffer`s; the timed loop is device-only.
 
 See `examples/basic.py` for a small correctness check using a fp32 reference.
