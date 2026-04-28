@@ -51,8 +51,54 @@ under the hood; if you have a ROCm-built torch and place tensors on a
 [AITER](https://github.com/ROCm/aiter)'s `flash_attn_func` (V3 ASM forward),
 RTNE and RTZ, on the same inputs. If the [Modular MAX](https://www.modular.com/max)
 package is installed, it also benches `max.nn.kernels.flash_attention_gpu`.
+For a multi-shape comparison, `bench_table.py` runs every shape against all
+three backends with median-over-passes timing.
 
-From scratch:
+### Results — MI300X, bf16, head\_dim = 128
+
+Median of 5 independent timing passes (30 iters each) per shape. Speedups are
+`other_ms / ours_ms`, so >1× means we win. Modular MAX has no rounding-mode
+selector and rounds RTNE internally (verified empirically).
+
+| Shape (B, H, S, D) | Round | Ours (ms) | AITER v3 (ms) | Speedup vs AITER | Modular MAX (ms) | Speedup vs MAX |
+|---|---|---|---|---|---|---|
+| (2, 16, 2048, 128) | RTNE | 0.194 | **0.169** | 0.87× | 0.201 | 1.04× |
+| (2, 16, 2048, 128) | RTZ | 0.188 | **0.145** | 0.77× | 0.201 | 1.07× |
+| (2, 24, 4096, 128) | RTNE | 0.991 | **0.915** | 0.92× | 1.122 | 1.13× |
+| (2, 24, 4096, 128) | RTZ | 0.961 | **0.804** | 0.84× | 1.122 | 1.17× |
+| (2, 24, 8192, 128) | RTNE | **3.668** | 3.747 | 1.02× | 4.216 | 1.15× |
+| (2, 24, 8192, 128) | RTZ | 3.577 | **3.265** | 0.91× | 4.216 | 1.18× |
+| (2, 24, 16384, 128) | RTNE | 14.901 | **14.499** | 0.97× | 17.848 | 1.20× |
+| (2, 24, 16384, 128) | RTZ | 14.548 | **12.429** | 0.85× | 17.848 | 1.23× |
+| (2, 24, 32768, 128) | RTNE | 56.043 | **54.747** | 0.98× | 70.233 | 1.25× |
+| (2, 24, 32768, 128) | RTZ | 54.869 | **48.284** | 0.88× | 70.233 | 1.28× |
+| (1, 32, 8192, 128)  | RTNE | **2.360** | 2.434 | 1.03× | 2.667 | 1.13× |
+| (1, 32, 8192, 128)  | RTZ | 2.318 | **2.131** | 0.92× | 2.667 | 1.15× |
+| (1, 32, 16384, 128) | RTNE | 9.609 | **8.889** | 0.93× | 11.024 | 1.15× |
+| (1, 32, 16384, 128) | RTZ | 9.340 | **7.822** | 0.84× | 11.024 | 1.18× |
+| (4, 16, 4096, 128)  | RTNE | **1.207** | 1.226 | 1.02× | 1.352 | 1.12× |
+| (4, 16, 4096, 128)  | RTZ | 1.187 | **1.086** | 0.91× | 1.352 | 1.14× |
+| (4, 16, 16384, 128) | RTNE | 18.421 | **18.041** | 0.98× | 22.046 | 1.20× |
+| (4, 16, 16384, 128) | RTZ | 17.904 | **15.967** | 0.89× | 22.046 | 1.23× |
+| (1, 64, 16384, 128) | RTNE | 18.464 | **18.040** | 0.98× | 22.766 | 1.23× |
+| (1, 64, 16384, 128) | RTZ | 17.951 | **15.975** | 0.89× | 22.766 | 1.27× |
+
+Geomean speedup across shapes:
+- **RTNE** — ours **0.97×** vs AITER, **1.16×** vs MAX
+- **RTZ** — ours **0.87×** vs AITER, **1.19×** vs MAX
+
+We trade blows with AITER on RTNE (parity within a few % each way, depending on
+shape) and lose ~10% on RTZ — AITER's RTZ path uses 32×32×8 MFMA + 8 waves
+at occ=1 + 64 KB LDS, structurally different from our 16×16×16 + 4 waves at
+occ=2 + 32 KB LDS. We are consistently ~15-25% faster than Modular MAX.
+
+Reproduce with:
+
+```sh
+python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5
+```
+
+### Running the bench from scratch
 
 ```sh
 # 1. clone with the AITER submodule
