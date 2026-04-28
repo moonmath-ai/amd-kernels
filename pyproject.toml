@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moonmath-attention"
+version = "0.1.0"
+description = "Hand-tuned bf16 forward attention kernel for AMD CDNA3 (MI300X)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["torch>=2.0"]
+
+[tool.setuptools]
+packages = ["moonmath_attention"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+moonmath_attention = ["libattention_*.so"]

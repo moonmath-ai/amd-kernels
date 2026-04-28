@@ -6,6 +6,11 @@
 # Python
 __pycache__/
 *.pyc
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
 
 # hipcc --save-temps output
 *-hip-amdgcn-amd-amdhsa-gfx942.bc
