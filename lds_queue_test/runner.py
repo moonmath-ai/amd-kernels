@@ -16,10 +16,10 @@ import torch
 ROOT = Path(__file__).parent
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--variant",      type=int, default=0, choices=[0, 1],
-                help="0=b32 (4 cy floor, ZERO conflicts), 1=b128 (8 cy floor, ZERO conflicts)")
+ap.add_argument("--variant",      type=int, default=0, choices=[0],
+                help="0=v5pp_pv_phase (4 waves/CTA, occ=2 = 8 waves/CU)")
 ap.add_argument("--n-blocks",     type=int, default=304, help="grid CTAs (1 per CU on MI300X)")
-ap.add_argument("--n-iters",      type=int, default=8096, help="loop iters per CTA (work amount). Larger = longer trace, better ATT samples.")
+ap.add_argument("--n-iters",      type=int, default=64, help="outer iters per CTA — small to keep loop minimal.")
 ap.add_argument("--warmup-iters", type=int, default=2)
 ap.add_argument("--bench-iters",  type=int, default=10)
 args = ap.parse_args()
@@ -38,7 +38,7 @@ lib.launch_lds_queue_test.argtypes = [
 
 device = torch.device("cuda")
 torch.manual_seed(42)
-BLOCK = 64 * 8  # kBlockSize
+BLOCK = 64 * 4  # kBlockSize = 4 waves
 in_buf  = torch.randint(0, 2**31 - 1, (args.n_blocks * BLOCK,), dtype=torch.int32, device=device)
 out_buf = torch.empty_like(in_buf)
 stream = torch.cuda.current_stream(device).cuda_stream
@@ -70,5 +70,5 @@ ms = start.elapsed_time(stop) / args.bench_iters
 launch()
 torch.cuda.synchronize()
 
-variant_name = ["b32 (8B/lane, 4 cy floor)", "b128 (16B/lane, 8 cy floor)"][args.variant]
+variant_name = "v5pp pv_phase access pattern (4 waves, occ=2)"
 print(f"variant={args.variant} ({variant_name})  blocks={args.n_blocks}  iters={args.n_iters}  ms/dispatch={ms:.3f}")

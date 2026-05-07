@@ -13,8 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 VARIANT="${VARIANT:-0}"
-N_ITERS="${N_ITERS:-131072}"   # large enough to give a meaningful ATT trace
-N_BLOCKS="${N_BLOCKS:-304}"     # 1 CTA per CU on MI300X
+N_ITERS="${N_ITERS:-64}"        # small loop — just enough to get clean ATT samples
+N_BLOCKS="${N_BLOCKS:-304}"     # exactly MI300X CU count (1 CTA per CU)
 WARMUP="${WARMUP:-2}"
 PYTHON="${PYTHON:-/home/tarik/miniconda3/envs/lite_attention/bin/python}"
 DECODER_LIB="${DECODER_LIB:-/opt/rocm-7.0.0/lib}"
