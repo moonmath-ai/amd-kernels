@@ -1,0 +1,13 @@
+# Build artifacts
+*.so
+*.bc
+*.hipi
+*.o
+*.out
+*.hipfb
+*.txt
+kernel.s
+
+# Profile output dirs
+profile_v*/
+.rocprofv3/
