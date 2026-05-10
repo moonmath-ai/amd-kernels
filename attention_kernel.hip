@@ -127,12 +127,8 @@ __device__ __forceinline__ int chiplet_swizzle(int wgid, int num_wgs, int chunk_
 
 // ─── bf16 packing with selectable rounding ─────────────────────────────────
 
-// MaybeNaN=true → AITER-equivalent NaN preservation: NaN propagates as
-// 0x7FFF0000, finite values get tie-to-even bias. Implemented as inline
-// asm (4 ops: v_cmp_u_f32 + v_bfe_u32 + v_add3_u32 + v_cndmask_b32). The
-// C++ form is forced into a 5-op shape because -ffinite-math-only folds
-// `f != f` away, so we drop to asm to match AITER's instruction count.
-// MaybeNaN=false skips the NaN check (3 ops).
+// MaybeNaN=true → NaN preservation: NaN propagates as
+// 0x7FFF0000, finite values get tie-to-even bias.
 template <bool MaybeNaN>
 __device__ __forceinline__ unsigned bf16_round(float f) {
     if constexpr (kBf16Round == BF16Round::RTNE) {
@@ -246,7 +242,7 @@ __device__ __forceinline__ void softmax_update(
         const float p2 = exp2c(fmaf(sacc[sn][2], scale_log2e, neg_m));
         const float p3 = exp2c(fmaf(sacc[sn][3], scale_log2e, neg_m));
         bs[sn]   = (p0 + p1) + (p2 + p3);
-        // Match AITER fmha_v3_fwd: NaN-preserving RTNE on softmax pack.
+        // NaN-preserving RTNE on softmax pack.
         preg[sn] = pack4_bf16</*MaybeNaN=*/true>(p0, p1, p2, p3);
     }
     float bsum = (bs[0] + bs[1]) + (bs[2] + bs[3]);
@@ -529,8 +525,6 @@ void attention_forward_v18(
     //   ────────   ────────────      ────────────
     //   Phase 1    pv + qk           sm  + K[N+1] HBM→LDS
     //   Phase 2    sm + V HBM/LDS    pv  + qk
-    // The mfma engine sees one group running pv+qk per phase. sacc/preg
-    // storage is shared (single copy, no per-group carries).
     for (int N = 0; N < nblocks; ++N) {
         const int  p        = N & 1;
         const int  K_cur    = p,     K_nxt = 1 - p;
@@ -545,16 +539,10 @@ void attention_forward_v18(
             if (!first) softmax_phase(sacc, preg, bmax);
             if (has_next) direct_lds_k(N + 1, K_nxt);
         }
-        // Mid-iter barrier: separates phase 1 from phase 2. Empirically
-        // necessary for wave-pair sync on the SIMD's mfma engine — without
-        // it, group A's softmax progress drifts and contention with B's
-        // qk mfma cycles regresses ~2-3%.
+
         __builtin_amdgcn_s_barrier();
 
         if (group_a) {
-            // softmax first — sacc consumed end-of-mfma-chain so it's already
-            // valid here. Then vstore (consumes nv0..3 holding V[N]), then
-            // pre-issue V[N+1] which reuses nv0..3 (now dead).
             softmax_phase(sacc, preg, bmax);
             wait_vmcnt0();
             vstore_v(V_nxt, nv0, nv1, nv2, nv3);
@@ -580,10 +568,7 @@ void attention_forward_v18(
         const float inv = rcpf(l_sum[qg]);
         #pragma unroll
         for (int t = 0; t < kDTiles; ++t) {
-            // Output store: inv=rcpf(l_sum) can be +Inf if l_sum=0 (degenerate
-            // empty-attention case), so o*inv could be NaN. Match AITER's
-            // NaN-preserving RTNE path here.
-            const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(
+            const bf16x4_t out = pack4_bf16</*MaybeNaN=*/false>(
                 o[qg][t][0] * inv, o[qg][t][1] * inv,
                 o[qg][t][2] * inv, o[qg][t][3] * inv);
             bst8(or_, ((qbase[qg] + col) * kHeadDim + t * kKTile + 4 * quad) * 2, out);
