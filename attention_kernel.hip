@@ -184,10 +184,13 @@ __device__ __forceinline__ float xor_sum(float v) {
     const int lane = wave_lane_id();
     const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
     wait_lgkmcnt0();
-    const float v1 = v + __builtin_bit_cast(float, p16);
-    const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, v1));
+    float r1; asm volatile("v_add_f32_e32 %0, %1, %2"
+                           : "=v"(r1) : "v"(v), "v"(__builtin_bit_cast(float, p16)));
+    const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, r1));
     wait_lgkmcnt0();
-    return v1 + __builtin_bit_cast(float, p32);
+    float r2; asm volatile("v_add_f32_e32 %0, %1, %2"
+                           : "=v"(r2) : "v"(r1), "v"(__builtin_bit_cast(float, p32)));
+    return r2;
 }
 __device__ __forceinline__ bool wave_all(bool p) { return __all((int)p) != 0; }
 
@@ -219,15 +222,28 @@ __device__ __forceinline__ void wait_lgkm_pin2(u32x4_t& a, u32x4_t& b) {
 
 // ─── online softmax: full rescale every iter, unconditional ────────────────
 
-// Force scalar v_add_f32. Without this the compiler packs pairs of qg's
-// bsum adds into v_pk_add_f32 → 16-deep linear chain on a single VGPR pair
-// where each writeback contends with concurrent pv_phase mfma writebacks.
-// Experiment: keep the math identical but split each packed-add into 2
-// scalar adds so the writeback port sees half-width writes.
+// Force scalar v_add_f32 / v_mul_f32 so the compiler can't pack pairs of
+// qg's softmax math into v_pk_*_f32. Packed ops produce a long linear
+// chain on a single VGPR pair whose wide writebacks contend with the
+// concurrent pv_phase mfma writebacks on the same SIMD's wave-pair.
 __device__ __forceinline__ float vadd_f32(float a, float b) {
     float r;
     asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
     return r;
+}
+__device__ __forceinline__ float vmul_f32(float a, float b) {
+    float r;
+    asm volatile("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+__device__ __forceinline__ float vfma_f32(float a, float b, float c) {
+    float r;
+    asm volatile("v_fma_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+}
+__device__ __forceinline__ fp32x4_t scale4_scalar(fp32x4_t v, float s) {
+    return fp32x4_t{vmul_f32(v[0], s), vmul_f32(v[1], s),
+                    vmul_f32(v[2], s), vmul_f32(v[3], s)};
 }
 
 __device__ __forceinline__ void softmax_update(
@@ -240,7 +256,7 @@ __device__ __forceinline__ void softmax_update(
     const float rescale = exp2c(old_m - new_m);
 
     #pragma unroll
-    for (int t = 0; t < kDTiles; ++t) oreg[t] = scale4(oreg[t], rescale);
+    for (int t = 0; t < kDTiles; ++t) oreg[t] = scale4_scalar(oreg[t], rescale);
 
     row_m = new_m;
     const float neg_m = -new_m;
@@ -258,7 +274,7 @@ __device__ __forceinline__ void softmax_update(
     }
     float bsum = vadd_f32(vadd_f32(bs[0], bs[1]), vadd_f32(bs[2], bs[3]));
     bsum = xor_sum(bsum);
-    row_l = row_l * rescale + bsum;
+    row_l = vfma_f32(row_l, rescale, bsum);
 }
 
 // ─── kernel ────────────────────────────────────────────────────────────────
