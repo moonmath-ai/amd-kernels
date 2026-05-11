@@ -219,6 +219,17 @@ __device__ __forceinline__ void wait_lgkm_pin2(u32x4_t& a, u32x4_t& b) {
 
 // ─── online softmax: full rescale every iter, unconditional ────────────────
 
+// Force scalar v_add_f32. Without this the compiler packs pairs of qg's
+// bsum adds into v_pk_add_f32 → 16-deep linear chain on a single VGPR pair
+// where each writeback contends with concurrent pv_phase mfma writebacks.
+// Experiment: keep the math identical but split each packed-add into 2
+// scalar adds so the writeback port sees half-width writes.
+__device__ __forceinline__ float vadd_f32(float a, float b) {
+    float r;
+    asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+
 __device__ __forceinline__ void softmax_update(
     fp32x4_t sacc[], fp32x4_t oreg[], bf16x4_t preg[],
     float& row_m, float& row_l, float scale_log2e, float bmax_local
@@ -245,7 +256,7 @@ __device__ __forceinline__ void softmax_update(
         // NaN-preserving RTNE on softmax pack.
         preg[sn] = pack4_bf16</*MaybeNaN=*/true>(p0, p1, p2, p3);
     }
-    float bsum = (bs[0] + bs[1]) + (bs[2] + bs[3]);
+    float bsum = vadd_f32(vadd_f32(bs[0], bs[1]), vadd_f32(bs[2], bs[3]));
     bsum = xor_sum(bsum);
     row_l = row_l * rescale + bsum;
 }
