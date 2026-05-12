@@ -192,6 +192,7 @@ __device__ __forceinline__ float xor_sum(float v) {
                            : "=v"(r2) : "v"(r1), "v"(__builtin_bit_cast(float, p32)));
     return r2;
 }
+
 __device__ __forceinline__ bool wave_all(bool p) { return __all((int)p) != 0; }
 
 
@@ -277,6 +278,7 @@ __device__ __forceinline__ void softmax_update(
     row_l = vfma_f32(row_l, rescale, bsum);
 }
 
+
 // ─── kernel ────────────────────────────────────────────────────────────────
 
 __global__ __launch_bounds__(kBlockSize, 1)
@@ -340,6 +342,18 @@ void attention_forward_v18(
     __shared__ uint32_t lds_k[2][kNBlock  * kKDwPerRow];   // 32 KB (2-buf)
     __shared__ uint32_t lds_v[2][kHeadDim * kVDwPerRow];   // 32 KB (2-buf)
 
+    // ─── Cached lane-swizzle byte offsets for QK reads ─────────────────────
+    //
+    //   qk byte addr = qk_b_dw[dp] | (sn << 12) | (kbuf << 14)
+    //
+    // bit layout: [kbuf:14][sn:12-13][col:8-11][lane_perm*4:2-6] — disjoint.
+    const uint32_t qk_b_dw[4] = {
+        (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^   0u)),
+        (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^  32u)),
+        (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^  64u)),
+        (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^  96u)),
+    };
+
     // ─── Q load (persistent VGPR for whole kernel) ─────────────────────────
     bf16x4_t q[2][kDTiles];
     #pragma unroll
@@ -391,6 +405,7 @@ void attention_forward_v18(
             buffer_load_b32_to_lds(kr, lds_base + call * 256, voff, soff);
         }
     };
+
 
     // ─── HBM V loader (group A) + DPP transpose + LDS store ────────────────
     const int ltid      = tid & ((kLoadWaves * kWaveSize) - 1);
@@ -462,9 +477,9 @@ void attention_forward_v18(
     // and softmax_update's exp chain doesn't wait for it on the critical
     // path.
     auto qk_phase = [&](int kbuf, fp32x4_t sacc_dst[2][kNSub], float bmax_dst[2]) {
+        // byte_addr = qk_b_dw[dp] | (sn << 12) | (kbuf << 14)  — all bit-disjoint.
         auto k_addr = [&](int sn, int dp) -> uint32_t {
-            const int dw = sn * 16 * kKDwPerRow + dw_base_qk[dp];
-            return (uint32_t)(uintptr_t)&lds_k[kbuf][dw];
+            return qk_b_dw[dp] | ((uint32_t)sn << 12) | ((uint32_t)kbuf << 14);
         };
 
         // Pre-issue dp=0 reads. Caller has placed this call right after the
@@ -584,8 +599,8 @@ void attention_forward_v18(
             if (!first) pv_phase(V_cur, preg);
             qk_phase(K_cur, sacc, bmax);
         } else {
-            if (!first) softmax_phase(sacc, preg, bmax);
             if (has_next) direct_lds_k(N + 1, K_nxt);
+            if (!first)  softmax_phase(sacc, preg, bmax);
         }
 
         __builtin_amdgcn_s_barrier();
