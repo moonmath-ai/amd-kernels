@@ -294,6 +294,28 @@ void attention_forward_v18(
     const int  quad    = lane >> 4;
     const bool group_a = wid < kLoadWaves;
 
+    // Precomputed lane swizzle bases.
+    // qk and pv swizzles factor as
+    //   dw = row_stride + col*ROW_DW + (lane_perm ^ (k*8))
+    // with lane_perm = (2*quad) ^ (col<<1) per-lane-constant and
+    // k ∈ {0,1,2,3} covering all distinct values of the iter-varying XOR
+    // (k=dp for qk; k = sn ^ (dt&1) for pv). Precomputing the 4 lane
+    // bases as VGPR constants lets the compiler collapse the per-call
+    // 3-4-op XOR chain to a single v_lshl_or_b32
+    const int lane_perm = (2 * quad) ^ (col << 1);
+    const int dw_base_pv[4] = {
+        col * 32 + (lane_perm ^ 0),
+        col * 32 + (lane_perm ^ 8),
+        col * 32 + (lane_perm ^ 16),
+        col * 32 + (lane_perm ^ 24),
+    };
+    const int dw_base_qk[4] = {
+        col * 64 + (lane_perm ^ 0),
+        col * 64 + (lane_perm ^ 8),
+        col * 64 + (lane_perm ^ 16),
+        col * 64 + (lane_perm ^ 24),
+    };
+
     // Head-first XCD swizzle: chunk_size = gridDim.x = blocks_per_head puts
     // every q-block of one (B,H) on the same XCD for L2 reuse of K and V.
     const int wgid_in   = blockIdx.y * gridDim.x + blockIdx.x;
@@ -409,7 +431,7 @@ void attention_forward_v18(
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int d        = vdim + 2 * i + is_odd_k;
-            const int swizzled = npair_idx ^ ((d & 0xF) << 1);
+            const int swizzled = npair_idx ^ ((d & 0xF) << 1) ^ (((d >> 4) & 1) << 3);
             const int addr     = base + d * kVDwPerRow + swizzled;
             lds_v[buf][addr]                   = v0[i];
             lds_v[buf][addr + 32 * kVDwPerRow] = v1[i];
@@ -441,8 +463,7 @@ void attention_forward_v18(
     // path.
     auto qk_phase = [&](int kbuf, fp32x4_t sacc_dst[2][kNSub], float bmax_dst[2]) {
         auto k_addr = [&](int sn, int dp) -> uint32_t {
-            const int dw = (sn * 16 + col) * kKDwPerRow
-                         + ((8 * dp + 2 * quad) ^ (col << 1));
+            const int dw = sn * 16 * kKDwPerRow + dw_base_qk[dp];
             return (uint32_t)(uintptr_t)&lds_k[kbuf][dw];
         };
 
@@ -515,8 +536,8 @@ void attention_forward_v18(
         for (int dt = 0; dt < kDTiles; ++dt)
             #pragma unroll
             for (int sn = 0; sn < kNSub; ++sn) {
-                const int dw = (dt * 16 + col) * kVDwPerRow
-                             + ((sn * 8 + 2 * quad) ^ (col << 1));
+                const int k  = sn ^ (dt & 1);
+                const int dw = dt * 16 * kVDwPerRow + dw_base_pv[k];
                 bf16x4_t vf = *reinterpret_cast<const bf16x4_t*>(&lds_v[vbuf][dw]);
                 #pragma unroll
                 for (int qg = 0; qg < 2; ++qg)
