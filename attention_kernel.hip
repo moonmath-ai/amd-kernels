@@ -220,7 +220,7 @@ __device__ __forceinline__ void wait_lgkm_pin2(u32x4_t& a, u32x4_t& b) {
 }
 
 
-// ─── online softmax: full rescale every iter, unconditional ────────────────
+// ─── online softmax with skip-rescale gate ─────────────────────────────────
 
 // Force scalar v_add_f32 / v_mul_f32 so the compiler can't pack pairs of
 // qg's softmax math into v_pk_*_f32. Packed ops produce a long linear
@@ -250,16 +250,30 @@ __device__ __forceinline__ void softmax_update(
     fp32x4_t sacc[], fp32x4_t oreg[], bf16x4_t preg[],
     float& row_m, float& row_l, float scale_log2e, float bmax_local
 ) {
-    const float bmax    = xor_max(bmax_local);
-    const float old_m   = row_m;
-    const float new_m   = fmaxf(old_m, bmax * scale_log2e);
-    const float rescale = exp2c(old_m - new_m);
+    const float new_m_local = bmax_local * scale_log2e;
+    const bool  first_block = row_l == 0.f;
+    const bool  lane_ok = (new_m_local - row_m) < kRescaleThreshold;
+    const bool  all_ok  = wave_all(lane_ok) && !first_block;
 
-    #pragma unroll
-    for (int t = 0; t < kDTiles; ++t) oreg[t] = scale4_scalar(oreg[t], rescale);
-
-    row_m = new_m;
-    const float neg_m = -new_m;
+    float neg_m;
+    float rescale = 1.f;
+    if (__builtin_expect(all_ok, 1)) {
+        neg_m = -row_m;
+    } else {
+        const float bmax  = xor_max(bmax_local);
+        const float old_m = row_m;
+        const float new_m = fmaxf(old_m, bmax * scale_log2e);
+        if (new_m != old_m) {
+            rescale = first_block ? 0.f : exp2c(old_m - new_m);
+            if (!first_block) {
+                #pragma unroll
+                for (int t = 0; t < kDTiles; ++t)
+                    oreg[t] = scale4_scalar(oreg[t], rescale);
+            }
+        }
+        row_m = new_m;
+        neg_m = -new_m;
+    }
 
     float bs[kNSub];
     #pragma unroll
