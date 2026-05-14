@@ -172,6 +172,11 @@ __device__ __forceinline__ int wave_lane_id() {
     return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
 
+// Cross-lane reductions over the 4-lane subset {i, i^16, i^32, i^48}.
+// In our mfma 16x16x16 output layout each lane outputs at q_row = col, so
+// lanes with the same col but varying quad process the same q-row across
+// all 64 kv positions (4 quads × 16 kv per quad). Reducing over those 4
+// lanes is exactly the per-q-row softmax reduction.
 __device__ __forceinline__ float xor_max(float v) {
     const int lane = wave_lane_id();
     const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
@@ -251,7 +256,7 @@ __device__ __forceinline__ void softmax_update(
     float& row_m, float& row_l, float scale_log2e, float bmax_local
 ) {
     const float new_m_local = bmax_local * scale_log2e;
-    const bool  first_block = row_l == 0.f;
+    const bool  first_block = row_m == -FLT_MAX;
     const bool  lane_ok = (new_m_local - row_m) < kRescaleThreshold;
     const bool  all_ok  = wave_all(lane_ok) && !first_block;
 
@@ -268,7 +273,7 @@ __device__ __forceinline__ void softmax_update(
             if (!first_block) {
                 #pragma unroll
                 for (int t = 0; t < kDTiles; ++t)
-                    oreg[t] = scale4_scalar(oreg[t], rescale);
+                    oreg[t] = scale4(oreg[t], rescale);
             }
         }
         row_m = new_m;
