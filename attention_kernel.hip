@@ -171,10 +171,10 @@ __device__ __forceinline__ bf16x4_t pack4_bf16(float a, float b, float c, float 
 __device__ __forceinline__ int wave_lane_id() {
     return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
+
 __device__ __forceinline__ float xor_max(float v) {
     const int lane = wave_lane_id();
     const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
-    wait_lgkmcnt0();
     const float v1 = fmaxf(v, __builtin_bit_cast(float, p16));
     const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, v1));
     wait_lgkmcnt0();
@@ -183,7 +183,6 @@ __device__ __forceinline__ float xor_max(float v) {
 __device__ __forceinline__ float xor_sum(float v) {
     const int lane = wave_lane_id();
     const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
-    wait_lgkmcnt0();
     float r1; asm volatile("v_add_f32_e32 %0, %1, %2"
                            : "=v"(r1) : "v"(v), "v"(__builtin_bit_cast(float, p16)));
     const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, r1));
