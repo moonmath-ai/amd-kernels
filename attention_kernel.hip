@@ -66,6 +66,17 @@ __device__ __forceinline__ fp32x4_t scale4(fp32x4_t v, float s) {
     return fp32x4_t{v[0]*s, v[1]*s, v[2]*s, v[3]*s};
 }
 
+// Compiler-natural emits v_pk_mul_f32, this helper forces 4 unpacked v_mul_f32_e32 instructions
+__device__ __forceinline__ fp32x4_t scale4_unpacked(fp32x4_t v, float s) {
+    float v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
+    asm volatile("s_nop 7" : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3));
+    asm volatile("v_mul_f32_e32 %0, %1, %0" : "+v"(v0) : "v"(s));
+    asm volatile("v_mul_f32_e32 %0, %1, %0" : "+v"(v1) : "v"(s));
+    asm volatile("v_mul_f32_e32 %0, %1, %0" : "+v"(v2) : "v"(s));
+    asm volatile("v_mul_f32_e32 %0, %1, %0" : "+v"(v3) : "v"(s));
+    return fp32x4_t{v0, v1, v2, v3};
+}
+
 constexpr uint32_t kBufCfg = 0x00020000u;
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t mkr(const void* p) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0xFFFFFFFFu, kBufCfg);
@@ -273,7 +284,7 @@ __device__ __forceinline__ void softmax_update(
             if (!first_block) {
                 #pragma unroll
                 for (int t = 0; t < kDTiles; ++t)
-                    oreg[t] = scale4(oreg[t], rescale);
+                    oreg[t] = scale4_unpacked(oreg[t], rescale);
             }
         }
         row_m = new_m;
