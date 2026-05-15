@@ -1,21 +1,15 @@
-// Forward attention v18 (bf16, gfx942 / MI300X), FA2-style online softmax.
+// Forward attention for AMD CDNA3 (MI300X / gfx942), bf16, FA2-style online softmax.
 //
-//   • Symmetric pipeline: both groups run sm[n] → pv[n] → qk[n+1]. Group B
-//     is offset by one phase from group A so the SIMD's mfma engine always
-//     has exactly one group active. Single sacc/preg storage shared by both.
+// 8-wave workgroup split into two groups of 4 waves. Per K-tile each iter
+// runs in two phases:
 //
-//   • Bootstrap: A's first iter skips pv (no preg yet); B trails by one
-//     phase. Epilogue finishes pv[N-1] for both groups.
+//                    Group A                      Group B
+//   ───────  ────────────────────────  ────────────────────────────
+//   Phase 1  pv[N-1] + qk[N]           K[N+1] HBM→LDS + softmax[N-1]
+//   Phase 2  softmax[N] + V HBM/LDS    pv[N-1] + qk[N]
 //
-//   • qk_phase uses inline-asm batched-2 ds_read2_b64 with "+v"-pinned slots
-//     (depth-2 ping-pong, 4 K reads in flight). Pin is load-bearing — without
-//     it the compiler reorders mfma above the wait → stale LDS data → NaN.
-//   • pv_phase uses compiler-natural reads (lets the scheduler pick its own
-//     prefetch depth and reuse VGPRs that the manual-pin version would lock).
-//
-//   • 32 KB K LDS + 32 KB V LDS, both double-buffered.
-//   • Head-first chiplet swizzle co-locates one (B,H)'s q-blocks on a single
-//     XCD so its 4 MB K+V stays resident in that XCD's L2.
+// The phase offset keeps the SIMD's MFMA engine active in exactly one
+// group at any time, while the other group does VALU+memory work.
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
@@ -62,11 +56,12 @@ __device__ __forceinline__ float    rcpf (float x) { return __builtin_amdgcn_rcp
 __device__ __forceinline__ fp32x4_t mfma(bf16x4_t a, bf16x4_t b, fp32x4_t c) {
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
 }
-__device__ __forceinline__ fp32x4_t scale4(fp32x4_t v, float s) {
-    return fp32x4_t{v[0]*s, v[1]*s, v[2]*s, v[3]*s};
-}
 
-// Compiler-natural emits v_pk_mul_f32, this helper forces 4 unpacked v_mul_f32_e32 instructions
+// Compiler-natural emits one v_pk_mul_f32 which schedules a packed write
+// that contends with the MFMA's fp32x4 writeback hazard window (~8 wait
+// states). The "+v" pin + s_nop 7 closes the hazard, then 4 separate
+// inline-asm muls let the compiler interleave them with the surrounding
+// softmax instructions instead of chaining on one VGPR pair.
 __device__ __forceinline__ fp32x4_t scale4_unpacked(fp32x4_t v, float s) {
     float v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
     asm volatile("s_nop 7" : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3));
@@ -98,8 +93,6 @@ __device__ __forceinline__ void bst8(__amdgpu_buffer_rsrc_t r, int off, bf16x4_t
 __device__ __forceinline__ void wait_vmcnt0()   { asm volatile("s_waitcnt vmcnt(0)"  ::: "memory"); }
 __device__ __forceinline__ void wait_lgkmcnt0() { __builtin_amdgcn_s_waitcnt(0x007F); }
 __device__ __forceinline__ void lds_barrier()   { wait_lgkmcnt0(); __builtin_amdgcn_s_barrier(); }
-__device__ __forceinline__ void setprio_high()   { asm volatile("s_setprio 1" ::: "memory"); }
-__device__ __forceinline__ void setprio_normal() { asm volatile("s_setprio 0" ::: "memory"); }
 
 
 // HBM→LDS direct dword load. Bypasses clang's `s_cselect_b32 m0, s, -1`
@@ -221,10 +214,10 @@ __device__ __forceinline__ u32x4_t ds_read2_b64_d_pair(uint32_t base) {
     return r;
 }
 
-// Two-slot lgkmcnt wait. "+v" pin on both slots forces the wait to happen
-// before any consumer (mfma) reads from a/b. Without the pin the compiler
-// reorders the mfma chain above the wait → mfma reads stale LDS data.
-// Pin lifetime is local to the inlined lambda; softmax sees these slots dead.
+// Two-slot lgkmcnt wait with "+v" pin on the destination VGPRs of the
+// ds_read2_b64 issues. The pin forces the wait to happen before any
+// consumer (mfma) reads from a/b — without it, the compiler reorders the
+// mfma chain above the wait and reads stale LDS data (silently → NaN).
 template <int N>
 __device__ __forceinline__ void wait_lgkm_pin2(u32x4_t& a, u32x4_t& b) {
     static_assert(N >= 0 && N <= 4);
@@ -238,28 +231,17 @@ __device__ __forceinline__ void wait_lgkm_pin2(u32x4_t& a, u32x4_t& b) {
 
 // ─── online softmax with skip-rescale gate ─────────────────────────────────
 
-// Force scalar v_add_f32 / v_mul_f32 so the compiler can't pack pairs of
-// qg's softmax math into v_pk_*_f32. Packed ops produce a long linear
-// chain on a single VGPR pair whose wide writebacks contend with the
-// concurrent pv_phase mfma writebacks on the same SIMD's wave-pair.
+// Force scalar v_add_f32 / v_mul_f32 / v_fma_f32. Compiler-natural emits
+// v_pk_*_f32, which produces a long linear chain on a single VGPR pair
+// whose wide writebacks contend with concurrent pv_phase mfma writebacks
+// on the same SIMD's wave-pair (verified: -1.5 to -2% at all sizes).
 __device__ __forceinline__ float vadd_f32(float a, float b) {
-    float r;
-    asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
-    return r;
-}
-__device__ __forceinline__ float vmul_f32(float a, float b) {
-    float r;
-    asm volatile("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    float r; asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
     return r;
 }
 __device__ __forceinline__ float vfma_f32(float a, float b, float c) {
-    float r;
-    asm volatile("v_fma_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    float r; asm volatile("v_fma_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
     return r;
-}
-__device__ __forceinline__ fp32x4_t scale4_scalar(fp32x4_t v, float s) {
-    return fp32x4_t{vmul_f32(v[0], s), vmul_f32(v[1], s),
-                    vmul_f32(v[2], s), vmul_f32(v[3], s)};
 }
 
 __device__ __forceinline__ void softmax_update(
@@ -299,7 +281,9 @@ __device__ __forceinline__ void softmax_update(
         const float p2 = exp2c(fmaf(sacc[sn][2], scale_log2e, neg_m));
         const float p3 = exp2c(fmaf(sacc[sn][3], scale_log2e, neg_m));
         bs[sn]   = (p0 + p1) + (p2 + p3);
-        // NaN-preserving RTNE on softmax pack.
+        // NaN-preserving RTNE on softmax pack: ensures NaN propagates to output
+        // (rare with normal inputs, but keeps the kernel robust under denormal
+        // / Inf inputs that could otherwise produce silently-rounded garbage).
         preg[sn] = pack4_bf16</*MaybeNaN=*/true>(p0, p1, p2, p3);
     }
     float bsum = vadd_f32(vadd_f32(bs[0], bs[1]), vadd_f32(bs[2], bs[3]));
@@ -325,26 +309,17 @@ void attention_forward_v18(
     const int  quad    = lane >> 4;
     const bool group_a = wid < kLoadWaves;
 
-    // Precomputed lane swizzle bases.
-    // qk and pv swizzles factor as
-    //   dw = row_stride + col*ROW_DW + (lane_perm ^ (k*8))
-    // with lane_perm = (2*quad) ^ (col<<1) per-lane-constant and
-    // k ∈ {0,1,2,3} covering all distinct values of the iter-varying XOR
-    // (k=dp for qk; k = sn ^ (dt&1) for pv). Precomputing the 4 lane
-    // bases as VGPR constants lets the compiler collapse the per-call
-    // 3-4-op XOR chain to a single v_lshl_or_b32
+    // Precomputed lane-swizzle bases for pv reads. Factored as
+    //   dw = dt*row_stride + col*32 + (lane_perm ^ (k*8))
+    // with lane_perm = (2*quad) ^ (col<<1) (per-lane constant) and
+    // k = sn ^ (dt&1) ∈ {0..3}. Caching the 4 values as VGPR constants
+    // collapses the per-call XOR chain to a single v_lshl_or_b32.
     const int lane_perm = (2 * quad) ^ (col << 1);
     const int dw_base_pv[4] = {
-        col * 32 + (lane_perm ^ 0),
-        col * 32 + (lane_perm ^ 8),
+        col * 32 + (lane_perm ^  0),
+        col * 32 + (lane_perm ^  8),
         col * 32 + (lane_perm ^ 16),
         col * 32 + (lane_perm ^ 24),
-    };
-    const int dw_base_qk[4] = {
-        col * 64 + (lane_perm ^ 0),
-        col * 64 + (lane_perm ^ 8),
-        col * 64 + (lane_perm ^ 16),
-        col * 64 + (lane_perm ^ 24),
     };
 
     // Head-first XCD swizzle: chunk_size = gridDim.x = blocks_per_head puts
@@ -371,11 +346,9 @@ void attention_forward_v18(
     __shared__ uint32_t lds_k[2][kNBlock  * kKDwPerRow];   // 32 KB (2-buf)
     __shared__ uint32_t lds_v[2][kHeadDim * kVDwPerRow];   // 32 KB (2-buf)
 
-    // ─── Cached lane-swizzle byte offsets for QK reads ─────────────────────
-    //
-    //   qk byte addr = qk_b_dw[dp] | (sn << 12) | (kbuf << 14)
-    //
-    // bit layout: [kbuf:14][sn:12-13][col:8-11][lane_perm*4:2-6] — disjoint.
+    // Cached lane-swizzle byte offsets for QK reads. Bit layout is disjoint:
+    //   [kbuf:14] [sn:12-13] [col:8-11] [lane_perm*4:2-6]
+    // so the final address is just `qk_b_dw[dp] | (sn << 12) | (kbuf << 14)`.
     const uint32_t qk_b_dw[4] = {
         (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^   0u)),
         (uint32_t)((col << 8) | (((unsigned)lane_perm << 2) ^  32u)),
@@ -418,6 +391,11 @@ void attention_forward_v18(
     }
 
     // ─── HBM K direct→LDS loader (group B handles K loads) ─────────────────
+    //
+    // K is loaded directly from HBM to LDS via bypassing VGPRs entirely. 
+    // Each load wave handles 16 K rows, one dword per lane per row. 
+    // Per-row swizzle ((row & 0xF) << 1) staggers the LDS dest so that 
+    // qk_phase's `ds_read2_b64` reads are bank-conflict free.
     constexpr int kKRowsPerWaveGroup = kNBlock / kLoadWaves;
     const int wid_in_group = wid - (group_a ? 0 : kLoadWaves);
     auto direct_lds_k = [&](int nb, int buf) {
@@ -437,6 +415,13 @@ void attention_forward_v18(
 
 
     // ─── HBM V loader (group A) + DPP transpose + LDS store ────────────────
+    //
+    // V is laid out [seq][hd] in HBM but pv_phase needs it as [hd][seq] in
+    // LDS. Each load wave brings in a contiguous 8-bf16 chunk along hd from
+    // 2 kv rows, then a DPP row_shl:4 / row_shr:4 pair exchanges halves
+    // with the kv-row-pair partner lane so each lane ends up holding 4 dws
+    // at ONE kv pair (2 rows) × 4 consecutive hd. The store path then
+    // scatters them into the [hd][seq] LDS layout.
     const int ltid      = tid & ((kLoadWaves * kWaveSize) - 1);
     const int kvrow     = ltid >> 2;
     const int vdim      = (ltid & 3) * 8;
@@ -483,37 +468,20 @@ void attention_forward_v18(
     };
 
     auto vstore_v = [&](int buf, bf16x8_t c0, bf16x8_t c1, bf16x8_t c2, bf16x8_t c3) {
-        if constexpr (kBf16Round == BF16Round::RTNE) {
-            u32x4_t t0 = transpose_chunk(c0);
-            u32x4_t t1 = transpose_chunk(c1);
-            u32x4_t t2 = transpose_chunk(c2);
-            u32x4_t t3 = transpose_chunk(c3);
-            store_v_pair(buf, 0, t0, t1);
-            store_v_pair(buf, 2, t2, t3);
-        } else {
-            store_v_pair(buf, 0, transpose_chunk(c0), transpose_chunk(c1));
-            store_v_pair(buf, 2, transpose_chunk(c2), transpose_chunk(c3));
-        }
+        store_v_pair(buf, 0, transpose_chunk(c0), transpose_chunk(c1));
+        store_v_pair(buf, 2, transpose_chunk(c2), transpose_chunk(c3));
     };
 
-    // ─── qk_phase: outer-dp / inner-sn, 4 K reads in flight (batched-2) ────
-    //
-    // outer-dp/inner-sn keeps all 8 accumulators alive at every dp step
-    // (8 chains × 4cy issue = 32cy covers the 16cy mfma latency). Each dp
-    // step consumes 2 and re-issues 2 under lgkmcnt(2) to keep 4 reads
-    // outstanding. bmax_local fold + xor_max swizzle pre-issued at dp=3
-    // tail so the cross-lane LDS round-trip hides under the lgkm drain
-    // and softmax_update's exp chain doesn't wait for it on the critical
-    // path.
     auto qk_phase = [&](int kbuf, fp32x4_t sacc_dst[2][kNSub], float bmax_dst[2]) {
-        // byte_addr = qk_b_dw[dp] | (sn << 12) | (kbuf << 14)  — all bit-disjoint.
+        // K LDS byte address. Bit-disjoint layout in qk_b_dw / sn / kbuf
+        // lets the compiler fold this into a single v_or_b32.
         auto k_addr = [&](int sn, int dp) -> uint32_t {
             return qk_b_dw[dp] | ((uint32_t)sn << 12) | ((uint32_t)kbuf << 14);
         };
 
-        // Pre-issue dp=0 reads. Caller has placed this call right after the
-        // preceding pv_phase, so the LDS round-trip overlaps the trailing
-        // pv mfmas and qk_phase's first wait sees zero stall.
+        // Pre-issue dp=0 reads. Caller has just finished pv_phase, so the
+        // LDS round-trip overlaps trailing pv mfmas — the first wait
+        // below sees zero stall.
         u32x4_t s0 = ds_read2_b64_d_pair(k_addr(0, 0));
         u32x4_t s1 = ds_read2_b64_d_pair(k_addr(1, 0));
         u32x4_t s2 = ds_read2_b64_d_pair(k_addr(2, 0));
@@ -551,19 +519,17 @@ void attention_forward_v18(
             s3 = ds_read2_b64_d_pair(k_addr(3, dp + 1));
         }
 
-        // Per-lane bmax fold, computed during dp=3 tail so the fmaxf chain
-        // hides under the trailing mfma latency.
+        // Per-lane bmax fold interleaved with the dp=3 mfmas so the
+        // fmaxf chain hides under mfma latency.
         float bm0 = -FLT_MAX, bm1 = -FLT_MAX;
         auto fold_one_sn = [&](int sn) {
-            const float a0 = fmaxf(sacc_dst[0][sn][0], sacc_dst[0][sn][1]);
-            const float b0 = fmaxf(sacc_dst[0][sn][2], sacc_dst[0][sn][3]);
-            bm0 = fmaxf(bm0, fmaxf(a0, b0));
-            const float a1 = fmaxf(sacc_dst[1][sn][0], sacc_dst[1][sn][1]);
-            const float b1 = fmaxf(sacc_dst[1][sn][2], sacc_dst[1][sn][3]);
-            bm1 = fmaxf(bm1, fmaxf(a1, b1));
+            bm0 = fmaxf(bm0, fmaxf(fmaxf(sacc_dst[0][sn][0], sacc_dst[0][sn][1]),
+                                   fmaxf(sacc_dst[0][sn][2], sacc_dst[0][sn][3])));
+            bm1 = fmaxf(bm1, fmaxf(fmaxf(sacc_dst[1][sn][0], sacc_dst[1][sn][1]),
+                                   fmaxf(sacc_dst[1][sn][2], sacc_dst[1][sn][3])));
         };
 
-        // dp=3: consume the last 4 in-flight reads with no re-issue.
+        // dp=3: consume last 4 in-flight reads, no re-issue.
         wait_lgkm_pin2<2>(s0, s1);
         mfma_consume(s0, 3, 0); fold_one_sn(0);
         mfma_consume(s1, 3, 1); fold_one_sn(1);
@@ -597,26 +563,20 @@ void attention_forward_v18(
                            m_max[qg], l_sum[qg], scale_log2e, bmax_local[qg]);
     };
 
-    // V VGPR-stage (group A). Lifecycle: issue_v(N) writes nv0..3 in iter
-    // N-1's phase-2 tail; vstore_v consumes them in iter N's phase 2.
+    // V VGPR-stage (group A): issue_v(N) writes nv0..3 in iter N-1's
+    // phase-2 tail; vstore_v consumes them in iter N's phase 2. The 1-iter
+    // pipeline shift gives the HBM load enough time-in-flight to hide.
     bf16x8_t nv0{}, nv1{}, nv2{}, nv3{};
 
     const int nblocks = seq_len / kNBlock;
 
-    // ─── Prologue: B loads K[0]→LDS, A pre-issues V[0]→VGPR ────────────────
-    // V loads are pipeline-shifted: issue_v(N+1) fires at iter N's phase-2
-    // tail (after vstore consumes V[N]), giving the next iter's V load a
-    // long enough time-in-flight to hide HBM latency.
+    // Prologue: B loads K[0]→LDS, A pre-issues V[0]→VGPR.
     if (!group_a) direct_lds_k(0, 0);
     if ( group_a) issue_v(0, nv0, nv1, nv2, nv3);
     wait_vmcnt0();
     lds_barrier();
 
-    // ─── Main loop ─────────────────────────────────────────────────────────
-    //              Group A           Group B
-    //   ────────   ────────────      ────────────
-    //   Phase 1    pv + qk           sm  + K[N+1] HBM→LDS
-    //   Phase 2    sm + V HBM/LDS    pv  + qk
+    // Main loop. See file header for the per-iter phase table.
     for (int N = 0; N < nblocks; ++N) {
         const int  p        = N & 1;
         const int  K_cur    = p,     K_nxt = 1 - p;
@@ -632,7 +592,7 @@ void attention_forward_v18(
             if (!first)  softmax_phase(sacc, preg, bmax);
         }
 
-        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_s_barrier();  // phase 1 → phase 2
 
         if (group_a) {
             softmax_phase(sacc, preg, bmax);
@@ -643,7 +603,7 @@ void attention_forward_v18(
             if (!first) pv_phase(V_cur, preg);
             qk_phase(K_cur, sacc, bmax);
         }
-        lds_barrier();   // end-of-iter sync (cross-iter buffer-swap visibility)
+        lds_barrier();                 // end-of-iter: buffer-swap visibility
     }
 
     // ─── Epilogue: drain last K tile ───────────────────────────────────────
