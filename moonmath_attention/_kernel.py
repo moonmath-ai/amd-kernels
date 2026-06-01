@@ -9,6 +9,10 @@ _LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
+# launch_v_transpose(V, V_t, seq_len_total, seq_len_per_head, stream)
+_VTRANSPOSE_ARGS = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+]
 _HTOD, _DTOH = 1, 2
 _hip = None
 _libs: dict[str, ctypes.CDLL] = {}
@@ -39,13 +43,15 @@ def _kernel(round_mode):
     lib = ctypes.CDLL(str(so))
     lib.launch_attention_forward.restype = ctypes.c_int
     lib.launch_attention_forward.argtypes = _LAUNCH_ARGS
+    lib.launch_v_transpose.restype = ctypes.c_int
+    lib.launch_v_transpose.argtypes = _VTRANSPOSE_ARGS
     _libs[round_mode] = lib
     return lib
 
 
 def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             out: torch.Tensor | None = None,
-            round_mode: str = "rtne") -> torch.Tensor:
+            round_mode: str = "rtna") -> torch.Tensor:
     """Fused forward attention: O = softmax(QKᵀ / √D) V on MI300X.
 
     Args:
@@ -55,13 +61,14 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                  torch tensors on a CUDA/HIP device are used in place.
         out: optional preallocated output tensor. Must match q's shape, dtype,
              device, and be contiguous. If None, a new tensor is allocated.
-        round_mode: "rtne" (default; ~0.5 ULP error) or "rtz" (cheaper; ~1 ULP).
+        round_mode: "rtna" (default; AITER's default, ties-away-from-zero),
+            "rtne" (~0.5 ULP error), or "rtz" (cheaper; ~1 ULP, truncation).
 
     Returns:
         torch.bfloat16 tensor of the same shape and device as the inputs.
     """
-    if round_mode not in ("rtne", "rtz"):
-        raise ValueError(f"round_mode must be 'rtne' or 'rtz' (got {round_mode!r})")
+    if round_mode not in ("rtna", "rtne", "rtz"):
+        raise ValueError(f"round_mode must be 'rtna', 'rtne', or 'rtz' (got {round_mode!r})")
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{name} must be torch.Tensor; got {type(t).__name__}")
@@ -102,7 +109,7 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # so the kernel reads/writes their CPU memory directly.
         q_u, k_u, v_u, o_u = (t.view(torch.uint16).numpy() for t in (q, k, v, out))
         nbytes = q_u.nbytes
-        d_q, d_k, d_v, d_out = (ctypes.c_void_p() for _ in range(4))
+        d_q, d_k, d_v, d_out, d_vt = (ctypes.c_void_p() for _ in range(5))
         try:
             for ptr, src in ((d_q, q_u), (d_k, k_u), (d_v, v_u)):
                 if hip.hipMalloc(ctypes.byref(ptr), nbytes) != 0:
@@ -111,7 +118,13 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                     raise RuntimeError("hipMemcpy H→D failed")
             if hip.hipMalloc(ctypes.byref(d_out), nbytes) != 0:
                 raise RuntimeError("hipMalloc(out) failed")
-            rc = lib.launch_attention_forward(d_q, d_k, d_v, d_out, B, H, S, D, None)
+            # L1V kernel: pre-transpose V into V_t before the attention launch.
+            if hip.hipMalloc(ctypes.byref(d_vt), nbytes) != 0:
+                raise RuntimeError("hipMalloc(v_t) failed")
+            rc = lib.launch_v_transpose(d_v, d_vt, B * H * S, S, None)
+            if rc != 0:
+                raise RuntimeError(f"launch_v_transpose returned {rc}")
+            rc = lib.launch_attention_forward(d_q, d_k, d_vt, d_out, B, H, S, D, None)
             if rc != 0:
                 raise RuntimeError(f"launch_attention_forward returned {rc}")
             if hip.hipDeviceSynchronize() != 0:
@@ -119,13 +132,24 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             if hip.hipMemcpy(o_u.ctypes.data, d_out, nbytes, _DTOH) != 0:
                 raise RuntimeError("hipMemcpy D→H failed")
         finally:
-            for ptr in (d_q, d_k, d_v, d_out):
+            for ptr in (d_q, d_k, d_v, d_out, d_vt):
                 if ptr.value:
                     hip.hipFree(ptr)
     elif q.device.type in ("cuda", "hip"):
+        # L1V kernel: V must be pre-transposed into V_t (pv_phase consumes V_t
+        # directly from L1). launch_v_transpose runs first, then the attention
+        # kernel — both are issued here so a caller timing forward() includes
+        # the V-transpose cost.
+        v_t = torch.empty_like(v)
+        rc = lib.launch_v_transpose(
+            ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
+            B * H * S, S, None,
+        )
+        if rc != 0:
+            raise RuntimeError(f"launch_v_transpose returned {rc}")
         rc = lib.launch_attention_forward(
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
-            ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
             B, H, S, D, None,
         )
         if rc != 0:

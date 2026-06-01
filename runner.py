@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark CDNA3 HIP attention (RTNE + RTZ) vs AITER's flash_attn_func, with
+"""Benchmark CDNA3 HIP attention (RTNA + RTNE + RTZ) vs AITER's flash_attn_func, with
 optional Modular MAX `flash_attention_gpu` if `max` is installed.
 
 Requires ROCm-built torch, the AITER submodule under third_party/aiter, and
@@ -21,8 +21,9 @@ from aiter import flash_attn_func  # noqa: E402
 
 import moonmath_attention as ma  # noqa: E402
 
-# AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA, 2=RTZ.
+# AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA (default), 2=RTZ.
 AITER_RTNE = 0
+AITER_RTNA = 1
 AITER_RTZ  = 2
 
 
@@ -147,14 +148,20 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
 
     # HIP: preallocate output per variant — allocation outside the timed loop;
     # the correctness section reuses each buffer's last value from the loop.
-    # AITER's high-level wrapper allocates internally; the timing reflects that.
+    # ma.forward runs the L1V pipeline: it pre-transposes V into V_t (an extra
+    # launch_v_transpose kernel) and then the attention kernel — so the timed
+    # HIP figure INCLUDES the V-transpose precompute. AITER's high-level wrapper
+    # allocates + transposes V internally too, so the timing is apples-to-apples.
+    out_hip_rtna = torch.empty_like(q)
     out_hip_rtne = torch.empty_like(q)
     out_hip_rtz  = torch.empty_like(q)
 
-    aiter_last = {"rtne": None, "rtz": None}
+    aiter_last = {"rtna": None, "rtne": None, "rtz": None}
     fns = {
+        "HIP   RTNA": lambda: ma.forward(q, k, v, out=out_hip_rtna, round_mode="rtna"),
         "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne"),
         "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz"),
+        "AITER RTNA": lambda: aiter_last.__setitem__("rtna", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNA)),
         "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
         "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
@@ -184,8 +191,10 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
 
     # Buffers already hold each kernel's last output from the timing loop.
     # Re-layout AITER outputs from (B, S, H, D) to (B, H, S, D) for comparison.
+    aiter_rtna_bhsd = aiter_last["rtna"].transpose(1, 2).contiguous()
     aiter_rtne_bhsd = aiter_last["rtne"].transpose(1, 2).contiguous()
     aiter_rtz_bhsd  = aiter_last["rtz"].transpose(1, 2).contiguous()
+    rtna_max, rtna_rmse = diff_stats(out_hip_rtna, aiter_rtna_bhsd)
     rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_rtne_bhsd)
     rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_rtz_bhsd)
 
@@ -199,7 +208,9 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
     print(f"              ms      TFLOP/s    ratios")
     for name, ms in timings.items():
         tflops = flops / (ms * 1e-3) / 1e12
-        if name == "HIP   RTNE":
+        if name == "HIP   RTNA":
+            ratios = f"HIP/AITER {ms / timings['AITER RTNA']:.2f}x"
+        elif name == "HIP   RTNE":
             ratios = f"HIP/AITER {ms / timings['AITER RTNE']:.2f}x"
         elif name == "HIP   RTZ":
             ratios = f"HIP/AITER {ms / timings['AITER RTZ']:.2f}x"
@@ -210,7 +221,7 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
             ratios = ""
         print(f"{name:11s} {ms:.4f}   {tflops:6.1f}    {ratios}")
 
-    print(f"HIP   vs AITER (max_abs / rmse):  RTNE {rtne_max:.2e} / {rtne_rmse:.2e}   RTZ {rtz_max:.2e} / {rtz_rmse:.2e}")
+    print(f"HIP   vs AITER (max_abs / rmse):  RTNA {rtna_max:.2e} / {rtna_rmse:.2e}   RTNE {rtne_max:.2e} / {rtne_rmse:.2e}   RTZ {rtz_max:.2e} / {rtz_rmse:.2e}")
     if out_max_f32 is not None:
         print(f"MAX   vs HIP   RTNE (max_abs / rmse):  {max_vs_hip[0]:.2e} / {max_vs_hip[1]:.2e}")
         print(f"MAX   vs AITER RTNE (max_abs / rmse):  {max_vs_aiter[0]:.2e} / {max_vs_aiter[1]:.2e}")

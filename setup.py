@@ -1,4 +1,4 @@
-"""Build hook: invoke `hipcc` to compile the kernel into RTNE and RTZ .so
+"""Build hook: invoke `hipcc` to compile the kernel into RTNA, RTNE and RTZ .so
 variants and bundle them as package_data."""
 import os
 import shutil
@@ -47,7 +47,7 @@ class BuildPyWithKernel(build_py):
                 f"reachable, or set HIPCC=/path/to/hipcc."
             )
         PKG_DIR.mkdir(exist_ok=True)
-        for round_mode in ("RTNE", "RTZ"):
+        for round_mode in ("RTNA", "RTNE", "RTZ"):
             _build_kernel(round_mode, PKG_DIR)
         super().run()
 
