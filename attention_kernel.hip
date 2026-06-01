@@ -588,6 +588,8 @@ void attention_forward(
             if (has_next) direct_lds_k(nb + 1, k_nxt);
         }
 
+        __builtin_amdgcn_s_barrier();
+
         // Phase 2
         if (group_a) {
             softmax(sacc, preg);
