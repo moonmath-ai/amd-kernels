@@ -32,6 +32,20 @@ def make_inputs(B, H, S, D, device, pattern):
     torch.manual_seed(42)
     if pattern == "random":
         return tuple(torch.randn(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+    if pattern == "realistic":
+        # Log-normal K-row norms (sigma=0.6) make attention peaked enough that
+        # the online-softmax skip-rescale gate fires on ~10% of (q-tile, K-block)
+        # pairs — a realistic workload that exercises the rescale path, unlike
+        # plain `random` (Gaussian K-norms) which almost never trips the gate.
+        # Q, V ~ N(0, 1); K direction uniform, magnitude exp(N(0, sigma))·√D.
+        sigma = 0.6
+        q = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
+        k_dir = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
+        k_dir = k_dir / k_dir.norm(dim=-1, keepdim=True)
+        log_norm = torch.randn(B, H, S, 1, dtype=torch.float32, device=device) * sigma
+        k = k_dir * (torch.exp(log_norm) * (D ** 0.5))
+        v = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
+        return q.bfloat16(), k.bfloat16(), v.bfloat16()
     if pattern == "ones":
         return tuple(torch.ones(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
     if pattern == "linear":
@@ -237,7 +251,7 @@ if __name__ == "__main__":
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--benchmark-iters", type=int, default=20)
     ap.add_argument("--warmup-iters", type=int, default=3)
-    ap.add_argument("--inputs", choices=["random", "ones", "linear", "diag"], default="random")
+    ap.add_argument("--inputs", choices=["random", "realistic", "ones", "linear", "diag"], default="random")
     ap.add_argument("--no-max", action="store_true",
                     help="Do not run Modular MAX flash_attention_gpu (if installed)")
     args = ap.parse_args()

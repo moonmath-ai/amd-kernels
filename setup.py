@@ -16,11 +16,14 @@ ARCH = os.environ.get("CDNA3_ARCH", "gfx942")
 HIPCC = os.environ.get("HIPCC", "hipcc")
 EXTRA_FLAGS = [f for f in os.environ.get("EXTRA_LLVM_FLAGS", "").split() if f]
 
+OPUS_INC = ROOT / "third_party" / "aiter" / "csrc" / "include" / "opus"
+
 HIPCC_FLAGS = [
     "-shared", "-fPIC", "-O3",
     f"--offload-arch={ARCH}",
     "-ffast-math", "-fno-math-errno",
     "-mllvm", "-amdgpu-early-inline-all=true",
+    f"-I{OPUS_INC}",
 ] + EXTRA_FLAGS
 
 
