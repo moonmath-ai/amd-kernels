@@ -132,7 +132,7 @@ def _max_buf_to_fp32_bhsd(buf, mod):
     return torch.from_numpy(np.ascontiguousarray(np.transpose(f32, (0, 2, 1, 3))))
 
 
-def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_max=True):
+def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include_max=True):
     if not torch.cuda.is_available():
         sys.exit("Need ROCm-built torch with a HIP device.")
     device = torch.device("cuda")
@@ -233,7 +233,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Benchmark HIP attention vs AITER (and optional MAX)")
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--heads", type=int, default=24)
-    ap.add_argument("--seq-len", type=int, default=8192)
+    ap.add_argument("--seq-len", type=int, default=16384)
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--benchmark-iters", type=int, default=20)
     ap.add_argument("--warmup-iters", type=int, default=3)
