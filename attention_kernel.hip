@@ -9,13 +9,13 @@
 //
 // One group keeps the SIMD's MFMA engine active while the other does VALU+memory.
 // L1V variant: V is pre-transposed offline (v_transpose_kernel_16x16) into V_t laid
-// out for direct bld16 consumption in pv_phase — no LDS staging for V.
+// out for direct load_u32x4 consumption in pv_phase — no LDS staging for V.
 //
 // Structure mirrors the 32x32x8 variant (see L1V-32x32x8 branch); only the
 // indexing and MFMA-fragment math differ for the 16x16x16 instruction:
 //   • 16x16x16 lane split: col = lane&15, quad = lane>>4 (4 quads, fp32x4 C-frag).
-//   • Each wave handles kQGroups=2 q-tiles of 16 rows (vs one 32-row tile).
-//   • qk reads K in d-tile pairs {dp, dp+4}; pv consumes V_t super-chunks.
+//   • Each wave handles kQTilesPerWave=2 q-tiles of 16 rows (vs one 32-row tile).
+//   • qk reads K in d-tile pairs {d_pair, d_pair+4}; pv consumes V_t super-chunks.
 // Indexing (layouts, fragments, V_t packing) is explained in docs/indexing.ipynb.
 
 #include <hip/hip_bf16.h>
@@ -39,28 +39,29 @@ using fp32x4_t = float    __attribute__((ext_vector_type(4)));  // 16x16x16 C-fr
 using u32x2_t  = uint32_t __attribute__((ext_vector_type(2)));
 using u32x4_t  = uint32_t __attribute__((ext_vector_type(4)));
 
-constexpr int   kWaveSize       = 64;
-constexpr int   kNumWaves       = 8;
-constexpr int   kLoadWaves      = 4;
-constexpr int   kBlockSize      = kWaveSize * kNumWaves;
-constexpr int   kNBlock         = 64;
-constexpr int   kKTile          = 16;          // 16x16x16 mfma tile (M=N)
-constexpr int   kNSub           = kNBlock / kKTile;     // 4 kv-subtiles / block
-constexpr int   kKInner         = 16;          // mfma K (contraction)
-constexpr int   kHeadDim        = 128;
-constexpr int   kDTiles         = kHeadDim / kKInner;   // 8 head-dim tiles
-constexpr int   kQTileRows      = 16;          // rows per q-tile (one mfma)
-constexpr int   kQGroups        = 2;           // q-tiles per wave → 32 rows/wave
-constexpr int   kKRowDw         = kHeadDim / 2;         // 64 = real K row width (dw)
-constexpr int   kKLdsStrideDw   = kKRowDw + 2;         // 66 = padded LDS row stride
-constexpr int   kKRowsPerLW     = kNBlock / kLoadWaves; // 16
-constexpr float kLog2e          = 1.4426950408889634f;
-constexpr uint32_t kBufCfg      = 0x00020000u;
+constexpr int   kWaveSize         = 64;
+constexpr int   kNumWaves         = 8;
+constexpr int   kLoadWaves        = 4;
+constexpr int   kBlockSize        = kWaveSize * kNumWaves;
+constexpr int   kKvBlockRows      = 64;                          // kv rows processed per main-loop iter
+constexpr int   kMfmaTile         = 16;                          // 16x16x16 mfma tile (M=N)
+constexpr int   kKvSubtiles       = kKvBlockRows / kMfmaTile;    // 4 kv-subtiles / block
+constexpr int   kMfmaK            = 16;                          // mfma K (contraction)
+constexpr int   kHeadDim          = 128;
+constexpr int   kHeadDimTiles     = kHeadDim / kMfmaK;           // 8 head-dim tiles
+constexpr int   kQTileRows        = 16;                          // rows per q-tile (one mfma)
+constexpr int   kQTilesPerWave    = 2;                           // → 32 q-rows / wave
+constexpr int   kQTilesPerWG      = kNumWaves * kQTilesPerWave;  // 16 q-tiles = 256 rows / workgroup
+constexpr int   kKRowDwords       = kHeadDim / 2;                // 64 = real K row width (dwords)
+constexpr int   kKLdsStrideDwords = kKRowDwords + 2;            // 66 = padded LDS row stride
+constexpr int   kKRowsPerLoadWave = kKvBlockRows / kLoadWaves;  // 16
+constexpr float kLog2e            = 1.4426950408889634f;
+constexpr uint32_t kBufferConfig  = 0x00020000u;  // SRD word3: DATA_FORMAT=32 (raw 32-bit elems)
 
-__device__ __forceinline__ fp32x4_t zero4() { return fp32x4_t{0,0,0,0}; }
+__device__ __forceinline__ fp32x4_t zero_fp32x4() { return fp32x4_t{0,0,0,0}; }
 
-__device__ __forceinline__ float exp2c(float x) { return __builtin_amdgcn_exp2f(x); }
-__device__ __forceinline__ float rcpf (float x) { return __builtin_amdgcn_rcpf (x); }
+__device__ __forceinline__ float fast_exp2(float x) { return __builtin_amdgcn_exp2f(x); }
+__device__ __forceinline__ float fast_rcp (float x) { return __builtin_amdgcn_rcpf (x); }
 
 __device__ __forceinline__ fp32x4_t mfma(bf16x4_t a, bf16x4_t b, fp32x4_t c) {
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
@@ -74,7 +75,7 @@ __device__ __forceinline__ void asm_mfma(bf16x4_t a, bf16x4_t b, fp32x4_t& c) {
 }
 
 // Literal-0 C operand skips the v_mov init the compiler emits to zero a fresh
-// accumulator. "=&v" prevents aliasing dst onto the A VGPRs.
+// accumulator. "=&v" prevents aliasing the dst onto the A VGPRs.
 __device__ __forceinline__ fp32x4_t asm_mfma_zero(bf16x4_t a, bf16x4_t b) {
     fp32x4_t r;
     asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, 0"
@@ -143,78 +144,98 @@ __device__ __forceinline__ bf16x4_t pack4_bf16(float a, float b, float c, float 
     return o;
 }
 
-__device__ __forceinline__ __amdgpu_buffer_rsrc_t mkr(const void* p) {
-    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0xFFFFFFFFu, kBufCfg);
+// Wrap a global pointer in a buffer resource descriptor (SRD = the 128-bit "V#" that
+// raw_buffer_load/store address through). Args: (base, stride=0 → not structured,
+// num_records=0xFFFFFFFF → effectively unbounded, config=kBufferConfig). const_cast
+// because the builtin takes a non-const base; a load resource is never written through.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer(const void* p) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0xFFFFFFFFu, kBufferConfig);
 }
-__device__ __forceinline__ bf16x4_t bld8(__amdgpu_buffer_rsrc_t r, int off) {
-    u32x2_t raw = __builtin_amdgcn_raw_buffer_load_b64(r, off, 0, 0);
+// Raw buffer load/store, named by the value moved (bf16x4 = 8 B, u32x4 = 16 B).
+__device__ __forceinline__ bf16x4_t load_bf16x4(__amdgpu_buffer_rsrc_t buffer, int byte_off) {
+    u32x2_t raw = __builtin_amdgcn_raw_buffer_load_b64(buffer, byte_off, 0, 0);
     bf16x4_t out; __builtin_memcpy(&out, &raw, sizeof(out)); return out;
 }
-__device__ __forceinline__ u32x4_t bld16(__amdgpu_buffer_rsrc_t r, int off) {
-    return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 0);
+__device__ __forceinline__ u32x4_t load_u32x4(__amdgpu_buffer_rsrc_t buffer, int byte_off) {
+    return __builtin_amdgcn_raw_buffer_load_b128(buffer, byte_off, 0, 0);
 }
-__device__ __forceinline__ void bst8(__amdgpu_buffer_rsrc_t r, int off, bf16x4_t v) {
+__device__ __forceinline__ void store_bf16x4(__amdgpu_buffer_rsrc_t buffer, int byte_off, bf16x4_t v) {
     u32x2_t bits; __builtin_memcpy(&bits, &v, 8);
-    __builtin_amdgcn_raw_buffer_store_b64(bits, r, off, 0, 0);
+    __builtin_amdgcn_raw_buffer_store_b64(bits, buffer, byte_off, 0, 0);
 }
 
-// Immediate-offset ds_read2: O0/O1 are compile-time (units of 8 B) baked into the
-// instruction. Lets one per-kv-subtile base register serve all d-tile pairs — only
-// the padded (un-swizzled) K-LDS layout makes the address affine in dp, so dp folds
-// into the immediate instead of a per-read VALU add. %c emits the bare constant.
-template <int O0, int O1>
-__device__ __forceinline__ u32x4_t ds_read2_b64_imm(uint32_t base) {
-    u32x4_t r;
+// Low 32 bits of an LDS pointer = its byte offset within the LDS segment. Hides
+// the pointer→integer cast at call sites.
+template <typename T>
+__device__ __forceinline__ uint32_t lds_addr(const T* p) { return (uint32_t)(uintptr_t)p; }
+
+// Broadcast a wave-uniform value into a scalar register (SGPR) via readfirstlane.
+// Every lane computes the same value here, so this lets the compiler use scalar
+// addressing instead of carrying it in a per-lane VGPR.
+__device__ __forceinline__ uint32_t to_scalar(uint32_t v) {
+    return __builtin_amdgcn_readfirstlane(v);
+}
+
+// Immediate-offset ds_read2: kOffset0/kOffset1 are compile-time (units of 8 B) baked
+// into the instruction. Lets one per-kv-subtile base register serve all d-tile pairs —
+// only the padded (un-swizzled) K-LDS layout makes the address affine in d_pair, so
+// d_pair folds into the immediate instead of a per-read VALU add. %c emits the bare constant.
+template <int kOffset0, int kOffset1>
+__device__ __forceinline__ u32x4_t ds_read2_b64_imm(uint32_t lds_base) {
+    u32x4_t result;
     asm volatile("ds_read2_b64 %0, %1 offset0:%c2 offset1:%c3"
-                 : "=&v"(r) : "v"(base), "i"(O0), "i"(O1));
-    return r;
+                 : "=&v"(result) : "v"(lds_base), "i"(kOffset0), "i"(kOffset1));
+    return result;
 }
 
 // Pinned lgkmcnt wait — anchors the consumer so the compiler can't reorder above.
+// kCount = how many outstanding LDS reads may remain in flight past this point.
 #define WAIT_LGKM_CASE(N) \
-    if constexpr (kN == N) asm volatile("s_waitcnt lgkmcnt(" #N ")" : "+v"(r) :: "memory");
-template <int kN, typename T>
-__device__ __forceinline__ void wait_lgkm(T& r) {
-    static_assert(kN >= 0 && kN <= 7, "kN out of range");
+    if constexpr (kCount == N) asm volatile("s_waitcnt lgkmcnt(" #N ")" : "+v"(anchor) :: "memory");
+template <int kCount, typename T>
+__device__ __forceinline__ void wait_lgkm(T& anchor) {
+    static_assert(kCount >= 0 && kCount <= 7, "kCount out of range");
     WAIT_LGKM_CASE(0) else WAIT_LGKM_CASE(1) else WAIT_LGKM_CASE(2) else
     WAIT_LGKM_CASE(3) else WAIT_LGKM_CASE(4) else WAIT_LGKM_CASE(5) else
     WAIT_LGKM_CASE(6) else WAIT_LGKM_CASE(7);
 }
 #undef WAIT_LGKM_CASE
 
-// QK inner body, compile-time unrolled (recursion → I is constant → dp folds into
-// the ds_read2 immediate). Depth-D ring over s0/s1/s2: consume read I, reissue I+D
-// into its slot. Each read's two halves are d-tiles {dp, dp+4}; both q-groups
-// multiply against the shared K operand. Last read drains lgkm(0), else holds D-1.
-// Iteration order: sn = I % kNSub (kv-subtile → base/sacc), dp = I / kNSub (d-pair).
-template <int I, int D, int N>
+// QK inner body, compile-time unrolled (recursion → kReadIdx is constant → d_pair folds
+// into the ds_read2 immediate). Depth-kDepth ring over k_ring0/1/2: consume read kReadIdx,
+// reissue read kReadIdx+kDepth into the same slot. Each read's two halves are d-tiles
+// {d_pair, d_pair+4}; both q-groups multiply against the shared K operand. The last read
+// drains lgkm(0), every earlier one leaves kDepth-1 still in flight.
+// Iteration order: kv_sub = kReadIdx % kKvSubtiles, d_pair = kReadIdx / kKvSubtiles.
+template <int kReadIdx, int kDepth, int kNumReads>
 __device__ __forceinline__ void qk_step(
-    u32x4_t& s0, u32x4_t& s1, u32x4_t& s2,
-    const bf16x4_t q[][kDTiles], fp32x4_t sacc[][kNSub],
-    const uint32_t* base_sn)
+    u32x4_t& k_ring0, u32x4_t& k_ring1, u32x4_t& k_ring2,
+    const bf16x4_t q_frag[][kHeadDimTiles], fp32x4_t scores[][kKvSubtiles],
+    const uint32_t* kv_sub_base)
 {
-    if constexpr (I < N) {
-        constexpr int sn   = I % kNSub;     // kv-subtile → base_sn[sn], sacc[qg][sn]
-        constexpr int dp   = I / kNSub;     // d-tile pair → immediate, q[qg][dp]/[dp+4]
-        constexpr int slot = I % D;         // depth-D ring slot (s0/s1/s2)
-        u32x4_t& cur = (slot == 0) ? s0 : (slot == 1) ? s1 : s2;
-        if constexpr (I == N - 1) wait_lgkm<0>(cur);
-        else                      wait_lgkm<D - 1>(cur);
-        // one ds_read2 = 4 dwords = two bf16x4 K-operands: d-tile dp and dp+4.
+    if constexpr (kReadIdx < kNumReads) {
+        constexpr int kv_sub = kReadIdx % kKvSubtiles;  // kv-subtile  → kv_sub_base[], scores[q_group][kv_sub]
+        constexpr int d_pair = kReadIdx / kKvSubtiles;  // d-tile pair → ds_read2 immediate, q_frag[q_group][d_pair]
+        constexpr int slot   = kReadIdx % kDepth;       // ring slot (k_ring0/1/2)
+        u32x4_t& cur = (slot == 0) ? k_ring0 : (slot == 1) ? k_ring1 : k_ring2;
+        if constexpr (kReadIdx == kNumReads - 1) wait_lgkm<0>(cur);
+        else                                     wait_lgkm<kDepth - 1>(cur);
+        // one ds_read2 = 4 dwords = two bf16x4 K-operands: d-tile d_pair and d_pair+4.
         const bf16x4_t k_lo = __builtin_bit_cast(bf16x4_t, u32x2_t{cur[0], cur[1]});
         const bf16x4_t k_hi = __builtin_bit_cast(bf16x4_t, u32x2_t{cur[2], cur[3]});
         #pragma unroll
-        for (int qg = 0; qg < kQGroups; ++qg) {
-            if constexpr (dp == 0) sacc[qg][sn] = asm_mfma_zero(k_lo, q[qg][0]);
-            else                   asm_mfma(k_lo, q[qg][dp], sacc[qg][sn]);
-            // Last mfma BUILTIN form so LLVM tracks the sacc write for softmax.
-            sacc[qg][sn] = mfma(k_hi, q[qg][dp + 4], sacc[qg][sn]);
+        for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+            if constexpr (d_pair == 0) scores[q_group][kv_sub] = asm_mfma_zero(k_lo, q_frag[q_group][0]);
+            else                       asm_mfma(k_lo, q_frag[q_group][d_pair], scores[q_group][kv_sub]);
+            // Last mfma BUILTIN form so LLVM tracks the scores write for softmax.
+            scores[q_group][kv_sub] = mfma(k_hi, q_frag[q_group][d_pair + 4], scores[q_group][kv_sub]);
         }
-        if constexpr (I + D < N) {
-            constexpr int J = I + D, jsn = J % kNSub, jdp = J / kNSub;
-            cur = ds_read2_b64_imm<jdp * 4, jdp * 4 + 16>(base_sn[jsn]);
+        if constexpr (kReadIdx + kDepth < kNumReads) {
+            constexpr int kNext = kReadIdx + kDepth;
+            constexpr int next_kv_sub = kNext % kKvSubtiles, next_d_pair = kNext / kKvSubtiles;
+            cur = ds_read2_b64_imm<next_d_pair * 4, next_d_pair * 4 + 16>(kv_sub_base[next_kv_sub]);
         }
-        qk_step<I + 1, D, N>(s0, s1, s2, q, sacc, base_sn);
+        qk_step<kReadIdx + 1, kDepth, kNumReads>(k_ring0, k_ring1, k_ring2, q_frag, scores, kv_sub_base);
     }
 }
 
@@ -246,32 +267,57 @@ constexpr auto kShape3 = opus::make_tuple(opus::number<1>{}, opus::number<1>{}, 
 // Q / Out: row-major (seq, head_dim).
 constexpr auto kQOLayout = opus::make_layout(kShape2, strides<kHeadDim, 1>());
 
-// V_t (pre-transposed): (kv-iter, super-chunk, lane); 16 chunks/iter, bf16x8/lane.
-constexpr int  kVtIterElems = kNBlock * kHeadDim;   // 8192 elems / kv-iter
-constexpr int  kVtScElems   = kVtIterElems / 16;    // 512  elems / super-chunk
-constexpr int  kVtLaneElems = 8;                    // bf16x8 / lane
+// V_t (pre-transposed): (kv-iter, super-chunk, lane). bf16x8 / lane.
+constexpr int  kVtChunks     = 16;                         // super-chunks / kv-block
+constexpr int  kVtBlockElems = kKvBlockRows * kHeadDim;    // 8192 elems / kv-block
+constexpr int  kVtChunkElems = kVtBlockElems / kVtChunks;  // 512  elems / super-chunk
+constexpr int  kVtLaneElems  = 8;                          // bf16x8 / lane
 constexpr auto kVtLayout = opus::make_layout(
-    kShape3, strides<kVtIterElems, kVtScElems, kVtLaneElems>());
+    kShape3, strides<kVtBlockElems, kVtChunkElems, kVtLaneElems>());
 
 // K addressed in DWORDS (2 bf16), row-major (kv_row, dword):
 //   HBM source: 64 dw/row.  LDS dest: padded to 66 dw/row, which breaks the
 //   32-way qk-read bank conflict (stride 64 ≡ 0 mod 32). Linear, no swizzle.
-constexpr auto kKHbmDword = opus::make_layout(kShape2, strides<kKRowDw, 1>());
-constexpr auto kKLdsDword = opus::make_layout(kShape2, strides<kKLdsStrideDw, 1>());
+constexpr auto kKHbmDword = opus::make_layout(kShape2, strides<kKRowDwords, 1>());
+constexpr auto kKLdsDword = opus::make_layout(kShape2, strides<kKLdsStrideDwords, 1>());
+
+// ─── Grid + MFMA thread→fragment index maps ─────────────────────────────────
+// Same rule as the memory layouts above (offset = Σ coordᵢ·strideᵢ) but these
+// yield LOGICAL indices — which q-tile / which kv-row / which fragment element —
+// not byte offsets, so callers don't multiply by 2.
+
+// (block_x, wave, q-group) → absolute q-tile index. A workgroup owns
+// kQTilesPerWG tiles, a wave owns kQTilesPerWave, a q-group is one tile.
+constexpr auto kQTileGrid = opus::make_layout(kShape3, strides<kQTilesPerWG, kQTilesPerWave, 1>());
+
+// (load-wave, local row) → kv-row that load-wave owns. kLoadWaves waves ×
+// kKRowsPerLoadWave rows tile the kKvBlockRows-row K block.
+constexpr auto kKLoadRow  = opus::make_layout(kShape2, strides<kKRowsPerLoadWave, 1>());
+
+// (load-wave, i) → V_t super-chunk to L1-prefetch (kVtChunks chunks / kLoadWaves).
+constexpr auto kVtPrefetch = opus::make_layout(kShape2, strides<kVtChunks / kLoadWaves, 1>());
+
+// MFMA 16x16x16 A/B fragment: lane = (col = lane&15, quad = lane>>4); the 16-wide
+// contraction is tiled by 4 quad-lanes, each holding kQuadSpan contiguous elems.
+constexpr int  kQuadSpan  = kMfmaK / 4;   // 4 bf16 contraction elems / quad-lane
+// (d-tile, quad) → head-dim element, for Q / Out (bf16 elements).
+constexpr auto kHdFrag    = opus::make_layout(kShape2, strides<kMfmaK, kQuadSpan>());
+// (kv-row, quad) → K-LDS dword (K is dword-addressed: kQuadSpan/2 dwords / quad).
+constexpr auto kKLaneDw   = opus::make_layout(kShape2, strides<kKLdsStrideDwords, kQuadSpan / 2>());
 
 // HBM→LDS direct dword load. Inline-asm `s_mov_b32 m0` (not s_add chain) so the
 // compiler sees m0 as a fresh write per call — Clang's cselect pattern around
 // the builtin form can substitute m0=-1 when lds_dest is small, silently
 // dropping writes.
 __device__ __forceinline__ void buffer_load_b32_to_lds(
-    __amdgpu_buffer_rsrc_t rsrc, uint32_t lds_dest,
+    __amdgpu_buffer_rsrc_t buffer, uint32_t lds_dest,
     uint32_t voff, uint32_t soff
 ) {
     asm volatile(
         "s_mov_b32 m0, %0\n\t"
         "buffer_load_dword %1, %2, %3 offen lds"
         :
-        : "s"(lds_dest), "v"(voff), "s"(rsrc), "s"(soff)
+        : "s"(lds_dest), "v"(voff), "s"(buffer), "s"(soff)
         : "memory"
     );
 }
@@ -279,14 +325,14 @@ __device__ __forceinline__ void buffer_load_b32_to_lds(
 // Head-first chiplet swizzle: chunk_size = blocks_per_head co-locates all
 // q-blocks of one (B,H) on a single XCD's L2 → K+V stay resident.
 constexpr int kNumXcds = 8;
-__device__ __forceinline__ int chiplet_swizzle(int wgid, int num_wgs, int chunk_size) {
+__device__ __forceinline__ int chiplet_swizzle(int wg_id, int num_wgs, int chunk_size) {
     const int block = kNumXcds * chunk_size;
     const int limit = (num_wgs / block) * block;
-    if (wgid >= limit) return wgid;
-    const int xcd          = wgid % kNumXcds;
-    const int local_pid    = wgid / kNumXcds;
-    const int chunk_idx    = local_pid / chunk_size;
-    const int pos_in_chunk = local_pid % chunk_size;
+    if (wg_id >= limit) return wg_id;
+    const int xcd          = wg_id % kNumXcds;
+    const int local_id    = wg_id / kNumXcds;
+    const int chunk_idx    = local_id / chunk_size;
+    const int pos_in_chunk = local_id % chunk_size;
     return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
 }
 
@@ -294,21 +340,21 @@ __device__ __forceinline__ int chiplet_swizzle(int wgid, int num_wgs, int chunk_
 // outputs at q_row = col, so the 4 quad-lanes sharing col span all 64 kvs of the
 // q-row. ds_swizzle 0x401F folds l^16, ds_bpermute folds l^32 (covers l^48 too).
 // Explicit lgkm(0) wait avoids a race when the bpermute is the only LGKM in flight.
-__device__ __forceinline__ float xor_max(float v) {
+__device__ __forceinline__ float cross_lane_max(float v) {
     const int lane = wave_lane_id();
-    const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
-    const float v1 = fmaxf(v, __builtin_bit_cast(float, p16));
-    const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, v1));
+    const int peer16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
+    const float partial = fmaxf(v, __builtin_bit_cast(float, peer16));
+    const int peer32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, partial));
     wait_lgkmcnt0();
-    return fmaxf(v1, __builtin_bit_cast(float, p32));
+    return fmaxf(partial, __builtin_bit_cast(float, peer32));
 }
-__device__ __forceinline__ float xor_sum(float v) {
+__device__ __forceinline__ float cross_lane_sum(float v) {
     const int lane = wave_lane_id();
-    const int p16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
-    const float v1 = v + __builtin_bit_cast(float, p16);
-    const int p32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, v1));
+    const int peer16  = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401F);
+    const float partial = v + __builtin_bit_cast(float, peer16);
+    const int peer32  = __builtin_amdgcn_ds_bpermute((lane ^ 32) << 2, __builtin_bit_cast(int, partial));
     wait_lgkmcnt0();
-    return v1 + __builtin_bit_cast(float, p32);
+    return partial + __builtin_bit_cast(float, peer32);
 }
 
 __global__ __launch_bounds__(kBlockSize, 1)
@@ -320,238 +366,239 @@ void attention_forward(
     int seq_len, float scale_log2e
 ) {
     // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
-    // Tile dims walked by the loops: sn (kv-subtile), dp (d-tile pair), dt (hd-tile),
-    // qg (q-group). 8 waves → 2 groups of 4 for warp-spec. See indexing notebook.
-    const int tid  = threadIdx.x;
-    const int wid  = tid >> 6;
-    const int lane = tid & 63;
-    const int col      = lane & 15;
-    const int quad     = lane >> 4;
-    const bool group_a = (wid < kLoadWaves);
-    const int wid_in_g = group_a ? wid : (wid - kLoadWaves);
+    // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
+    // q_group (q-group). 8 waves → 2 groups of 4 for warp-spec. See indexing notebook.
+    const int  tid           = threadIdx.x;
+    const int  wave_id       = tid >> 6;
+    const int  lane          = tid & 63;
+    const int  col           = lane & 15;   // q-col / kv-row within a 16-wide tile
+    const int  quad          = lane >> 4;   // which group of 4 lanes (0..3)
+    const bool group_a       = (wave_id < kLoadWaves);
+    const int  wave_in_group = group_a ? wave_id : (wave_id - kLoadWaves);
 
-    const int wgid_in   = blockIdx.y * gridDim.x + blockIdx.x;
-    const int total_wgs = gridDim.x * gridDim.y;
-    const int wgid      = chiplet_swizzle(wgid_in, total_wgs, gridDim.x);
-    const int sw_bx     = wgid % gridDim.x;
-    const int sw_by     = wgid / gridDim.x;
+    const int wg_id_raw = blockIdx.y * gridDim.x + blockIdx.x;
+    const int num_wgs   = gridDim.x * gridDim.y;
+    const int wg_id     = chiplet_swizzle(wg_id_raw, num_wgs, gridDim.x);
+    const int q_block   = wg_id % gridDim.x;   // which 256-row q-block
+    const int bh_index  = wg_id / gridDim.x;   // which (batch·head)
 
-    // Each wave owns kQGroups q-tiles (16 rows each). WG = 8 waves × 2 × 16 = 256 rows.
-    const int q_tiles    = seq_len / kQTileRows;
-    const int qtile_base = sw_bx * (kNumWaves * kQGroups) + wid * kQGroups;
-    bool valid[kQGroups];
-    int  qbase[kQGroups];
+    // Q-tile ownership: each wave owns kQTilesPerWave (=2) 16-row q-tiles. For each,
+    // q_tile_start_row is the absolute seq-row where that tile begins — a per-tile
+    // origin used for addressing; lane `col` later reads/writes row (start + col).
+    // Parallel arrays valid/q_tile_start_row/q_frag/o_acc/scores are all indexed by
+    // q_group; valid[] masks a tile that runs past the sequence end.
+    const int num_q_tiles = seq_len / kQTileRows;
+    bool valid[kQTilesPerWave];
+    int  q_tile_start_row[kQTilesPerWave];
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg) {
-        valid[qg] = (qtile_base + qg) < q_tiles;
-        qbase[qg] = valid[qg] ? (qtile_base + qg) * kQTileRows : 0;
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+        const int q_tile = kQTileGrid(q_block, wave_id, q_group);
+        valid[q_group] = q_tile < num_q_tiles;
+        q_tile_start_row[q_group] = valid[q_group] ? q_tile * kQTileRows : 0;
     }
 
-    const long long bhoff = (long long)sw_by * seq_len * kHeadDim;
-    const auto qr  = mkr(Q + bhoff);
-    const auto kr  = mkr(K + bhoff);
-    const auto vr  = mkr(V + bhoff);
-    const auto or_ = mkr(Out + bhoff);
+    const long long bh_offset = (long long)bh_index * seq_len * kHeadDim;
+    const auto q_buffer  = make_buffer(Q + bh_offset);
+    const auto k_buffer  = make_buffer(K + bh_offset);
+    const auto v_buffer  = make_buffer(V + bh_offset);
+    const auto out_buffer = make_buffer(Out + bh_offset);
 
-    __shared__ uint32_t lds_k[2][kNBlock * kKLdsStrideDw];   // 33 KB (2-buf)
-    // V LDS staging removed — V_t is consumed directly from L1 via bld16.
+    __shared__ uint32_t lds_k[2][kKvBlockRows * kKLdsStrideDwords];   // 33 KB (2-buf)
+    // V LDS staging removed — V_t is consumed directly from L1 via load_u32x4.
 
-    // K[nb] HBM→LDS (group B). Wave w owns rows [w·16, +16); for each, its 64
+    // K[kv_block] HBM→LDS (group B). Wave w owns rows [w·16, +16); for each, its 64
     // lanes stream one full K row — lane L copies dword L. Linear padded LDS.
-    constexpr uint32_t kKRowBytes   = (uint32_t)(kKLdsStrideDw * 4);
-    constexpr uint32_t kKBlockBytes = (uint32_t)(kNBlock * kHeadDim * 2);
-    const int wave_row0 = wid_in_g * kKRowsPerLW;   // first K row this wave owns
-    auto direct_lds_k = [&](int nb, int kbuf) {
-        const uint32_t lds_row0  = __builtin_amdgcn_readfirstlane(
-            (uint32_t)(uintptr_t)&lds_k[kbuf][kKLdsDword(wave_row0, 0)]);
-        const uint32_t hbm_block = __builtin_amdgcn_readfirstlane(
-            (uint32_t)((uint64_t)nb * kKBlockBytes));
+    constexpr uint32_t kKRowBytes   = (uint32_t)(kKLdsStrideDwords * 4);
+    constexpr uint32_t kKBlockBytes = (uint32_t)(kKvBlockRows * kHeadDim * 2);
+    const int wave_row0 = kKLoadRow(wave_in_group, 0);   // first kv-row this load-wave owns
+    auto direct_lds_k = [&](int kv_block, int kbuf) {
+        const uint32_t lds_row0  = to_scalar(lds_addr(&lds_k[kbuf][kKLdsDword(wave_row0, 0)]));
+        const uint32_t hbm_block = to_scalar((uint32_t)((uint64_t)kv_block * kKBlockBytes));
         #pragma unroll
-        for (int c = 0; c < kKRowsPerLW; ++c) {
-            const int kv_row = wave_row0 + c;
+        for (int c = 0; c < kKRowsPerLoadWave; ++c) {
+            const int kv_row = kKLoadRow(wave_in_group, c);
             const uint32_t hbm_byte = (uint32_t)(kKHbmDword(kv_row, lane) * 4);
-            buffer_load_b32_to_lds(kr, lds_row0 + c * kKRowBytes, hbm_byte, hbm_block);
+            buffer_load_b32_to_lds(k_buffer, lds_row0 + c * kKRowBytes, hbm_byte, hbm_block);
         }
     };
 
     // Prologue: K[0] → LDS (group B only). Group A has no work until iter 1.
     if (!group_a) direct_lds_k(0, 0);
 
-    // Persistent VGPR Q (no reload across K-blocks). Lane (qbase+col) owns one
-    // q-row; each bld8 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
-    bf16x4_t q[kQGroups][kDTiles];
+    // Persistent VGPR Q (no reload across K-blocks). Lane (q_tile_start_row+col) owns one
+    // q-row; each load_bf16x4 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
+    bf16x4_t q_frag[kQTilesPerWave][kHeadDimTiles];
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg)
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
         #pragma unroll
-        for (int d = 0; d < kDTiles; ++d) {
-            const int q_elem = kQOLayout(qbase[qg] + col, d * kKTile + quad * 4);
-            q[qg][d] = valid[qg] ? bld8(qr, q_elem * 2) : bf16x4_t{0,0,0,0};
+        for (int d = 0; d < kHeadDimTiles; ++d) {
+            const int q_elem = kQOLayout(q_tile_start_row[q_group] + col, kHdFrag(d, quad));
+            q_frag[q_group][d] = valid[q_group] ? load_bf16x4(q_buffer, q_elem * 2) : bf16x4_t{0,0,0,0};
         }
 
-    fp32x4_t o[kQGroups][kDTiles];
+    fp32x4_t o_acc[kQTilesPerWave][kHeadDimTiles];
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg)
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
         #pragma unroll
-        for (int d = 0; d < kDTiles; ++d) o[qg][d] = zero4();
-    float m_max[kQGroups], l_sum[kQGroups];
+        for (int d = 0; d < kHeadDimTiles; ++d) o_acc[q_group][d] = zero_fp32x4();
+    float row_max[kQTilesPerWave], row_sum[kQTilesPerWave];
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg) { m_max[qg] = -FLT_MAX; l_sum[qg] = 0.f; }
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) { row_max[q_group] = -FLT_MAX; row_sum[q_group] = 0.f; }
 
     // ─── QK: S = K·Qᵀ via mfma(A=K, B=Q). 4 kv-subtiles × 4 d-tile pairs. ───────
-    // Linear K-LDS ⇒ read address is affine in dp, so one base reg per kv-subtile +
-    // dp on the ds_read2 immediate (qk_step). base = k_byte_base + this lane's
-    // (kv_row=col, dword=2*quad)·4; per-subtile delta steps kv_row by kKTile rows.
+    // Linear K-LDS ⇒ read address is affine in d_pair, so one base reg per kv-subtile +
+    // d_pair on the ds_read2 immediate (qk_step). base = k_byte_base + this lane's
+    // (kv_row=col, dword=2*quad)·4; per-subtile delta steps kv_row by kMfmaTile rows.
     auto qk_base = [&](uint32_t k_byte_base) -> uint32_t {
-        return k_byte_base + (uint32_t)(kKLdsDword(col, quad * 2) * 4);  // (kv_row=col, dword)
+        return k_byte_base + (uint32_t)(kKLaneDw(col, quad) * 4);  // (kv-row=col, quad→dword)
     };
-    constexpr uint32_t kQkBaseSnDelta = (uint32_t)(kKLdsDword(kKTile, 0) * 4);  // +one kv-subtile
+    constexpr uint32_t kQkSubtileDelta = (uint32_t)(kKLdsDword(kMfmaTile, 0) * 4);  // +one kv-subtile
 
     // Prefetch first 3 ds_read2 BEFORE pv_phase: their lgkmcnt advances
-    // independently of pv's vmcnt bld16. sched_barrier(0) locks placement.
-    // Reads 0,1,2 = (sn=0,1,2; dp=0) → shared immediate, stepped base.
-    auto prefetch_qk = [&](uint32_t k_byte_base, u32x4_t& s0, u32x4_t& s1, u32x4_t& s2) {
+    // independently of pv's vmcnt load_u32x4. sched_barrier(0) locks placement.
+    // Reads 0,1,2 = (kv_sub=0,1,2; d_pair=0) → shared immediate, stepped base.
+    auto prefetch_qk = [&](uint32_t k_byte_base, u32x4_t& k_ring0, u32x4_t& k_ring1, u32x4_t& k_ring2) {
         sched_fence();
-        const uint32_t b0 = qk_base(k_byte_base);
-        s0 = ds_read2_b64_imm<0, 16>(b0);
-        s1 = ds_read2_b64_imm<0, 16>(b0 + kQkBaseSnDelta);
-        s2 = ds_read2_b64_imm<0, 16>(b0 + 2 * kQkBaseSnDelta);
+        const uint32_t lane_base = qk_base(k_byte_base);
+        k_ring0 = ds_read2_b64_imm<0, 16>(lane_base);
+        k_ring1 = ds_read2_b64_imm<0, 16>(lane_base + kQkSubtileDelta);
+        k_ring2 = ds_read2_b64_imm<0, 16>(lane_base + 2 * kQkSubtileDelta);
         sched_fence();
     };
 
-    // Pass s0/s1/s2 by value so qk_phase sees them as locals (compiler may
+    // Pass k_ring0/k_ring1/k_ring2 by value so qk_phase sees them as locals (compiler may
     // freely reorder the lgkm waits relative to mfma issue). The depth-3 ring
     // and immediate-offset reissue live in the recursive qk_step.
-    auto qk_phase = [&](uint32_t k_byte_base, u32x4_t s0, u32x4_t s1, u32x4_t s2,
-                        fp32x4_t sacc[kQGroups][kNSub]) {
-        constexpr int kTotalReads = kNSub * (kDTiles / 2);  // 16
+    auto qk_phase = [&](uint32_t k_byte_base, u32x4_t k_ring0, u32x4_t k_ring1, u32x4_t k_ring2,
+                        fp32x4_t scores[kQTilesPerWave][kKvSubtiles]) {
+        constexpr int kTotalReads = kKvSubtiles * (kHeadDimTiles / 2);  // 16
         constexpr int kDepth      = 3;
-        const uint32_t b0 = qk_base(k_byte_base);
-        uint32_t base_sn[kNSub];
+        const uint32_t lane_base = qk_base(k_byte_base);
+        uint32_t kv_sub_base[kKvSubtiles];
         #pragma unroll
-        for (int sn = 0; sn < kNSub; ++sn) base_sn[sn] = b0 + (uint32_t)sn * kQkBaseSnDelta;
+        for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub) kv_sub_base[kv_sub] = lane_base + (uint32_t)kv_sub * kQkSubtileDelta;
         mfma_prio_hi();
         sched_fence();
-        qk_step<0, kDepth, kTotalReads>(s0, s1, s2, q, sacc, base_sn);
+        qk_step<0, kDepth, kTotalReads>(k_ring0, k_ring1, k_ring2, q_frag, scores, kv_sub_base);
         sched_fence();
         mfma_prio_lo();
     };
 
     // ─── PV: O += V·Pᵀ via mfma(A=V_t, B=P). 16 super-chunks/iter, each lane
-    // bld16s its pre-packed bf16x8 from V_t (kVtLayout). Depth-4 prefetch ring.
-    // Super-chunk sc → hd-tile dt=sc/2, kv-subtile pair {sn0,sn1}; both q-groups
+    // load_u32x4s its pre-packed bf16x8 from V_t (kVtLayout). Depth-4 prefetch ring.
+    // chunk → hd-tile d_tile=chunk/2, kv-subtile pair {kv_sub0,kv_sub1}; both q-groups
     // share the V operand. ──────────────────────────────────────────────────────
-    auto sc_off_of = [&](int it, int sc) -> uint32_t {
-        return (uint32_t)(kVtLayout(it, sc, lane) * 2);   // bf16 elems → bytes
+    auto chunk_byte_off = [&](int kv_iter, int chunk) -> uint32_t {
+        return (uint32_t)(kVtLayout(kv_iter, chunk, lane) * 2);   // bf16 elems → bytes
     };
 
-    auto pv_phase = [&](int it, const bf16x4_t preg[kQGroups][kNSub]) {
-        constexpr int kPvChunks = kDTiles * (kNSub / 2);  // 16
+    auto pv_phase = [&](int kv_iter, const bf16x4_t probs[kQTilesPerWave][kKvSubtiles]) {
+        constexpr int kPvChunks = kVtChunks;  // 16 V_t super-chunks / kv-iter
         constexpr int kPvDepth  = 4;
         mfma_prio_hi();
         sched_fence();
-        u32x4_t r[kPvDepth];
+        u32x4_t v_ring[kPvDepth];
         #pragma unroll
         for (int p_init = 0; p_init < kPvDepth; ++p_init) {
-            r[p_init] = bld16(vr, (int)sc_off_of(it, p_init));
+            v_ring[p_init] = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, p_init));
         }
         #pragma unroll
-        for (int sc = 0; sc < kPvChunks; ++sc) {
-            const int dt      = sc >> 1;        // hd-tile 0..7
-            const int sn_pair = sc & 1;         // 0 → {sn0,sn1}={0,1}; 1 → {2,3}
-            const int sn0     = sn_pair * 2;
-            const int sn1     = sn0 + 1;
-            const int slot    = sc % kPvDepth;
-            u32x4_t& cur = r[slot];
-            // bld16 = 4 dwords = two bf16x4 V-operands (kv-subtiles sn0, sn1).
+        for (int chunk = 0; chunk < kPvChunks; ++chunk) {
+            const int d_tile      = chunk >> 1;        // hd-tile 0..7
+            const int kv_sub_pair = chunk & 1;         // 0 → {kv_sub0,kv_sub1}={0,1}; 1 → {2,3}
+            const int kv_sub0     = kv_sub_pair * 2;
+            const int kv_sub1     = kv_sub0 + 1;
+            const int slot        = chunk % kPvDepth;   // depth-4 ring slot
+            u32x4_t&  cur         = v_ring[slot];
+            // load_u32x4 = 4 dwords = two bf16x4 V-operands (kv-subtiles kv_sub0, kv_sub1).
             const bf16x4_t v_lo = __builtin_bit_cast(bf16x4_t, u32x2_t{cur[0], cur[1]});
             const bf16x4_t v_hi = __builtin_bit_cast(bf16x4_t, u32x2_t{cur[2], cur[3]});
-            asm_mfma(v_lo, preg[0][sn0], o[0][dt]);
-            asm_mfma(v_lo, preg[1][sn0], o[1][dt]);
-            asm_mfma(v_hi, preg[0][sn1], o[0][dt]);
-            asm_mfma(v_hi, preg[1][sn1], o[1][dt]);
-            if (sc + kPvDepth < kPvChunks) {
-                cur = bld16(vr, (int)sc_off_of(it, sc + kPvDepth));
+            asm_mfma(v_lo, probs[0][kv_sub0], o_acc[0][d_tile]);
+            asm_mfma(v_lo, probs[1][kv_sub0], o_acc[1][d_tile]);
+            asm_mfma(v_hi, probs[0][kv_sub1], o_acc[0][d_tile]);
+            asm_mfma(v_hi, probs[1][kv_sub1], o_acc[1][d_tile]);
+            if (chunk + kPvDepth < kPvChunks) {
+                cur = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, chunk + kPvDepth));
             }
         }
         sched_fence();
         mfma_prio_lo();
     };
 
-    // L1 prefetcher for V_t[it_next], fired from Group A's softmax-only P2.
-    // vmcnt is per-wave so this is independent of any consumer's pending bld16.
+    // L1 prefetcher for V_t[kv_iter_next], fired from Group A's softmax-only P2.
+    // vmcnt is per-wave so this is independent of any consumer's pending load_u32x4.
     // Wave-split: each of 4 waves takes 4 unique super-chunks → 16 unique cache
     // line requests hit all L1 sets in parallel. The dest v[140:143] is a discard
     // sink: this is the LAST op before the end-of-iter wait_vmcnt0, so the async
     // write lands and is drained before any reuse (same invariant as the 32x32).
-    auto prefetch_v_t_l1 = [&](int it_next) {
-        if (it_next < 0) return;
-        const int sc_start = wid_in_g * 4;
+    auto prefetch_v_t_l1 = [&](int kv_iter_next) {
+        if (kv_iter_next < 0) return;
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int sc = sc_start + i;
-            const uint32_t sc_off = (uint32_t)(kVtLayout(it_next, sc, lane) * 2);
+        for (int i = 0; i < kVtChunks / kLoadWaves; ++i) {
+            const int chunk = kVtPrefetch(wave_in_group, i);
+            const uint32_t chunk_off = (uint32_t)(kVtLayout(kv_iter_next, chunk, lane) * 2);
             asm volatile(
                 "buffer_load_dwordx4 v[140:143], %0, %1, 0 offen"
                 :
-                : "v"(sc_off), "s"(vr)
+                : "v"(chunk_off), "s"(v_buffer)
                 : "v140", "v141", "v142", "v143", "memory"
             );
         }
     };
 
-    // ─── Softmax: bmax fold + exp2 + rescale + pack, per q-group ────────────────
-    auto softmax = [&](fp32x4_t sacc[kQGroups][kNSub], bf16x4_t preg[kQGroups][kNSub]) {
+    // ─── Softmax: block-max fold + exp2 + rescale + pack, per q-group ───────────
+    auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles]) {
         #pragma unroll
-        for (int qg = 0; qg < kQGroups; ++qg) {
-            // bmax fold happens IN softmax (P2), where the other group is in
+        for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+            // block-max fold happens IN softmax (P2), where the other group is in
             // pv+qk (MFMA-heavy) — the v_max3 chain hides under their MFMA.
-            float bmax_local = -FLT_MAX;
+            float block_max = -FLT_MAX;
             #pragma unroll
-            for (int sn = 0; sn < kNSub; ++sn)
-                bmax_local = fmaxf(bmax_local,
-                    fmaxf(fmaxf(sacc[qg][sn][0], sacc[qg][sn][1]),
-                          fmaxf(sacc[qg][sn][2], sacc[qg][sn][3])));
+            for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
+                block_max = fmaxf(block_max,
+                    fmaxf(fmaxf(scores[q_group][kv_sub][0], scores[q_group][kv_sub][1]),
+                          fmaxf(scores[q_group][kv_sub][2], scores[q_group][kv_sub][3])));
             constexpr float kRescaleThr = 8.0f;
-            const float new_m_local = bmax_local * scale_log2e;
-            const bool  first_block = m_max[qg] == -FLT_MAX;
-            const bool  all_ok = __all((int)((new_m_local - m_max[qg]) < kRescaleThr)) != 0
+            const float new_max_cand = block_max * scale_log2e;
+            const bool  first_block = row_max[q_group] == -FLT_MAX;
+            const bool  all_ok = __all((int)((new_max_cand - row_max[q_group]) < kRescaleThr)) != 0
                                 && !first_block;
-            float neg_m;
+            float neg_max;
             float rescale = 1.f;
             if (__builtin_expect(all_ok, 1)) {
-                neg_m = -m_max[qg];
+                neg_max = -row_max[q_group];
             } else {
-                const float new_m = fmaxf(m_max[qg], xor_max(bmax_local) * scale_log2e);
-                rescale = first_block ? 0.f : exp2c(m_max[qg] - new_m);
+                const float new_max = fmaxf(row_max[q_group], cross_lane_max(block_max) * scale_log2e);
+                rescale = first_block ? 0.f : fast_exp2(row_max[q_group] - new_max);
                 if (!first_block) {
-                    // Force in-place v_mul_f32_e32: per-subscript `o[qg][t][i] *=`
+                    // Force in-place v_mul_f32_e32: per-subscript `o_acc[q_group][t][i] *=`
                     // compiles to v_pk_mul_f32 (partial-subreg write → mfma C-read
-                    // hazard). Inline `+v(o[qg][t][i])` keeps it scalar.
+                    // hazard). Inline `+v(o_acc[q_group][t][i])` keeps it scalar.
                     #pragma unroll
-                    for (int t = 0; t < kDTiles; ++t)
+                    for (int t = 0; t < kHeadDimTiles; ++t)
                         #pragma unroll
                         for (int i = 0; i < 4; ++i)
                             asm volatile("v_mul_f32_e32 %0, %1, %0"
-                                         : "+v"(o[qg][t][i]) : "v"(rescale));
+                                         : "+v"(o_acc[q_group][t][i]) : "v"(rescale));
                 }
-                m_max[qg] = new_m;
-                neg_m = -new_m;
+                row_max[q_group] = new_max;
+                neg_max = -new_max;
             }
-            float bs = 0.f;
+            float block_sum = 0.f;
             #pragma unroll
-            for (int sn = 0; sn < kNSub; ++sn) {
-                const float p0 = exp2c(fmaf(sacc[qg][sn][0], scale_log2e, neg_m));
-                const float p1 = exp2c(fmaf(sacc[qg][sn][1], scale_log2e, neg_m));
-                const float p2 = exp2c(fmaf(sacc[qg][sn][2], scale_log2e, neg_m));
-                const float p3 = exp2c(fmaf(sacc[qg][sn][3], scale_log2e, neg_m));
+            for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub) {
+                const float p0 = fast_exp2(fmaf(scores[q_group][kv_sub][0], scale_log2e, neg_max));
+                const float p1 = fast_exp2(fmaf(scores[q_group][kv_sub][1], scale_log2e, neg_max));
+                const float p2 = fast_exp2(fmaf(scores[q_group][kv_sub][2], scale_log2e, neg_max));
+                const float p3 = fast_exp2(fmaf(scores[q_group][kv_sub][3], scale_log2e, neg_max));
                 // NaN-safe pack: a masked row gives all-zero p (safe); a zero
-                // l_sum is handled in the epilogue. MaybeNaN scrubs any drift.
-                preg[qg][sn] = pack4_bf16</*MaybeNaN=*/true>(p0, p1, p2, p3);
-                bs = vadd_f32(bs, (p0 + p1) + (p2 + p3));
+                // row_sum is handled in the epilogue. MaybeNaN scrubs any drift.
+                probs[q_group][kv_sub] = pack4_bf16</*MaybeNaN=*/true>(p0, p1, p2, p3);
+                block_sum = vadd_f32(block_sum, (p0 + p1) + (p2 + p3));
             }
-            // Cross-lane sum of bs is deferred to the output epilogue (math-equiv
+            // Cross-lane sum of block_sum is deferred to the output epilogue (math-equiv
             // since rescale is a global per-row factor).
-            l_sum[qg] = vadd_f32(vmul_f32(l_sum[qg], rescale), bs);
+            row_sum[q_group] = vadd_f32(vmul_f32(row_sum[q_group], rescale), block_sum);
         }
     };
 
@@ -562,42 +609,42 @@ void attention_forward(
     // regress perf by stalling consumer issue on vmcnt pressure.
     wait_vmcnt0();
     lds_barrier();
-    fp32x4_t sacc[kQGroups][kNSub];
-    bf16x4_t preg[kQGroups][kNSub];
-    const int nblocks = seq_len / kNBlock;
+    fp32x4_t scores[kQTilesPerWave][kKvSubtiles];
+    bf16x4_t probs[kQTilesPerWave][kKvSubtiles];
+    const int num_kv_blocks = seq_len / kKvBlockRows;
     bool first = true;
-    for (int nb = 0; nb < nblocks; ++nb) {
-        const int k_cur = nb & 1;
-        const int k_nxt = (nb + 1) & 1;
-        const bool has_next = (nb + 1 < nblocks);
-        const uint32_t k_byte_base = (uint32_t)(uintptr_t)&lds_k[k_cur][0];
+    for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
+        const int kbuf_cur = kv_block & 1;
+        const int kbuf_next = (kv_block + 1) & 1;
+        const bool has_next = (kv_block + 1 < num_kv_blocks);
+        const uint32_t k_byte_base = lds_addr(&lds_k[kbuf_cur][0]);
 
         // Slots declared inside the loop so the compiler treats them as
         // single-iter lifetime (no cross-iter register pressure).
-        u32x4_t s0, s1, s2;
+        u32x4_t k_ring0, k_ring1, k_ring2;
 
         // Phase 1
         if (group_a) {
             // qk LDS reads (lgkmcnt) fired BEFORE pv_phase so they hide under
             // pv's mfmas; consumed in qk_phase. sched_barrier locks placement.
-            prefetch_qk(k_byte_base, s0, s1, s2);
-            if (!first) pv_phase(nb - 1, preg);
-            qk_phase(k_byte_base, s0, s1, s2, sacc);
+            prefetch_qk(k_byte_base, k_ring0, k_ring1, k_ring2);
+            if (!first) pv_phase(kv_block - 1, probs);
+            qk_phase(k_byte_base, k_ring0, k_ring1, k_ring2, scores);
         } else {
-            if (!first) softmax(sacc, preg);
-            if (has_next) direct_lds_k(nb + 1, k_nxt);
+            if (!first) softmax(scores, probs);
+            if (has_next) direct_lds_k(kv_block + 1, kbuf_next);
         }
 
         __builtin_amdgcn_s_barrier();
 
         // Phase 2
         if (group_a) {
-            softmax(sacc, preg);
-            if (has_next) prefetch_v_t_l1(nb);
+            softmax(scores, probs);
+            if (has_next) prefetch_v_t_l1(kv_block);
         } else {
-            prefetch_qk(k_byte_base, s0, s1, s2);
-            if (!first) pv_phase(nb - 1, preg);
-            qk_phase(k_byte_base, s0, s1, s2, sacc);
+            prefetch_qk(k_byte_base, k_ring0, k_ring1, k_ring2);
+            if (!first) pv_phase(kv_block - 1, probs);
+            qk_phase(k_byte_base, k_ring0, k_ring1, k_ring2, scores);
         }
 
         // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes
@@ -610,100 +657,100 @@ void attention_forward(
 
     // Epilogue: drain. Group B softmaxes its final qk; both groups pv on the
     // last V tile.
-    if (!group_a) softmax(sacc, preg);
+    if (!group_a) softmax(scores, probs);
     {
-        const int it = nblocks - 1;
-        pv_phase(it, preg);
+        const int kv_iter = num_kv_blocks - 1;
+        pv_phase(kv_iter, probs);
     }
 
     // ─── Output ────────────────────────────────────────────────────────────
-    // l_sum is summed across the 4 quad-lanes once here (math-equiv since
-    // rescale is global to the row). invl=0 when l_sum==0 prevents 0×inf=NaN.
+    // row_sum is summed across the 4 quad-lanes once here (math-equiv since
+    // rescale is global to the row). inv_sum=0 when row_sum==0 prevents 0×inf=NaN.
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg) l_sum[qg] = xor_sum(l_sum[qg]);
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
     #pragma unroll
-    for (int qg = 0; qg < kQGroups; ++qg) {
-        if (!valid[qg]) continue;
-        const float invl = (l_sum[qg] == 0.0f) ? 0.0f : rcpf(l_sum[qg]);
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+        if (!valid[q_group]) continue;
+        const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
         // No PV mfma follows so a packed v_pk_mul_f32 is safe here. MaybeNaN
-        // pack4 scrubs any residual NaN/Inf in o from pathological inputs.
+        // pack4 scrubs any residual NaN/Inf in o_acc from pathological inputs.
         #pragma unroll
-        for (int t = 0; t < kDTiles; ++t) {
-            o[qg][t] = o[qg][t] * invl;
+        for (int t = 0; t < kHeadDimTiles; ++t) {
+            o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
             const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(
-                o[qg][t][0], o[qg][t][1], o[qg][t][2], o[qg][t][3]);
-            bst8(or_, kQOLayout(qbase[qg] + col, t * kKTile + quad * 4) * 2, out);
+                o_acc[q_group][t][0], o_acc[q_group][t][1], o_acc[q_group][t][2], o_acc[q_group][t][3]);
+            store_bf16x4(out_buffer, kQOLayout(q_tile_start_row[q_group] + col, kHdFrag(t, quad)) * 2, out);
         }
     }
 }
 
 // ─── V transpose for 16x16x16 mfma ─────────────────────────────────────────────
 // Pre-packs V[seq,128] into V_t so pv_phase reads each lane's MFMA A-fragment with
-// one contiguous bld16. Phase 1: V block HBM→LDS (coalesced). Phase 2: re-read in
-// fragment order → V_t (kVtLayout, shared with pv_phase). Super-chunk sc = dt*2 +
-// sn_pair; lane l's 16 bytes are two A-operands (kv-subtiles sn0 then sn1):
-//   bytes [l*16 .. l*16+7]   = V[k=sn0*16 + (l/16)*4 + i, hd=dt*16 + l%16]
-//   bytes [l*16+8 .. l*16+15] = V[k=sn1*16 + (l/16)*4 + i, hd=dt*16 + l%16]
+// one contiguous load_u32x4. Phase 1: V block HBM→LDS (coalesced). Phase 2: re-read in
+// fragment order → V_t (kVtLayout, shared with pv_phase). super-chunk = d_tile*2 +
+// kv_sub_pair; lane l's 16 bytes are two A-operands (kv-subtiles kv_sub0 then kv_sub1):
+//   bytes [l*16 .. l*16+7]   = V[k=kv_sub0*16 + (l/16)*4 + i, hd=d_tile*16 + l%16]
+//   bytes [l*16+8 .. l*16+15] = V[k=kv_sub1*16 + (l/16)*4 + i, hd=d_tile*16 + l%16]
 // V_t layout and the fragment map are drawn in the indexing notebook.
 constexpr int kXposeThreadsPerWG = 256;
 constexpr auto kVStageWr = opus::make_layout(kShape2, strides<kHeadDim / 2, 4>()); // (row, octet)→dword
-constexpr auto kVtScLane = opus::make_layout(kShape2, strides<kVtScElems, kVtLaneElems>()); // (super-chunk, lane)
+constexpr auto kVtChunkLane = opus::make_layout(kShape2, strides<kVtChunkElems, kVtLaneElems>()); // (super-chunk, lane)
 __global__ __launch_bounds__(kXposeThreadsPerWG, 4)
 void v_transpose_kernel_16x16(
     const bf16_t* __restrict__ V,
     bf16_t*       __restrict__ V_t,
     int           seq_len_per_head
 ) {
-    const int it  = blockIdx.x;                 // which 64-row kv-block (over all B·H·S)
+    const int kv_iter  = blockIdx.x;                 // which 64-row kv-block (over all B·H·S)
     const int tid = threadIdx.x;
-    const long long block_base = (long long)it * kVtIterElems;  // bf16 elems before this block
+    const long long block_base = (long long)kv_iter * kVtBlockElems;  // bf16 elems before this block
 
-    __shared__ uint32_t sV_dw[kNBlock * (kHeadDim / 2)];   // 64 rows × 64 dw = 16 KB
-    const auto vr_x = mkr(V);
+    __shared__ uint32_t stage_dw[kKvBlockRows * (kHeadDim / 2)];   // 64 rows × 64 dw = 16 KB
+    const auto v_buffer = make_buffer(V);
 
-    // ── Phase 1: V[block] HBM → LDS, coalesced. 1024 thread-ops cover 64 rows ×
-    //    16 head-dim octets; each op copies one bf16x8 (= 4 dwords). ───────────
+    // ── Phase 1: V[block] HBM → LDS, coalesced. 1024 element-copies cover 64 rows ×
+    //    16 head-dim octets; each copies one bf16x8 (= 4 dwords). ───────────
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const int op    = k * kXposeThreadsPerWG + tid;
-        const int row   = op >> 4;             // 0..63 kv-row in this block
-        const int octet = op & 15;             // 0..15 head-dim octet (×8 bf16)
-        u32x4_t v8 = __builtin_amdgcn_raw_buffer_load_b128(
-            vr_x, (uint32_t)((block_base + kQOLayout(row, octet * 8)) * 2), 0, 0);
-        const int dst = kVStageWr(row, octet);            // dword offset in sV_dw
-        sV_dw[dst + 0] = v8[0]; sV_dw[dst + 1] = v8[1];
-        sV_dw[dst + 2] = v8[2]; sV_dw[dst + 3] = v8[3];
+        const int elem_idx = k * kXposeThreadsPerWG + tid;
+        const int row      = elem_idx >> 4;    // 0..63 kv-row in this block
+        const int octet    = elem_idx & 15;    // 0..15 head-dim octet (×8 bf16)
+        u32x4_t v_oct = __builtin_amdgcn_raw_buffer_load_b128(
+            v_buffer, (uint32_t)((block_base + kQOLayout(row, octet * 8)) * 2), 0, 0);
+        const int dst_dw = kVStageWr(row, octet);            // dword offset in stage_dw
+        stage_dw[dst_dw + 0] = v_oct[0]; stage_dw[dst_dw + 1] = v_oct[1];
+        stage_dw[dst_dw + 2] = v_oct[2]; stage_dw[dst_dw + 3] = v_oct[3];
     }
 
     __syncthreads();
 
     // staged tile is bf16, row-major (kv_row, head_dim) — same shape as Q (kQOLayout).
-    const bf16_t* sV = reinterpret_cast<const bf16_t*>(sV_dw);
-    const auto otr_x = mkr(V_t);
+    const bf16_t* stage = reinterpret_cast<const bf16_t*>(stage_dw);
+    const auto vt_buffer = make_buffer(V_t);
 
     // ── Phase 2: gather each (super-chunk, lane)'s two A-fragments from LDS → V_t. ──
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const int flat_idx = tid * 4 + k;        // 0..1023
-        const int sc       = flat_idx >> 6;      // super-chunk 0..15
-        const int lane_in  = flat_idx & 63;      // lane 0..63
-        const int dt       = sc >> 1;            // hd-tile 0..7
-        const int sn_pair  = sc &  1;            // 0..1
-        const int sn0      = sn_pair * 2;
-        const int sn1      = sn0 + 1;
-        const int d        = dt * 16 + (lane_in & 15);
-        const int k0_base  = (lane_in >> 4) * 4;
+        const int frag_idx    = tid * 4 + k;       // 0..1023
+        const int chunk          = frag_idx >> 6;     // super-chunk 0..15
+        const int frag_lane   = frag_idx & 63;     // lane 0..63
+        const int d_tile      = chunk >> 1;           // hd-tile 0..7
+        const int kv_sub_pair = chunk & 1;            // 0..1
+        const int kv_sub0     = kv_sub_pair * 2;
+        const int kv_sub1     = kv_sub0 + 1;
+        const int hd          = d_tile * 16 + (frag_lane & 15);  // head-dim element 0..127
+        const int kv_row0     = (frag_lane >> 4) * 4;            // first of this lane's 4 kv-rows
 
         bf16_t packed[8];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            packed[i]     = sV[kQOLayout(sn0 * 16 + k0_base + i, d)];
-            packed[4 + i] = sV[kQOLayout(sn1 * 16 + k0_base + i, d)];
+            packed[i]     = stage[kQOLayout(kv_sub0 * 16 + kv_row0 + i, hd)];
+            packed[4 + i] = stage[kQOLayout(kv_sub1 * 16 + kv_row0 + i, hd)];
         }
         u32x4_t packed_v;
         __builtin_memcpy(&packed_v, packed, sizeof(packed));
         __builtin_amdgcn_raw_buffer_store_b128(
-            packed_v, otr_x, (uint32_t)((block_base + kVtScLane(sc, lane_in)) * 2), 0, 0);
+            packed_v, vt_buffer, (uint32_t)((block_base + kVtChunkLane(chunk, frag_lane)) * 2), 0, 0);
     }
     (void)seq_len_per_head;
 }
@@ -718,12 +765,12 @@ int launch_attention_forward(
     int batch, int heads, int seq_len, int head_dim, void* stream
 ) {
     if (batch <= 0 || heads <= 0)             return 1;
-    if (seq_len <= 0 || (seq_len % kNBlock))  return 2;
+    if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
     if (head_dim != kHeadDim)                 return 3;
 
     const int   bh   = batch * heads;
     const int   qt   = seq_len / kQTileRows;
-    const dim3  grid((qt + kNumWaves * kQGroups - 1) / (kNumWaves * kQGroups), bh);
+    const dim3  grid((qt + kQTilesPerWG - 1) / kQTilesPerWG, bh);
     const float sl2e = kLog2e / sqrtf((float)kHeadDim);
 
     hipLaunchKernelGGL(
@@ -738,8 +785,8 @@ int launch_attention_forward(
 int launch_v_transpose(
     const void* v, void* v_t, int n_rows, int seq_len_per_head, void* stream
 ) {
-    if (n_rows <= 0 || (n_rows % kNBlock)) return 2;
-    const int iters = n_rows / kNBlock;
+    if (n_rows <= 0 || (n_rows % kKvBlockRows)) return 2;
+    const int iters = n_rows / kKvBlockRows;
     hipLaunchKernelGGL(
         v_transpose_kernel_16x16,
         dim3(iters), dim3(kXposeThreadsPerWG), 0, (hipStream_t)stream,
