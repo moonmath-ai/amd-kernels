@@ -10,6 +10,7 @@ from setuptools.command.build_py import build_py
 
 ROOT = Path(__file__).parent.resolve()
 KERNEL = ROOT / "attention_kernel.hip"
+KERNEL_LITE = KERNEL  # sparsity branch: skip kernel IS attention_kernel.hip (templated attention_forward<kLite>)
 PKG_DIR = ROOT / "moonmath_attention"
 
 ARCH = os.environ.get("CDNA3_ARCH", "gfx942")
@@ -27,10 +28,10 @@ HIPCC_FLAGS = [
 ] + EXTRA_FLAGS
 
 
-def _build_kernel(round_mode: str, out_dir: Path) -> Path:
-    out = out_dir / f"libattention_{round_mode.lower()}.so"
+def _build_kernel(round_mode: str, out_dir: Path, src: Path = KERNEL, tag: str = "") -> Path:
+    out = out_dir / f"libattention_{tag}{round_mode.lower()}.so"
     cmd = [HIPCC, *HIPCC_FLAGS, f"-DBF16_ROUND={round_mode}",
-           "-o", str(out), str(KERNEL)]
+           "-o", str(out), str(src)]
     print("[hipcc]", " ".join(cmd), flush=True)
     subprocess.check_call(cmd)
     return out
@@ -51,7 +52,8 @@ class BuildPyWithKernel(build_py):
             )
         PKG_DIR.mkdir(exist_ok=True)
         for round_mode in ("RTNA", "RTNE", "RTZ"):
-            _build_kernel(round_mode, PKG_DIR)
+            _build_kernel(round_mode, PKG_DIR)                                  # champion dense
+            _build_kernel(round_mode, PKG_DIR, src=KERNEL_LITE, tag="lite_")    # LiteAttention skip
         super().run()
 
 

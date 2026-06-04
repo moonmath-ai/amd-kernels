@@ -55,6 +55,7 @@ constexpr int   kQTilesPerWG      = kNumWaves * kQTilesPerWave;  // 16 q-tiles =
 constexpr int   kKRowDwords       = kHeadDim / 2;                // 64 = real K row width (dwords)
 constexpr int   kKLdsStrideDwords = kKRowDwords + 2;            // 66 = padded LDS row stride
 constexpr int   kKRowsPerLoadWave = kKvBlockRows / kLoadWaves;  // 16
+constexpr int   kVerdictRing      = 2;  // lite skip-vote LDS ring = live window {step, step-1}; pow2
 constexpr float kLog2e            = 1.4426950408889634f;
 constexpr uint32_t kBufferConfig  = 0x00020000u;  // SRD word3: DATA_FORMAT=32 (raw 32-bit elems)
 
@@ -171,8 +172,12 @@ __device__ __forceinline__ uint32_t lds_addr(const T* p) { return (uint32_t)(uin
 
 // Broadcast a wave-uniform value into a scalar register (SGPR) via readfirstlane.
 // Every lane computes the same value here, so this lets the compiler use scalar
-// addressing instead of carrying it in a per-lane VGPR.
+// addressing instead of carrying it in a per-lane VGPR. The int overload keeps
+// signed list values (skip-list entries can be -1) in an SGPR without a u32 round-trip.
 __device__ __forceinline__ uint32_t to_scalar(uint32_t v) {
+    return __builtin_amdgcn_readfirstlane(v);
+}
+__device__ __forceinline__ int to_scalar(int v) {
     return __builtin_amdgcn_readfirstlane(v);
 }
 
@@ -357,13 +362,17 @@ __device__ __forceinline__ float cross_lane_sum(float v) {
     return partial + __builtin_bit_cast(float, peer32);
 }
 
+template <bool kLite>
 __global__ __launch_bounds__(kBlockSize, 1)
 void attention_forward(
     const bf16_t* __restrict__ Q,
     const bf16_t* __restrict__ K,
     const bf16_t* __restrict__ V,    // points to V_t (pre-transposed)
     bf16_t* __restrict__ Out,
-    int seq_len, float scale_log2e
+    int seq_len, float scale_log2e,
+    const int16_t* __restrict__ read_list,   // LiteAttention skip list (this phase's slice)
+    int16_t* __restrict__ write_list,        // skip list written for the next timestep
+    float thr, int phase                     // skip threshold (log2) + reverse-list phase
 ) {
     // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
     // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
@@ -376,11 +385,21 @@ void attention_forward(
     const bool group_a       = (wave_id < kLoadWaves);
     const int  wave_in_group = group_a ? wave_id : (wave_id - kLoadWaves);
 
-    const int wg_id_raw = blockIdx.y * gridDim.x + blockIdx.x;
-    const int num_wgs   = gridDim.x * gridDim.y;
-    const int wg_id     = chiplet_swizzle(wg_id_raw, num_wgs, gridDim.x);
-    const int q_block   = wg_id % gridDim.x;   // which 256-row q-block
-    const int bh_index  = wg_id / gridDim.x;   // which (batch·head)
+    // Grid: x = #q-blocks (256-row blocks = ceil(seq_len/256)), y = batch·heads.
+    // One workgroup (CTA) per (q-block, batch·head).
+    const int num_q_blocks = gridDim.x;
+    const int num_bh       = gridDim.y;
+    const int wg_id_raw = blockIdx.y * num_q_blocks + blockIdx.x;
+    const int num_wgs   = num_q_blocks * num_bh;
+    // Dense: head-first chiplet swizzle co-locates a (B,H)'s q-blocks on one XCD's
+    // L2 (~+1.4% @ moderate S). Lite: that pinning is HARMFUL — uneven per-head
+    // sparsity saturates the dense heads' XCDs while sparse heads' XCDs idle
+    // (per-head 50% skip measured 0.83x, i.e. SLOWER). Identity mapping spreads each
+    // head's q-tiles across all 8 XCDs → per-head 50% skip load-balances to ~1.9x.
+    // kLite is a compile-time bool, so this is a zero-cost static branch.
+    const int wg_id     = kLite ? wg_id_raw : chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
+    const int q_block   = wg_id % num_q_blocks;   // which 256-row q-block
+    const int bh_index  = wg_id / num_q_blocks;   // which (batch·head)
 
     // Q-tile ownership: each wave owns kQTilesPerWave (=2) 16-row q-tiles. For each,
     // q_tile_start_row is the absolute seq-row where that tile begins — a per-tile
@@ -406,13 +425,14 @@ void attention_forward(
     __shared__ uint32_t lds_k[2][kKvBlockRows * kKLdsStrideDwords];   // 33 KB (2-buf)
     // V LDS staging removed — V_t is consumed directly from L1 via load_u32x4.
 
-    // K[kv_block] HBM→LDS (group B). Wave w owns rows [w·16, +16); for each, its 64
-    // lanes stream one full K row — lane L copies dword L. Linear padded LDS.
+    // K[kv_block] HBM→LDS into double-buffer half `k_buf` (group B). Wave w owns rows
+    // [w·16, +16); for each, its 64 lanes stream one full K row — lane L copies dword L.
+    // Linear padded LDS.
     constexpr uint32_t kKRowBytes   = (uint32_t)(kKLdsStrideDwords * 4);
     constexpr uint32_t kKBlockBytes = (uint32_t)(kKvBlockRows * kHeadDim * 2);
     const int wave_row0 = kKLoadRow(wave_in_group, 0);   // first kv-row this load-wave owns
-    auto direct_lds_k = [&](int kv_block, int kbuf) {
-        const uint32_t lds_row0  = to_scalar(lds_addr(&lds_k[kbuf][kKLdsDword(wave_row0, 0)]));
+    auto direct_lds_k = [&](int kv_block, int k_buf) {
+        const uint32_t lds_row0  = to_scalar(lds_addr(&lds_k[k_buf][kKLdsDword(wave_row0, 0)]));
         const uint32_t hbm_block = to_scalar((uint32_t)((uint64_t)kv_block * kKBlockBytes));
         #pragma unroll
         for (int c = 0; c < kKRowsPerLoadWave; ++c) {
@@ -422,8 +442,38 @@ void attention_forward(
         }
     };
 
-    // Prologue: K[0] → LDS (group B only). Group A has no work until iter 1.
-    if (!group_a) direct_lds_k(0, 0);
+    // ─── LiteAttention skip state (dynamic LDS; 0 bytes when !kLite) ─────────────
+    // The main loop walks the read list's RLE ranges directly (no block-list
+    // expansion). sverdict[wave][step % kVerdictRing] holds each wave's per-block skip
+    // vote; the loop's incremental writer ANDs the 8 waves to emit the next-step write
+    // list. Only the live window (step and step-1) is ever read, so a fixed ring suffices
+    // — the LDS cost is constant in seq_len (vs the old [kNumWaves*num_kv_blocks]).
+    const int num_kv_blocks = seq_len / kKvBlockRows;   // total K-blocks (= ktiles)
+    const int lstep         = phase ? 1 : -1;           // reverse-list step (skip_list.h)
+    extern __shared__ char g_dyn[];
+    uint8_t* const sverdict = (uint8_t*)g_dyn;          // [kNumWaves*kVerdictRing] ring, kLite only
+
+    // Skip-list is row-major [bh, q-block, num_k_blocks] in HBM — one RLE row per CTA.
+    // lbase = that row's origin (a Layout, like every other index; strides are runtime/
+    // seq-len-dependent so it's built per-launch, not constexpr). Within the row the RLE
+    // is walked by a running cursor (lbase + idx). to_scalar() keeps cursor reads in SGPRs,
+    // not VGPRs across the MFMA loop.
+    long long lbase = 0;
+    int       list_len = 0;
+    auto rl = [&](int idx) -> int { return to_scalar((int)read_list[lbase + idx]); };
+
+    // Prologue: first processed K-block → LDS (group B only); group A idle until iter 1.
+    int  first_blk = 0;                       // dense: block 0
+    bool any       = (num_kv_blocks > 0);
+    if constexpr (kLite) {
+        const long long num_k_blocks = num_kv_blocks + 2;
+        const auto kSkipRow = opus::make_layout(kShape2, opus::make_tuple(num_q_blocks * num_k_blocks, num_k_blocks));
+        lbase     = kSkipRow(bh_index, q_block);          // origin of this CTA's skip-list row
+        list_len  = to_scalar((int)read_list[lbase]);     // RLE length
+        any       = (list_len > 0);
+        first_blk = any ? (rl(list_len) + lstep) : 0;      // first range's start
+    }
+    if (!group_a && any) direct_lds_k(first_blk, 0);
 
     // Persistent VGPR Q (no reload across K-blocks). Lane (q_tile_start_row+col) owns one
     // q-row; each load_bf16x4 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
@@ -492,7 +542,16 @@ void attention_forward(
         return (uint32_t)(kVtLayout(kv_iter, chunk, lane) * 2);   // bf16 elems → bytes
     };
 
-    auto pv_phase = [&](int kv_iter, const bf16x4_t probs[kQTilesPerWave][kKvSubtiles]) {
+    // verdict_step = the processing step of the block being pv'd (its verdict-ring slot);
+    // ignored when !kLite. Soft block-skip: a wave whose verdict for this block is "skip"
+    // does no pv at all (its probs were already zeroed in softmax, so the result is
+    // unchanged — this just drops the 0-adding MFMAs + V_t loads). The verdict is in
+    // LDS from this wave's own softmax (group A: prev iter P2; group B: this iter P1),
+    // visible across the same barriers record() relies on.
+    auto pv_phase = [&](int kv_iter, const bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int verdict_step) {
+        if constexpr (kLite) {
+            if (sverdict[wave_id * kVerdictRing + (verdict_step & (kVerdictRing - 1))]) return;
+        }
         constexpr int kPvChunks = kVtChunks;  // 16 V_t super-chunks / kv-iter
         constexpr int kPvDepth  = 4;
         mfma_prio_hi();
@@ -547,7 +606,43 @@ void attention_forward(
     };
 
     // ─── Softmax: block-max fold + exp2 + rescale + pack, per q-group ───────────
-    auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles]) {
+    auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int step) {
+        // ── LiteAttention verdict pre-pass (kLite) — decide this wave's skip from the
+        // per-q-group block maxes BEFORE the fold, so a skipping wave can drop the WHOLE
+        // contribution (probs→0, no row_sum/o_acc update) = "block absent". (Dropping
+        // only pv while the fold ran would bias o/row_sum — verdict is a MAX test, not a
+        // contribution test.) The verdict ALWAYS feeds the next-step write list and ALSO
+        // drives this step's per-wave fold+pv skip. Keep iff some q-row's
+        // block max is within `thr` (log2) of its running max — FA3 cond2/!__any_sync;
+        // the per-lane partial max + __any reduces across the 4 quad-lanes of each col.
+        if constexpr (kLite) {
+            bool any_keep = false;
+            #pragma unroll
+            for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+                float bm = -FLT_MAX;
+                #pragma unroll
+                for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
+                    bm = fmaxf(bm,
+                        fmaxf(fmaxf(scores[q_group][kv_sub][0], scores[q_group][kv_sub][1]),
+                              fmaxf(scores[q_group][kv_sub][2], scores[q_group][kv_sub][3])));
+                any_keep = any_keep || (valid[q_group] && ((bm * scale_log2e - row_max[q_group]) > thr));
+            }
+            bool skip_wave = (__any(any_keep) == 0);
+            if (step == 0) skip_wave = false;   // FA3 Is_first: never skip the first processed block
+            if (lane == 0) sverdict[wave_id * kVerdictRing + (step & (kVerdictRing - 1))] = skip_wave ? (uint8_t)1 : (uint8_t)0;
+            if (skip_wave) {
+                // Block absent for this wave: zero probs so the (skipped) pv adds
+                // nothing; row_max/row_sum/o_acc untouched — the skip predicate
+                // (bm·scale − row_max ≤ thr) guarantees no new running max.
+                #pragma unroll
+                for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
+                    #pragma unroll
+                    for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
+                        probs[q_group][kv_sub] = bf16x4_t{0, 0, 0, 0};
+                return;
+            }
+        }
+        // ── Fold (dense + lite-keep) — byte-identical to the champion. ──
         #pragma unroll
         for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
             // block-max fold happens IN softmax (P2), where the other group is in
@@ -611,56 +706,105 @@ void attention_forward(
     lds_barrier();
     fp32x4_t scores[kQTilesPerWave][kKvSubtiles];
     bf16x4_t probs[kQTilesPerWave][kKvSubtiles];
-    const int num_kv_blocks = seq_len / kKvBlockRows;
-    bool first = true;
-    for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
-        const int kbuf_cur = kv_block & 1;
-        const int kbuf_next = (kv_block + 1) & 1;
-        const bool has_next = (kv_block + 1 < num_kv_blocks);
-        const uint32_t k_byte_base = lds_addr(&lds_k[kbuf_cur][0]);
+    // ─── Unified pipeline over processed K-blocks ──────────────────────────────
+    // Dense and lite share ONE warp-spec body; only how each step's blocks are produced
+    // differs. `step` = processing-step counter 0,1,2,… (drives K double-buffer parity +
+    // verdict-ring slot); `kv_block`/`prev_block` are the blocks being qk'd / pv'd;
+    // `next_block` is what group B streams into LDS. Dense: kv_block==prev_block+1==step,
+    // walking 0..num_kv_blocks-1 — every lite-only construct below is `if constexpr`'d
+    // out, leaving the champion's loop. Lite: a cursor walks the read-list's RLE ranges
+    // (kv_block/prev_block decoupled from step) and tid 0 records the next-step write list
+    // under group B's MFMA. has_next = "another block follows" (dense: step+1<N; lite:
+    // range continues OR another range remains).
 
-        // Slots declared inside the loop so the compiler treats them as
-        // single-iter lifetime (no cross-iter register pressure).
+    // Lite cursor + incremental write-list state (unused → elided when !kLite).
+    auto load_range = [&](int& range_block, int& range_end, int& rle_idx) {  // open next RLE range
+        range_block = rl(rle_idx) + lstep;
+        range_end   = rl(rle_idx - 1) + lstep;
+        rle_idx    -= 2;
+    };
+    int  rle_idx = list_len, range_block = 0, range_end = 0;
+    int  write_idx   = 1;       // write-list output cursor
+    bool skip_state  = true;    // running skip/compute state (for transition detection)
+    bool prev_ended_range = false;   // did prev_block end its range?
+    // record `block` at verdict-ring slot `verdict_step`: AND its 8 wave-votes, emit a
+    // skip↔compute transition when the state flips, and a range-end marker if is_range_end.
+    auto record = [&](int block, int verdict_step, bool is_range_end) {
+        int sk = 1;
+        #pragma unroll
+        for (int w = 0; w < kNumWaves; ++w) sk &= (int)sverdict[w * kVerdictRing + (verdict_step & (kVerdictRing - 1))];
+        const bool skip = (sk != 0);
+        if (skip != skip_state) { write_list[lbase + write_idx++] = (int16_t)block; skip_state = skip; }
+        if (is_range_end) { skip_state = true; if (!skip) write_list[lbase + write_idx++] = (int16_t)(block + lstep); }
+    };
+
+    int  prev_block = -1, step = 0;
+    bool have = kLite ? (list_len > 0) : (num_kv_blocks > 0);
+    if constexpr (kLite) { if (have) load_range(range_block, range_end, rle_idx); }
+
+    while (have) {
+        // Per-step block descriptor: dense counts straight up, lite reads the cursor.
+        int  kv_block, next_block;  bool has_next, range_continues = false;
+        if constexpr (kLite) {
+            kv_block             = range_block;
+            const int next_in_range = kv_block + lstep;
+            range_continues      = (lstep > 0) ? (next_in_range < range_end) : (next_in_range > range_end);
+            has_next             = range_continues || (rle_idx >= 1);
+            next_block           = range_continues ? next_in_range : (has_next ? (rl(rle_idx) + lstep) : -1);
+        } else {
+            kv_block = step;  next_block = step + 1;  has_next = (step + 1 < num_kv_blocks);
+        }
+        const int  k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
+        const bool first = (step == 0);
+        const uint32_t k_byte_base = lds_addr(&lds_k[k_buf_cur][0]);
+        // Declared in-loop = single-iter lifetime (no cross-iter register pressure).
         u32x4_t k_ring0, k_ring1, k_ring2;
-
-        // Phase 1
-        if (group_a) {
-            // qk LDS reads (lgkmcnt) fired BEFORE pv_phase so they hide under
-            // pv's mfmas; consumed in qk_phase. sched_barrier locks placement.
+        if (group_a) {  // P1
+            // qk LDS reads (lgkmcnt) fired BEFORE pv_phase so they hide under pv's
+            // mfmas; consumed in qk_phase. prefetch_qk's sched_barrier locks placement.
             prefetch_qk(k_byte_base, k_ring0, k_ring1, k_ring2);
-            if (!first) pv_phase(kv_block - 1, probs);
+            if (!first) pv_phase(prev_block, probs, step - 1);
             qk_phase(k_byte_base, k_ring0, k_ring1, k_ring2, scores);
         } else {
-            if (!first) softmax(scores, probs);
-            if (has_next) direct_lds_k(kv_block + 1, kbuf_next);
+            if (!first) softmax(scores, probs, step - 1);
+            if (has_next) direct_lds_k(next_block, k_buf_next);
         }
-
         __builtin_amdgcn_s_barrier();
-
-        // Phase 2
-        if (group_a) {
-            softmax(scores, probs);
+        if (group_a) {  // P2
+            softmax(scores, probs, step);
+            if constexpr (kLite) {   // record prev block's completed vote under group B's MFMA
+                if (tid == 0 && !first) record(prev_block, step - 1, prev_ended_range);
+            }
             if (has_next) prefetch_v_t_l1(kv_block);
         } else {
             prefetch_qk(k_byte_base, k_ring0, k_ring1, k_ring2);
-            if (!first) pv_phase(kv_block - 1, probs);
+            if (!first) pv_phase(prev_block, probs, step - 1);
             qk_phase(k_byte_base, k_ring0, k_ring1, k_ring2, scores);
         }
-
-        // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes
-        // (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so the next iter's
-        // qk_phase doesn't read stale K. lds_barrier covers the LGKMCNT side.
+        // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is
+        // VMCNT-tracked, not LGKMCNT) so the next iter's qk_phase can't read stale K;
+        // lds_barrier covers the LGKMCNT side.
         wait_vmcnt0();
         lds_barrier();
-        first = false;
+        prev_block = kv_block; ++step;
+        if constexpr (kLite) {
+            prev_ended_range = !range_continues;
+            if (range_continues)   range_block = kv_block + lstep;
+            else if (rle_idx >= 1) load_range(range_block, range_end, rle_idx);
+            else                   have = false;
+        } else {
+            have = (step < num_kv_blocks);
+        }
     }
-
-    // Epilogue: drain. Group B softmaxes its final qk; both groups pv on the
-    // last V tile.
-    if (!group_a) softmax(scores, probs);
-    {
-        const int kv_iter = num_kv_blocks - 1;
-        pv_phase(kv_iter, probs);
+    // Epilogue: last block's softmax + pv, then (lite) flush its always-range-end vote.
+    if (!group_a && step > 0) softmax(scores, probs, step - 1);
+    if (step > 0) pv_phase(prev_block, probs, step - 1);
+    if constexpr (kLite) {
+        lds_barrier();   // group B's last-block vote → visible to tid 0
+        if (tid == 0 && step > 0) {
+            record(prev_block, step - 1, /*is_range_end=*/true);
+            write_list[lbase] = (int16_t)(write_idx - 1);   // finalize count
+        }
     }
 
     // ─── Output ────────────────────────────────────────────────────────────
@@ -774,9 +918,40 @@ int launch_attention_forward(
     const float sl2e = kLog2e / sqrtf((float)kHeadDim);
 
     hipLaunchKernelGGL(
-        attention_forward, grid, dim3(kBlockSize), 0, (hipStream_t)stream,
+        attention_forward<false>, grid, dim3(kBlockSize), 0, (hipStream_t)stream,
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-        (bf16_t*)out, seq_len, sl2e);
+        (bf16_t*)out, seq_len, sl2e,
+        (const int16_t*)nullptr, (int16_t*)nullptr, 0.f, 0);
+    return (int)hipGetLastError();
+}
+
+// LiteAttention forward: read_list / write_list are int16 [B,H,qtiles,nblocks+2]
+// slices (read = skip_list[phase], write = skip_list[1-phase]); kBlockM=256,
+// kBlockN=64. threshold is in log2 units (~ -10). phase selects reverse-list step.
+// V must already be pre-transposed into V_t (call launch_v_transpose first).
+int launch_attention_forward_lite(
+    const void* q, const void* k, const void* v, void* out,
+    int batch, int heads, int seq_len, int head_dim,
+    const void* read_list, void* write_list, float threshold, int phase, void* stream
+) {
+    if (batch <= 0 || heads <= 0)                  return 1;
+    if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
+    if (head_dim != kHeadDim)                      return 3;
+    if (!read_list || !write_list)                 return 4;
+
+    const int   bh   = batch * heads;
+    const int   qt   = seq_len / kQTileRows;
+    const dim3  grid((qt + kQTilesPerWG - 1) / kQTilesPerWG, bh);
+    const float sl2e = kLog2e / sqrtf((float)kHeadDim);
+    // dynamic LDS: sverdict[kNumWaves*kVerdictRing] ring — constant (live window 2),
+    // independent of seq_len, so the lite path is not LDS-capped by sequence length.
+    const size_t dyn = (size_t)kNumWaves * kVerdictRing;
+
+    hipLaunchKernelGGL(
+        attention_forward<true>, grid, dim3(kBlockSize), dyn, (hipStream_t)stream,
+        (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
+        (bf16_t*)out, seq_len, sl2e,
+        (const int16_t*)read_list, (int16_t*)write_list, threshold, phase);
     return (int)hipGetLastError();
 }
 

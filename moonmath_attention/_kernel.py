@@ -9,6 +9,12 @@ _LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
+# launch_attention_forward_lite(q,k,v,out, B,H,S,D, read_list,write_list, thr, phase, stream)
+_LITE_LAUNCH_ARGS = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
+]
 # launch_v_transpose(V, V_t, seq_len_total, seq_len_per_head, stream)
 _VTRANSPOSE_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
@@ -46,6 +52,28 @@ def _kernel(round_mode):
     lib.launch_v_transpose.restype = ctypes.c_int
     lib.launch_v_transpose.argtypes = _VTRANSPOSE_ARGS
     _libs[round_mode] = lib
+    return lib
+
+
+def _lite_kernel(round_mode):
+    """Load the LiteAttention-capable .so (dense `launch_attention_forward` +
+    `launch_attention_forward_lite`). Built from attention_kernel.hip (templated
+    attention_forward<kLite>); its dense path is bit-exact to the champion
+    across RTNA/RTNE/RTZ."""
+    key = f"lite_{round_mode}"
+    if key in _libs:
+        return _libs[key]
+    so = _PKG / f"libattention_lite_{round_mode}.so"
+    if not so.exists():
+        raise RuntimeError(f"{so.name} missing — reinstall with `pip install -e .`")
+    lib = ctypes.CDLL(str(so))
+    lib.launch_attention_forward.restype = ctypes.c_int
+    lib.launch_attention_forward.argtypes = _LAUNCH_ARGS
+    lib.launch_attention_forward_lite.restype = ctypes.c_int
+    lib.launch_attention_forward_lite.argtypes = _LITE_LAUNCH_ARGS
+    lib.launch_v_transpose.restype = ctypes.c_int
+    lib.launch_v_transpose.argtypes = _VTRANSPOSE_ARGS
+    _libs[key] = lib
     return lib
 
 
@@ -159,4 +187,60 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     else:
         raise NotImplementedError(f"Unsupported torch device {q.device!r}; expected 'cpu' or 'cuda'/'hip'")
 
+    return out
+
+
+def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
+                 out=None, round_mode="rtna"):
+    """LiteAttention forward: skip K-blocks per the cross-timestep skip list.
+
+    `read_list` / `write_list` are int16 CUDA tensors shaped
+    [B, H, qtiles, nblocks+2] (the per-phase slices of a [2, ...] double buffer):
+    read_list = skip_list[phase], write_list = skip_list[1-phase]. The kernel
+    processes only the K-blocks named in read_list and writes, for the next
+    timestep, the blocks whose max score stayed within `threshold` (log2) of the
+    running max for ALL 256 q-rows of the CTA. tile = (kBlockM=256, kBlockN=64).
+
+    GPU tensors only (the diffusion use case). Output is an approximation of full
+    attention (skipped blocks contribute 0) — exact only with a compute-all list.
+    """
+    if round_mode not in ("rtna", "rtne", "rtz"):
+        raise ValueError(f"round_mode must be 'rtna', 'rtne', or 'rtz' (got {round_mode!r})")
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        if t.dtype != torch.bfloat16 or t.dim() != 4 or not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous 4-D bfloat16")
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError("q/k/v shapes must match")
+    if q.device.type not in ("cuda", "hip"):
+        raise NotImplementedError("forward_lite requires a CUDA/HIP tensor")
+    for nm, t in (("read_list", read_list), ("write_list", write_list)):
+        if t.dtype != torch.int16 or not t.is_contiguous() or t.device != q.device:
+            raise ValueError(f"{nm} must be a contiguous int16 tensor on q's device")
+    B, H, S, D = q.shape
+    if D != 128:
+        raise ValueError(f"head_dim must be 128 (got {D})")
+    if S % 64 != 0:
+        raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
+
+    hip = _hip_runtime()
+    lib = _lite_kernel(round_mode)
+    if out is None:
+        out = torch.empty_like(q)
+
+    v_t = torch.empty_like(v)
+    rc = lib.launch_v_transpose(
+        ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
+        B * H * S, S, None)
+    if rc != 0:
+        raise RuntimeError(f"launch_v_transpose returned {rc}")
+    rc = lib.launch_attention_forward_lite(
+        ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+        ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
+        B, H, S, D,
+        ctypes.c_void_p(read_list.data_ptr()), ctypes.c_void_p(write_list.data_ptr()),
+        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), None)
+    if rc != 0:
+        raise RuntimeError(f"launch_attention_forward_lite returned {rc}")
+    if hip.hipDeviceSynchronize() != 0:
+        raise RuntimeError("hipDeviceSynchronize failed")
     return out
