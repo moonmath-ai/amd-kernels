@@ -113,8 +113,12 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     B, H, S, D = q.shape
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
-    if S % 64 != 0:
-        raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
+    # seq_len may be any positive value now; the kernel pads the last K/V block in-place.
+    # if S % 64 != 0:
+    #     raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
+    if S <= 0:
+        raise ValueError(f"seq_len must be positive (got {S})")
+    S_pad = ((S + 63) // 64) * 64    # per-head V_t padding (block-aligned)
 
     hip = _hip_runtime()
     lib = _kernel(round_mode)
@@ -137,6 +141,7 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # so the kernel reads/writes their CPU memory directly.
         q_u, k_u, v_u, o_u = (t.view(torch.uint16).numpy() for t in (q, k, v, out))
         nbytes = q_u.nbytes
+        vt_nbytes = B * H * S_pad * D * 2     # per-head padded V_t (bf16)
         d_q, d_k, d_v, d_out, d_vt = (ctypes.c_void_p() for _ in range(5))
         try:
             for ptr, src in ((d_q, q_u), (d_k, k_u), (d_v, v_u)):
@@ -147,7 +152,8 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             if hip.hipMalloc(ctypes.byref(d_out), nbytes) != 0:
                 raise RuntimeError("hipMalloc(out) failed")
             # L1V kernel: pre-transpose V into V_t before the attention launch.
-            if hip.hipMalloc(ctypes.byref(d_vt), nbytes) != 0:
+            # V_t is per-head padded to ceil(S/64)*64 rows, so it can be larger than V.
+            if hip.hipMalloc(ctypes.byref(d_vt), vt_nbytes) != 0:
                 raise RuntimeError("hipMalloc(v_t) failed")
             rc = lib.launch_v_transpose(d_v, d_vt, B * H * S, S, None)
             if rc != 0:
@@ -168,7 +174,8 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # directly from L1). launch_v_transpose runs first, then the attention
         # kernel — both are issued here so a caller timing forward() includes
         # the V-transpose cost.
-        v_t = torch.empty_like(v)
+        # v_t = torch.empty_like(v)
+        v_t = torch.empty((B, H, S_pad, D), dtype=v.dtype, device=v.device)  # per-head padded
         rc = lib.launch_v_transpose(
             ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
             B * H * S, S, None,
@@ -219,15 +226,20 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     B, H, S, D = q.shape
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
-    if S % 64 != 0:
-        raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
+    # seq_len may be any positive value now; the kernel pads the last K/V block in-place.
+    # if S % 64 != 0:
+    #     raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
+    if S <= 0:
+        raise ValueError(f"seq_len must be positive (got {S})")
+    S_pad = ((S + 63) // 64) * 64    # per-head V_t padding (block-aligned)
 
     hip = _hip_runtime()
     lib = _lite_kernel(round_mode)
     if out is None:
         out = torch.empty_like(q)
 
-    v_t = torch.empty_like(v)
+    # v_t = torch.empty_like(v)
+    v_t = torch.empty((B, H, S_pad, D), dtype=v.dtype, device=v.device)  # per-head padded
     rc = lib.launch_v_transpose(
         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
         B * H * S, S, None)

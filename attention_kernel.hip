@@ -406,7 +406,8 @@ void attention_forward(
     // origin used for addressing; lane `col` later reads/writes row (start + col).
     // Parallel arrays valid/q_tile_start_row/q_frag/o_acc/scores are all indexed by
     // q_group; valid[] masks a tile that runs past the sequence end.
-    const int num_q_tiles = seq_len / kQTileRows;
+    // const int num_q_tiles = seq_len / kQTileRows;
+    const int num_q_tiles = (seq_len + kQTileRows - 1) / kQTileRows;  // ceil: last q-tile may be partial (rows ≥ seq_len masked at store)
     bool valid[kQTilesPerWave];
     int  q_tile_start_row[kQTilesPerWave];
     #pragma unroll
@@ -416,10 +417,19 @@ void attention_forward(
         q_tile_start_row[q_group] = valid[q_group] ? q_tile * kQTileRows : 0;
     }
 
+    // Reverse-iteration support: ceil block count; the last (highest-index) K/V block is
+    // the only partial one, and reverse order makes it the FIRST processed block (step 0).
+    const int num_kv_blocks = (seq_len + kKvBlockRows - 1) / kKvBlockRows;          // ceil
+    const int last_kv_rows  = seq_len - (num_kv_blocks - 1) * kKvBlockRows;         // valid rows in the first-processed block ∈ [1,64]
+
     const long long bh_offset = (long long)bh_index * seq_len * kHeadDim;
+    // V_t is pre-transposed with each head padded to num_kv_blocks·64 rows, so every
+    // head's V_t starts on a 64-row block boundary even when seq_len%64≠0.
+    const long long bh_offset_v = (long long)bh_index * num_kv_blocks * kKvBlockRows * kHeadDim;
     const auto q_buffer  = make_buffer(Q + bh_offset);
     const auto k_buffer  = make_buffer(K + bh_offset);
-    const auto v_buffer  = make_buffer(V + bh_offset);
+    // const auto v_buffer  = make_buffer(V + bh_offset);
+    const auto v_buffer  = make_buffer(V + bh_offset_v);
     const auto out_buffer = make_buffer(Out + bh_offset);
 
     __shared__ uint32_t lds_k[2][kKvBlockRows * kKLdsStrideDwords];   // 33 KB (2-buf)
@@ -448,8 +458,13 @@ void attention_forward(
     // vote; the loop's incremental writer ANDs the 8 waves to emit the next-step write
     // list. Only the live window (step and step-1) is ever read, so a fixed ring suffices
     // — the LDS cost is constant in seq_len (vs the old [kNumWaves*num_kv_blocks]).
-    const int num_kv_blocks = seq_len / kKvBlockRows;   // total K-blocks (= ktiles)
-    const int lstep         = phase ? 1 : -1;           // reverse-list step (skip_list.h)
+    // num_kv_blocks computed above (ceil) for reverse iteration + partial-block support.
+    // const int num_kv_blocks = seq_len / kKvBlockRows;   // total K-blocks (= ktiles)
+    // Always reverse now (process the last/partial block first); `phase` no longer flips the
+    // traversal direction — it only selects the read/write skip-list buffer (chosen host-side).
+    // const int lstep         = phase ? 1 : -1;           // reverse-list step (skip_list.h)
+    const int lstep         = -1;                       // always reverse (last block → first)
+    (void)phase;
     extern __shared__ char g_dyn[];
     uint8_t* const sverdict = (uint8_t*)g_dyn;          // [kNumWaves*kVerdictRing] ring, kLite only
 
@@ -460,18 +475,23 @@ void attention_forward(
     // not VGPRs across the MFMA loop.
     long long lbase = 0;
     int       list_len = 0;
+    // question: why make this a lambda? isn't it better to just offset the pointer argument read_list? (i think it's already a scalar pointer)
     auto rl = [&](int idx) -> int { return to_scalar((int)read_list[lbase + idx]); };
 
     // Prologue: first processed K-block → LDS (group B only); group A idle until iter 1.
-    int  first_blk = 0;                       // dense: block 0
+    // Reverse order: dense first block = last block (num_kv_blocks-1); lite = first RLE range start.
+    // int  first_blk = 0;                       // dense: block 0
+    int  first_blk = num_kv_blocks - 1;       // dense: last block (reverse order)
     bool any       = (num_kv_blocks > 0);
     if constexpr (kLite) {
         const long long num_k_blocks = num_kv_blocks + 2;
         const auto kSkipRow = opus::make_layout(kShape2, opus::make_tuple(num_q_blocks * num_k_blocks, num_k_blocks));
         lbase     = kSkipRow(bh_index, q_block);          // origin of this CTA's skip-list row
         list_len  = to_scalar((int)read_list[lbase]);     // RLE length
-        any       = (list_len > 0);
-        first_blk = any ? (rl(list_len) + lstep) : 0;      // first range's start
+        any       = (list_len > 0); // question: why do we need this? the algorithm forces always list_len > 0
+        // Reverse front-read: first range's start is the FIRST stored value (highest block).
+        // first_blk = any ? (rl(list_len) + lstep) : 0;      // first range's start
+        first_blk = any ? rl(1) : 0;               // first range's start (front of RLE)
     }
     if (!group_a && any) direct_lds_k(first_blk, 0);
 
@@ -607,6 +627,22 @@ void attention_forward(
 
     // ─── Softmax: block-max fold + exp2 + rescale + pack, per q-group ───────────
     auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int step) {
+        // ── Partial last-block padding ─────────────────────────────────────────────
+        // Reverse iteration ⇒ the only partial K-block (last in sequence) is ALWAYS step 0.
+        // Its kv-rows ≥ last_kv_rows are invalid (loaded past seq_len): force their scores to
+        // -FLT_MAX so exp2→0 (no softmax mass, no PV contribution). C-fragment kv-row within
+        // the 64-row block = kv_sub·16 + quad·4 + i. No-op when last_kv_rows==64 (seq_len%64==0),
+        // preserving the champion's exact dense behavior.
+        if (step == 0 && last_kv_rows < kKvBlockRows) {
+            #pragma unroll
+            for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
+                #pragma unroll
+                for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        if (kv_sub * kMfmaTile + quad * 4 + i >= last_kv_rows)
+                            scores[q_group][kv_sub][i] = -FLT_MAX;
+        }
         // ── LiteAttention verdict pre-pass (kLite) — decide this wave's skip from the
         // per-q-group block maxes BEFORE the fold, so a skipping wave can drop the WHOLE
         // contribution (probs→0, no row_sum/o_acc update) = "block absent". (Dropping
@@ -718,12 +754,20 @@ void attention_forward(
     // range continues OR another range remains).
 
     // Lite cursor + incremental write-list state (unused → elided when !kLite).
+    // Reverse-only encoding: ranges are read FRONT-to-back (cursor grows), and stored values
+    // are the actual block + below-edge directly (no +lstep decode). record() writes `block`
+    // then `block+lstep` (=block-1) — exactly this format — so the round-trip is self-consistent
+    // across steps (every step now processes high→low / last→first).
     auto load_range = [&](int& range_block, int& range_end, int& rle_idx) {  // open next RLE range
-        range_block = rl(rle_idx) + lstep;
-        range_end   = rl(rle_idx - 1) + lstep;
-        rle_idx    -= 2;
+        // range_block = rl(rle_idx) + lstep;
+        // range_end   = rl(rle_idx - 1) + lstep;
+        // rle_idx    -= 2;
+        range_block = rl(rle_idx);
+        range_end   = rl(rle_idx + 1);
+        rle_idx    += 2;
     };
-    int  rle_idx = list_len, range_block = 0, range_end = 0;
+    // int  rle_idx = list_len, range_block = 0, range_end = 0;
+    int  rle_idx = 1, range_block = 0, range_end = 0;
     int  write_idx   = 1;       // write-list output cursor
     bool skip_state  = true;    // running skip/compute state (for transition detection)
     bool prev_ended_range = false;   // did prev_block end its range?
@@ -749,10 +793,13 @@ void attention_forward(
             kv_block             = range_block;
             const int next_in_range = kv_block + lstep;
             range_continues      = (lstep > 0) ? (next_in_range < range_end) : (next_in_range > range_end);
-            has_next             = range_continues || (rle_idx >= 1);
-            next_block           = range_continues ? next_in_range : (has_next ? (rl(rle_idx) + lstep) : -1);
+            // has_next             = range_continues || (rle_idx >= 1);
+            // next_block           = range_continues ? next_in_range : (has_next ? (rl(rle_idx) + lstep) : -1);
+            has_next             = range_continues || (rle_idx < list_len);   // another pair (rle_idx,rle_idx+1) remains
+            next_block           = range_continues ? next_in_range : (has_next ? rl(rle_idx) : -1);
         } else {
-            kv_block = step;  next_block = step + 1;  has_next = (step + 1 < num_kv_blocks);
+            // kv_block = step;  next_block = step + 1;  has_next = (step + 1 < num_kv_blocks);
+            kv_block = num_kv_blocks - 1 - step;  next_block = kv_block - 1;  has_next = (next_block >= 0);
         }
         const int  k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
         const bool first = (step == 0);
@@ -789,9 +836,10 @@ void attention_forward(
         prev_block = kv_block; ++step;
         if constexpr (kLite) {
             prev_ended_range = !range_continues;
-            if (range_continues)   range_block = kv_block + lstep;
-            else if (rle_idx >= 1) load_range(range_block, range_end, rle_idx);
-            else                   have = false;
+            if (range_continues)         range_block = kv_block + lstep;
+            // else if (rle_idx >= 1) load_range(range_block, range_end, rle_idx);
+            else if (rle_idx < list_len) load_range(range_block, range_end, rle_idx);
+            else                         have = false;
         } else {
             have = (step < num_kv_blocks);
         }
@@ -815,6 +863,10 @@ void attention_forward(
     #pragma unroll
     for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
         if (!valid[q_group]) continue;
+        // Partial last q-tile: this lane's output row may lie past seq_len — never store it
+        // (the Out buffer SRD is unbounded, so an OOB store would corrupt the next head's Out).
+        const int  out_row      = q_tile_start_row[q_group] + col;
+        const bool row_in_range = out_row < seq_len;
         const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
         // No PV mfma follows so a packed v_pk_mul_f32 is safe here. MaybeNaN
         // pack4 scrubs any residual NaN/Inf in o_acc from pathological inputs.
@@ -823,7 +875,8 @@ void attention_forward(
             o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
             const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(
                 o_acc[q_group][t][0], o_acc[q_group][t][1], o_acc[q_group][t][2], o_acc[q_group][t][3]);
-            store_bf16x4(out_buffer, kQOLayout(q_tile_start_row[q_group] + col, kHdFrag(t, quad)) * 2, out);
+            if (row_in_range)
+                store_bf16x4(out_buffer, kQOLayout(out_row, kHdFrag(t, quad)) * 2, out);
         }
     }
 }
@@ -845,9 +898,22 @@ void v_transpose_kernel_16x16(
     bf16_t*       __restrict__ V_t,
     int           seq_len_per_head
 ) {
-    const int kv_iter  = blockIdx.x;                 // which 64-row kv-block (over all B·H·S)
+    // Per-head padded V_t: blockIdx.x enumerates (head, kv_iter). Source V is unpadded
+    // (head stride seq_len·D); dest V_t is padded to num_kv_blocks·64 rows/head so every
+    // head's V_t begins on a 64-row block boundary even when seq_len%64≠0. The padded tail
+    // rows (kv-rows ≥ valid) get whatever the source overflow yields (next head's V, or 0 at
+    // the tensor end) — always finite, and multiplied by prob=0 in the attention's masked
+    // first block, so they never contribute.
+    const int num_kv_blocks = (seq_len_per_head + kKvBlockRows - 1) / kKvBlockRows;
+    // const int kv_iter  = blockIdx.x;                 // which 64-row kv-block (over all B·H·S)
+    const int head     = blockIdx.x / num_kv_blocks;
+    const int kv_iter  = blockIdx.x % num_kv_blocks;
     const int tid = threadIdx.x;
-    const long long block_base = (long long)kv_iter * kVtBlockElems;  // bf16 elems before this block
+    // const long long block_base = (long long)kv_iter * kVtBlockElems;  // bf16 elems before this block
+    const long long src_block_base = (long long)head * seq_len_per_head * kHeadDim
+                                   + (long long)kv_iter * kVtBlockElems;   // unpadded source base (bf16 elems)
+    const long long dst_block_base = (long long)head * num_kv_blocks * kVtBlockElems
+                                   + (long long)kv_iter * kVtBlockElems;   // padded dest base (bf16 elems)
 
     __shared__ uint32_t stage_dw[kKvBlockRows * (kHeadDim / 2)];   // 64 rows × 64 dw = 16 KB
     const auto v_buffer = make_buffer(V);
@@ -860,7 +926,7 @@ void v_transpose_kernel_16x16(
         const int row      = elem_idx >> 4;    // 0..63 kv-row in this block
         const int octet    = elem_idx & 15;    // 0..15 head-dim octet (×8 bf16)
         u32x4_t v_oct = __builtin_amdgcn_raw_buffer_load_b128(
-            v_buffer, (uint32_t)((block_base + kQOLayout(row, octet * 8)) * 2), 0, 0);
+            v_buffer, (uint32_t)((src_block_base + kQOLayout(row, octet * 8)) * 2), 0, 0);
         const int dst_dw = kVStageWr(row, octet);            // dword offset in stage_dw
         stage_dw[dst_dw + 0] = v_oct[0]; stage_dw[dst_dw + 1] = v_oct[1];
         stage_dw[dst_dw + 2] = v_oct[2]; stage_dw[dst_dw + 3] = v_oct[3];
@@ -894,9 +960,9 @@ void v_transpose_kernel_16x16(
         u32x4_t packed_v;
         __builtin_memcpy(&packed_v, packed, sizeof(packed));
         __builtin_amdgcn_raw_buffer_store_b128(
-            packed_v, vt_buffer, (uint32_t)((block_base + kVtChunkLane(chunk, frag_lane)) * 2), 0, 0);
+            packed_v, vt_buffer, (uint32_t)((dst_block_base + kVtChunkLane(chunk, frag_lane)) * 2), 0, 0);
     }
-    (void)seq_len_per_head;
+    // (void)seq_len_per_head;  // now used (per-head padded layout)
 }
 
 }  // namespace
@@ -909,11 +975,12 @@ int launch_attention_forward(
     int batch, int heads, int seq_len, int head_dim, void* stream
 ) {
     if (batch <= 0 || heads <= 0)             return 1;
-    if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
+    // if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
+    if (seq_len <= 0)                              return 2;  // any seq_len (last K/V block is padded in-kernel)
     if (head_dim != kHeadDim)                 return 3;
 
     const int   bh   = batch * heads;
-    const int   qt   = seq_len / kQTileRows;
+    const int   qt   = (seq_len + kQTileRows - 1) / kQTileRows;  // ceil (last q-tile may be partial)
     const dim3  grid((qt + kQTilesPerWG - 1) / kQTilesPerWG, bh);
     const float sl2e = kLog2e / sqrtf((float)kHeadDim);
 
@@ -935,12 +1002,13 @@ int launch_attention_forward_lite(
     const void* read_list, void* write_list, float threshold, int phase, void* stream
 ) {
     if (batch <= 0 || heads <= 0)                  return 1;
-    if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
+    // if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
+    if (seq_len <= 0)                              return 2;  // any seq_len (last K/V block is padded in-kernel)
     if (head_dim != kHeadDim)                      return 3;
     if (!read_list || !write_list)                 return 4;
 
     const int   bh   = batch * heads;
-    const int   qt   = seq_len / kQTileRows;
+    const int   qt   = (seq_len + kQTileRows - 1) / kQTileRows;  // ceil (last q-tile may be partial)
     const dim3  grid((qt + kQTilesPerWG - 1) / kQTilesPerWG, bh);
     const float sl2e = kLog2e / sqrtf((float)kHeadDim);
     // dynamic LDS: sverdict[kNumWaves*kVerdictRing] ring — constant (live window 2),
@@ -960,8 +1028,14 @@ int launch_attention_forward_lite(
 int launch_v_transpose(
     const void* v, void* v_t, int n_rows, int seq_len_per_head, void* stream
 ) {
-    if (n_rows <= 0 || (n_rows % kKvBlockRows)) return 2;
-    const int iters = n_rows / kKvBlockRows;
+    // n_rows = B·H·S (unpadded source). V_t is written per-head padded to ceil(S/64)·64 rows,
+    // so launch bh·num_kv_blocks blocks (one per (head, kv_iter)).
+    // if (n_rows <= 0 || (n_rows % kKvBlockRows)) return 2;
+    if (n_rows <= 0 || seq_len_per_head <= 0 || (n_rows % seq_len_per_head)) return 2;
+    const int bh            = n_rows / seq_len_per_head;
+    const int num_kv_blocks = (seq_len_per_head + kKvBlockRows - 1) / kKvBlockRows;
+    // const int iters = n_rows / kKvBlockRows;
+    const int iters = bh * num_kv_blocks;
     hipLaunchKernelGGL(
         v_transpose_kernel_16x16,
         dim3(iters), dim3(kXposeThreadsPerWG), 0, (hipStream_t)stream,
