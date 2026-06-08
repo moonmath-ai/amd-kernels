@@ -17,7 +17,7 @@ first step (compute-all seed) is exact full attention; later steps approximate
 
 Usage:
     >>> import torch, moonmath_attention as ma
-    >>> attn = ma.LiteAttention(threshold=-10.0)
+    >>> attn = ma.LiteAttention(threshold=-6.0)
     >>> for t in range(num_denoise_steps):
     ...     out = attn(q, k, v)          # same shape/dtype as q; skips grow over steps
     >>> attn.reset_skip_state()          # e.g. on a new prompt / shape change
@@ -42,7 +42,7 @@ class LiteAttention:
     flips the read/write role each call, exactly like LiteAttention's `_phase`.
 
     Args:
-        threshold: log2-space skip threshold (negative; ~ -10). A block is
+        threshold: log2-space skip threshold (negative; ~ -6). A block is
             skippable when its max log-score is > |threshold| below the running max.
             More negative => fewer skips (more conservative).
         enable_skipping: if False, every call is exact dense attention.
@@ -51,7 +51,7 @@ class LiteAttention:
             (the kernel implements the byte-exact reverse/phase encoding).
     """
 
-    def __init__(self, threshold: float = -10.0, *, enable_skipping: bool = True,
+    def __init__(self, threshold: float = -6.0, *, enable_skipping: bool = True,
                  round_mode: str = "rtna", reverse_skip_list: bool = True):
         if threshold >= 0:
             raise ValueError(f"threshold must be negative (log2 units); got {threshold}")
@@ -94,13 +94,14 @@ class LiteAttention:
             return None
         return self._skip[1 - self._phase]
 
-    def _ensure(self, q):
-        B, H, S, D = q.shape
-        sig = (B, H, S, q.device)
+    def _ensure(self, q, k):
+        B, H, Sq, D = q.shape
+        Skv = k.shape[2]                       # cross-attn: K/V len may differ from Q
+        sig = (B, H, Sq, Skv, q.device)
         if self._skip is not None and self._sig == sig:
             return
-        qtiles = _ceil_div(S, KBLOCK_M)
-        ktiles = _ceil_div(S, KBLOCK_N)
+        qtiles = _ceil_div(Sq, KBLOCK_M)
+        ktiles = _ceil_div(Skv, KBLOCK_N)      # skip-list is over K-blocks
         skip = torch.zeros(2, B, H, qtiles, ktiles + 2, dtype=torch.int16, device=q.device)
         # Compute-all reverse seed (skip_list.h init): [2, ktiles-1, -1].
         skip[0, :, :, :, 0] = 2
@@ -110,14 +111,16 @@ class LiteAttention:
         self._phase = 0
         self._sig = sig
 
-    def __call__(self, q, k, v, *, out=None):
-        return self.forward(q, k, v, out=out)
+    def __call__(self, q, k, v, *, out=None, must_do_list=None):
+        return self.forward(q, k, v, out=out, must_do_list=must_do_list)
 
-    def forward(self, q, k, v, *, out=None):
+    def forward(self, q, k, v, *, out=None, must_do_list=None):
+        # `must_do_list` (optional int16 [len, s0,e0, ...]): K-block ranges pinned as
+        # always-compute in the emitted write list (e.g. attention sinks). None ⇒ pure vote.
         if not self.enable_skipping:
             return _kernel.forward(q, k, v, out=out, round_mode=self.round_mode)
 
-        self._ensure(q)
+        self._ensure(q, k)
         if self._phase == 0:
             read, write = self._skip[0], self._skip[1]
             self._phase = 1
@@ -128,7 +131,8 @@ class LiteAttention:
         kphase = 1 if self._phase == 1 else 0
         return _kernel.forward_lite(
             q, k, v, read.contiguous(), write.contiguous(),
-            threshold=self.threshold, phase=kphase, out=out, round_mode=self.round_mode)
+            threshold=self.threshold, phase=kphase, must_do_list=must_do_list,
+            out=out, round_mode=self.round_mode)
 
 
 # Backward-compatible alias (renamed from MoonLiteAttention -> LiteAttention).

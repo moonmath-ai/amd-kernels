@@ -369,9 +369,10 @@ void attention_forward(
     const bf16_t* __restrict__ K,
     const bf16_t* __restrict__ V,    // points to V_t (pre-transposed)
     bf16_t* __restrict__ Out,
-    int seq_len, float scale_log2e,
+    int seq_len, int seq_len_kv, float scale_log2e,   // seq_len = Q rows; seq_len_kv = K/V rows (cross-attn)
     const int16_t* __restrict__ read_list,   // LiteAttention skip list (this phase's slice)
     int16_t* __restrict__ write_list,        // skip list written for the next timestep
+    const int16_t* __restrict__ must_do_list,// global force-compute list (nullable): [len,s0,e0,...]
     float thr, int phase                     // skip threshold (log2) + reverse-list phase
 ) {
     // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
@@ -419,18 +420,19 @@ void attention_forward(
 
     // Reverse-iteration support: ceil block count; the last (highest-index) K/V block is
     // the only partial one, and reverse order makes it the FIRST processed block (step 0).
-    const int num_kv_blocks = (seq_len + kKvBlockRows - 1) / kKvBlockRows;          // ceil
-    const int last_kv_rows  = seq_len - (num_kv_blocks - 1) * kKvBlockRows;         // valid rows in the first-processed block ∈ [1,64]
+    const int num_kv_blocks = (seq_len_kv + kKvBlockRows - 1) / kKvBlockRows;       // ceil
+    const int last_kv_rows  = seq_len_kv - (num_kv_blocks - 1) * kKvBlockRows;      // valid rows in the first-processed block ∈ [1,64]
 
-    const long long bh_offset = (long long)bh_index * seq_len * kHeadDim;
+    // Cross-attention: Q/Out use seq_len (Sq rows); K/V use seq_len_kv (Skv rows).
+    const long long bh_offset_q  = (long long)bh_index * seq_len    * kHeadDim;
+    const long long bh_offset_kv = (long long)bh_index * seq_len_kv * kHeadDim;
     // V_t is pre-transposed with each head padded to num_kv_blocks·64 rows, so every
-    // head's V_t starts on a 64-row block boundary even when seq_len%64≠0.
+    // head's V_t starts on a 64-row block boundary even when seq_len_kv%64≠0.
     const long long bh_offset_v = (long long)bh_index * num_kv_blocks * kKvBlockRows * kHeadDim;
-    const auto q_buffer  = make_buffer(Q + bh_offset);
-    const auto k_buffer  = make_buffer(K + bh_offset);
-    // const auto v_buffer  = make_buffer(V + bh_offset);
+    const auto q_buffer  = make_buffer(Q + bh_offset_q);
+    const auto k_buffer  = make_buffer(K + bh_offset_kv);
     const auto v_buffer  = make_buffer(V + bh_offset_v);
-    const auto out_buffer = make_buffer(Out + bh_offset);
+    const auto out_buffer = make_buffer(Out + bh_offset_q);
 
     __shared__ uint32_t lds_k[2][kKvBlockRows * kKLdsStrideDwords];   // 33 KB (2-buf)
     // V LDS staging removed — V_t is consumed directly from L1 via load_u32x4.
@@ -441,13 +443,18 @@ void attention_forward(
     constexpr uint32_t kKRowBytes   = (uint32_t)(kKLdsStrideDwords * 4);
     constexpr uint32_t kKBlockBytes = (uint32_t)(kKvBlockRows * kHeadDim * 2);
     const int wave_row0 = kKLoadRow(wave_in_group, 0);   // first kv-row this load-wave owns
+    // Partial last block (seq_len_kv%64!=0): rows ≥ last_kv_rows are past the K tensor — re-read
+    // the last valid row (its score is masked to -inf anyway) to avoid an OOB read. Aligned → no clamp.
+    const bool k_partial = (last_kv_rows < kKvBlockRows);
     auto direct_lds_k = [&](int kv_block, int k_buf) {
         const uint32_t lds_row0  = to_scalar(lds_addr(&lds_k[k_buf][kKLdsDword(wave_row0, 0)]));
         const uint32_t hbm_block = to_scalar((uint32_t)((uint64_t)kv_block * kKBlockBytes));
+        const bool partial = k_partial && (kv_block == num_kv_blocks - 1);
         #pragma unroll
         for (int c = 0; c < kKRowsPerLoadWave; ++c) {
-            const int kv_row = kKLoadRow(wave_in_group, c);
-            const uint32_t hbm_byte = (uint32_t)(kKHbmDword(kv_row, lane) * 4);
+            const int kv_row   = kKLoadRow(wave_in_group, c);
+            const int read_row = (partial && kv_row >= last_kv_rows) ? (last_kv_rows - 1) : kv_row;
+            const uint32_t hbm_byte = (uint32_t)(kKHbmDword(read_row, lane) * 4);
             buffer_load_b32_to_lds(k_buffer, lds_row0 + c * kKRowBytes, hbm_byte, hbm_block);
         }
     };
@@ -499,12 +506,16 @@ void attention_forward(
     // q-row; each load_bf16x4 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
     bf16x4_t q_frag[kQTilesPerWave][kHeadDimTiles];
     #pragma unroll
-    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
+    for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
+        // Partial q-tile (seq_len%16!=0): lanes whose row ≥ seq_len would read past Q — load 0
+        // instead (their output is dropped at the store). Aligned → q_row_ok==valid.
+        const bool q_row_ok = valid[q_group] && (q_tile_start_row[q_group] + col) < seq_len;
         #pragma unroll
         for (int d = 0; d < kHeadDimTiles; ++d) {
             const int q_elem = kQOLayout(q_tile_start_row[q_group] + col, kHdFrag(d, quad));
-            q_frag[q_group][d] = valid[q_group] ? load_bf16x4(q_buffer, q_elem * 2) : bf16x4_t{0,0,0,0};
+            q_frag[q_group][d] = q_row_ok ? load_bf16x4(q_buffer, q_elem * 2) : bf16x4_t{0,0,0,0};
         }
+    }
 
     fp32x4_t o_acc[kQTilesPerWave][kHeadDimTiles];
     #pragma unroll
@@ -562,16 +573,11 @@ void attention_forward(
         return (uint32_t)(kVtLayout(kv_iter, chunk, lane) * 2);   // bf16 elems → bytes
     };
 
-    // verdict_step = the processing step of the block being pv'd (its verdict-ring slot);
-    // ignored when !kLite. Soft block-skip: a wave whose verdict for this block is "skip"
-    // does no pv at all (its probs were already zeroed in softmax, so the result is
-    // unchanged — this just drops the 0-adding MFMAs + V_t loads). The verdict is in
-    // LDS from this wave's own softmax (group A: prev iter P2; group B: this iter P1),
-    // visible across the same barriers record() relies on.
+    // pv runs for EVERY read-list block (Hopper-equivalent): the lite skip vote only feeds the
+    // next-step skip list; it does NOT drop the current block's PV (see softmax verdict pre-pass).
+    // verdict_step retained for caller ABI symmetry; no longer used to gate pv.
     auto pv_phase = [&](int kv_iter, const bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int verdict_step) {
-        if constexpr (kLite) {
-            if (sverdict[wave_id * kVerdictRing + (verdict_step & (kVerdictRing - 1))]) return;
-        }
+        (void)verdict_step;
         constexpr int kPvChunks = kVtChunks;  // 16 V_t super-chunks / kv-iter
         constexpr int kPvDepth  = 4;
         mfma_prio_hi();
@@ -626,14 +632,14 @@ void attention_forward(
     };
 
     // ─── Softmax: block-max fold + exp2 + rescale + pack, per q-group ───────────
-    auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int step) {
+    auto softmax = [&](fp32x4_t scores[kQTilesPerWave][kKvSubtiles], bf16x4_t probs[kQTilesPerWave][kKvSubtiles], int step, int blk) {
         // ── Partial last-block padding ─────────────────────────────────────────────
-        // Reverse iteration ⇒ the only partial K-block (last in sequence) is ALWAYS step 0.
-        // Its kv-rows ≥ last_kv_rows are invalid (loaded past seq_len): force their scores to
-        // -FLT_MAX so exp2→0 (no softmax mass, no PV contribution). C-fragment kv-row within
-        // the 64-row block = kv_sub·16 + quad·4 + i. No-op when last_kv_rows==64 (seq_len%64==0),
-        // preserving the champion's exact dense behavior.
-        if (step == 0 && last_kv_rows < kKvBlockRows) {
+        // The only partial K/V block is the last (highest-index); its kv-rows ≥ last_kv_rows
+        // were loaded past seq_len_kv → force their scores to -FLT_MAX so exp2→0 (no softmax
+        // mass, no PV contribution). C-fragment kv-row within the 64-row block = kv_sub·16 +
+        // quad·4 + i. Gated on the block index (not step==0: lite may skip the partial block).
+        // No-op when last_kv_rows==64 → byte-identical dense/self-attn behavior.
+        if (blk == num_kv_blocks - 1 && last_kv_rows < kKvBlockRows) {
             #pragma unroll
             for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
                 #pragma unroll
@@ -643,14 +649,13 @@ void attention_forward(
                         if (kv_sub * kMfmaTile + quad * 4 + i >= last_kv_rows)
                             scores[q_group][kv_sub][i] = -FLT_MAX;
         }
-        // ── LiteAttention verdict pre-pass (kLite) — decide this wave's skip from the
-        // per-q-group block maxes BEFORE the fold, so a skipping wave can drop the WHOLE
-        // contribution (probs→0, no row_sum/o_acc update) = "block absent". (Dropping
-        // only pv while the fold ran would bias o/row_sum — verdict is a MAX test, not a
-        // contribution test.) The verdict ALWAYS feeds the next-step write list and ALSO
-        // drives this step's per-wave fold+pv skip. Keep iff some q-row's
-        // block max is within `thr` (log2) of its running max — FA3 cond2/!__any_sync;
-        // the per-lane partial max + __any reduces across the 4 quad-lanes of each col.
+        // ── LiteAttention verdict pre-pass (kLite) — compute this wave's skip vote and store it
+        // for the NEXT-step write list ONLY (Hopper-equivalent): the CURRENT read-list block is
+        // computed FULLY for every wave; we never drop its PV/denominator per-wave (that would
+        // over-normalize q-rows whose wave skipped while peers kept). Keep iff some q-row's block
+        // max is within `thr` (log2) of its running max — FA3 cond2/!__any_sync. The block max is
+        // computed ONCE here (lite) and reused by the fold below; dense recomputes it in the fold.
+        float blk_max[kQTilesPerWave];
         if constexpr (kLite) {
             bool any_keep = false;
             #pragma unroll
@@ -661,34 +666,30 @@ void attention_forward(
                     bm = fmaxf(bm,
                         fmaxf(fmaxf(scores[q_group][kv_sub][0], scores[q_group][kv_sub][1]),
                               fmaxf(scores[q_group][kv_sub][2], scores[q_group][kv_sub][3])));
+                blk_max[q_group] = bm;
                 any_keep = any_keep || (valid[q_group] && ((bm * scale_log2e - row_max[q_group]) > thr));
             }
             bool skip_wave = (__any(any_keep) == 0);
             if (step == 0) skip_wave = false;   // FA3 Is_first: never skip the first processed block
             if (lane == 0) sverdict[wave_id * kVerdictRing + (step & (kVerdictRing - 1))] = skip_wave ? (uint8_t)1 : (uint8_t)0;
-            if (skip_wave) {
-                // Block absent for this wave: zero probs so the (skipped) pv adds
-                // nothing; row_max/row_sum/o_acc untouched — the skip predicate
-                // (bm·scale − row_max ≤ thr) guarantees no new running max.
-                #pragma unroll
-                for (int q_group = 0; q_group < kQTilesPerWave; ++q_group)
-                    #pragma unroll
-                    for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
-                        probs[q_group][kv_sub] = bf16x4_t{0, 0, 0, 0};
-                return;
-            }
         }
         // ── Fold (dense + lite-keep) — byte-identical to the champion. ──
         #pragma unroll
         for (int q_group = 0; q_group < kQTilesPerWave; ++q_group) {
             // block-max fold happens IN softmax (P2), where the other group is in
-            // pv+qk (MFMA-heavy) — the v_max3 chain hides under their MFMA.
-            float block_max = -FLT_MAX;
-            #pragma unroll
-            for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
-                block_max = fmaxf(block_max,
-                    fmaxf(fmaxf(scores[q_group][kv_sub][0], scores[q_group][kv_sub][1]),
-                          fmaxf(scores[q_group][kv_sub][2], scores[q_group][kv_sub][3])));
+            // pv+qk (MFMA-heavy) — the v_max3 chain hides under their MFMA. Lite reuses
+            // the verdict pre-pass's fold (blk_max); dense computes it fresh here.
+            float block_max;
+            if constexpr (kLite) {
+                block_max = blk_max[q_group];
+            } else {
+                block_max = -FLT_MAX;
+                #pragma unroll
+                for (int kv_sub = 0; kv_sub < kKvSubtiles; ++kv_sub)
+                    block_max = fmaxf(block_max,
+                        fmaxf(fmaxf(scores[q_group][kv_sub][0], scores[q_group][kv_sub][1]),
+                              fmaxf(scores[q_group][kv_sub][2], scores[q_group][kv_sub][3])));
+            }
             constexpr float kRescaleThr = 8.0f;
             const float new_max_cand = block_max * scale_log2e;
             const bool  first_block = row_max[q_group] == -FLT_MAX;
@@ -771,13 +772,41 @@ void attention_forward(
     int  write_idx   = 1;       // write-list output cursor
     bool skip_state  = true;    // running skip/compute state (for transition detection)
     bool prev_ended_range = false;   // did prev_block end its range?
+    // ── MustDoList: a single GLOBAL force-compute list (nullable), forward RLE
+    // [len, s0,e0, s1,e1, …] of [start,end) K-block (tile) ranges that must ALWAYS be
+    // recorded as "compute" — the 8-wave skip vote can't drop them, so they stay in every
+    // timestep's read list (e.g. attention sinks / pinned blocks). md_force walks this cursor
+    // monotonically in lstep order alongside the processed blocks (tid 0 only). md_ri AND the
+    // current range's [md_s, md_e) bounds are loop-carried — bounds are reloaded ONLY when the
+    // cursor advances to a new range (O(#ranges) total), not re-read from the global list every
+    // block, so an active must-do costs only register compares per block (2qg has the headroom).
+    const bool have_md = kLite && (must_do_list != nullptr) && ((int)must_do_list[0] > 0);
+    const int  md_nr   = have_md ? ((int)must_do_list[0] >> 1) : 0;   // # of [s,e) ranges
+    int  md_ri = (lstep > 0) ? 0 : (md_nr - 1);                       // range cursor (walk dir = lstep)
+    int  md_s  = have_md ? (int)must_do_list[1 + 2 * md_ri] : 0;      // current range [s,e), cached
+    int  md_e  = have_md ? (int)must_do_list[2 + 2 * md_ri] : 0;
+    auto md_force = [&](int block) -> bool {   // is `block` forced-compute? advances the cursor
+        if (!have_md) return false;
+        if (lstep > 0) {   // blocks ascending: skip past ranges we've moved beyond
+            while (md_ri < md_nr && block >= md_e) {
+                if (++md_ri < md_nr) { md_s = (int)must_do_list[1 + 2 * md_ri]; md_e = (int)must_do_list[2 + 2 * md_ri]; }
+            }
+            return md_ri < md_nr && block >= md_s && block < md_e;
+        } else {           // blocks descending: walk ranges high→low
+            while (md_ri >= 0 && block < md_s) {
+                if (--md_ri >= 0) { md_s = (int)must_do_list[1 + 2 * md_ri]; md_e = (int)must_do_list[2 + 2 * md_ri]; }
+            }
+            return md_ri >= 0 && block >= md_s && block < md_e;
+        }
+    };
     // record `block` at verdict-ring slot `verdict_step`: AND its 8 wave-votes, emit a
     // skip↔compute transition when the state flips, and a range-end marker if is_range_end.
     auto record = [&](int block, int verdict_step, bool is_range_end) {
         int sk = 1;
         #pragma unroll
         for (int w = 0; w < kNumWaves; ++w) sk &= (int)sverdict[w * kVerdictRing + (verdict_step & (kVerdictRing - 1))];
-        const bool skip = (sk != 0);
+        bool skip = (sk != 0);
+        if (md_force(block)) skip = false;   // MustDoList: pin this block as compute
         if (skip != skip_state) { write_list[lbase + write_idx++] = (int16_t)block; skip_state = skip; }
         if (is_range_end) { skip_state = true; if (!skip) write_list[lbase + write_idx++] = (int16_t)(block + lstep); }
     };
@@ -813,12 +842,12 @@ void attention_forward(
             if (!first) pv_phase(prev_block, probs, step - 1);
             qk_phase(k_byte_base, k_ring0, k_ring1, k_ring2, scores);
         } else {
-            if (!first) softmax(scores, probs, step - 1);
+            if (!first) softmax(scores, probs, step - 1, prev_block);
             if (has_next) direct_lds_k(next_block, k_buf_next);
         }
         __builtin_amdgcn_s_barrier();
         if (group_a) {  // P2
-            softmax(scores, probs, step);
+            softmax(scores, probs, step, kv_block);
             if constexpr (kLite) {   // record prev block's completed vote under group B's MFMA
                 if (tid == 0 && !first) record(prev_block, step - 1, prev_ended_range);
             }
@@ -845,7 +874,7 @@ void attention_forward(
         }
     }
     // Epilogue: last block's softmax + pv, then (lite) flush its always-range-end vote.
-    if (!group_a && step > 0) softmax(scores, probs, step - 1);
+    if (!group_a && step > 0) softmax(scores, probs, step - 1, prev_block);
     if (step > 0) pv_phase(prev_block, probs, step - 1);
     if constexpr (kLite) {
         lds_barrier();   // group B's last-block vote → visible to tid 0
@@ -901,9 +930,8 @@ void v_transpose_kernel_16x16(
     // Per-head padded V_t: blockIdx.x enumerates (head, kv_iter). Source V is unpadded
     // (head stride seq_len·D); dest V_t is padded to num_kv_blocks·64 rows/head so every
     // head's V_t begins on a 64-row block boundary even when seq_len%64≠0. The padded tail
-    // rows (kv-rows ≥ valid) get whatever the source overflow yields (next head's V, or 0 at
-    // the tensor end) — always finite, and multiplied by prob=0 in the attention's masked
-    // first block, so they never contribute.
+    // rows (kv-rows ≥ seq_len_per_head) are written as ZERO (phase 1 below), so the attention's
+    // masked partial block (prob=0) contributes 0·0=0 — NaN-safe even at the tensor end.
     const int num_kv_blocks = (seq_len_per_head + kKvBlockRows - 1) / kKvBlockRows;
     // const int kv_iter  = blockIdx.x;                 // which 64-row kv-block (over all B·H·S)
     const int head     = blockIdx.x / num_kv_blocks;
@@ -925,8 +953,14 @@ void v_transpose_kernel_16x16(
         const int elem_idx = k * kXposeThreadsPerWG + tid;
         const int row      = elem_idx >> 4;    // 0..63 kv-row in this block
         const int octet    = elem_idx & 15;    // 0..15 head-dim octet (×8 bf16)
-        u32x4_t v_oct = __builtin_amdgcn_raw_buffer_load_b128(
-            v_buffer, (uint32_t)((src_block_base + kQOLayout(row, octet * 8)) * 2), 0, 0);
+        // Partial last block: source rows ≥ seq_len_per_head are padding — write ZERO (not an
+        // OOB read). This makes V_t's padded tail exactly 0 so the attention's masked kv (prob=0)
+        // contribute 0·0=0, NOT 0·NaN=NaN from uninitialized over-read memory at the tensor end.
+        const bool row_valid = (kv_iter * kKvBlockRows + row) < seq_len_per_head;
+        u32x4_t v_oct = row_valid
+            ? __builtin_amdgcn_raw_buffer_load_b128(
+                  v_buffer, (uint32_t)((src_block_base + kQOLayout(row, octet * 8)) * 2), 0, 0)
+            : u32x4_t{0, 0, 0, 0};
         const int dst_dw = kVStageWr(row, octet);            // dword offset in stage_dw
         stage_dw[dst_dw + 0] = v_oct[0]; stage_dw[dst_dw + 1] = v_oct[1];
         stage_dw[dst_dw + 2] = v_oct[2]; stage_dw[dst_dw + 3] = v_oct[3];
@@ -972,11 +1006,11 @@ extern "C" {
 // first to produce V_t from raw V. V_t and V have identical total byte size.
 int launch_attention_forward(
     const void* q, const void* k, const void* v, void* out,
-    int batch, int heads, int seq_len, int head_dim, void* stream
+    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, void* stream
 ) {
     if (batch <= 0 || heads <= 0)             return 1;
-    // if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
-    if (seq_len <= 0)                              return 2;  // any seq_len (last K/V block is padded in-kernel)
+    if (seq_len <= 0)                         return 2;   // any Q len (partial last q-tile masked in-kernel)
+    if (seq_len_kv <= 0)                      return 5;   // any K/V len (partial last block masked in-kernel)
     if (head_dim != kHeadDim)                 return 3;
 
     const int   bh   = batch * heads;
@@ -987,8 +1021,8 @@ int launch_attention_forward(
     hipLaunchKernelGGL(
         attention_forward<false>, grid, dim3(kBlockSize), 0, (hipStream_t)stream,
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-        (bf16_t*)out, seq_len, sl2e,
-        (const int16_t*)nullptr, (int16_t*)nullptr, 0.f, 0);
+        (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+        (const int16_t*)nullptr, (int16_t*)nullptr, (const int16_t*)nullptr, 0.f, 0);
     return (int)hipGetLastError();
 }
 
@@ -998,14 +1032,15 @@ int launch_attention_forward(
 // V must already be pre-transposed into V_t (call launch_v_transpose first).
 int launch_attention_forward_lite(
     const void* q, const void* k, const void* v, void* out,
-    int batch, int heads, int seq_len, int head_dim,
-    const void* read_list, void* write_list, float threshold, int phase, void* stream
+    int batch, int heads, int seq_len, int seq_len_kv, int head_dim,
+    const void* read_list, void* write_list, const void* must_do_list,
+    float threshold, int phase, void* stream
 ) {
     if (batch <= 0 || heads <= 0)                  return 1;
-    // if (seq_len <= 0 || (seq_len % kKvBlockRows))  return 2;
-    if (seq_len <= 0)                              return 2;  // any seq_len (last K/V block is padded in-kernel)
+    if (seq_len <= 0)                              return 2;   // any Q len (partial last q-tile masked in-kernel)
+    if (seq_len_kv <= 0)                           return 5;   // any K/V len (partial last block masked in-kernel)
     if (head_dim != kHeadDim)                      return 3;
-    if (!read_list || !write_list)                 return 4;
+    if (!read_list || !write_list)                 return 4;   // must_do_list is optional (nullable)
 
     const int   bh   = batch * heads;
     const int   qt   = (seq_len + kQTileRows - 1) / kQTileRows;  // ceil (last q-tile may be partial)
@@ -1018,8 +1053,8 @@ int launch_attention_forward_lite(
     hipLaunchKernelGGL(
         attention_forward<true>, grid, dim3(kBlockSize), dyn, (hipStream_t)stream,
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-        (bf16_t*)out, seq_len, sl2e,
-        (const int16_t*)read_list, (int16_t*)write_list, threshold, phase);
+        (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+        (const int16_t*)read_list, (int16_t*)write_list, (const int16_t*)must_do_list, threshold, phase);
     return (int)hipGetLastError();
 }
 

@@ -5,15 +5,16 @@ from pathlib import Path
 import torch
 
 _PKG = Path(__file__).parent
+# launch_attention_forward(q,k,v,out, B,H,Sq,Skv,D, stream)  [Skv = K/V len; cross-attn]
 _LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
-# launch_attention_forward_lite(q,k,v,out, B,H,S,D, read_list,write_list, thr, phase, stream)
+# launch_attention_forward_lite(q,k,v,out, B,H,Sq,Skv,D, read_list,write_list,must_do_list, thr, phase, stream)
 _LITE_LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
 ]
 # launch_v_transpose(V, V_t, seq_len_total, seq_len_per_head, stream)
 _VTRANSPOSE_ARGS = [
@@ -106,19 +107,23 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             raise ValueError(f"{name} must be 4-D (batch, heads, seq_len, head_dim); got shape={tuple(t.shape)}")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    if not (q.shape == k.shape == v.shape):
-        raise ValueError(f"q/k/v shapes must match; got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}")
+    # Cross-attention: k/v may have a different seq_len than q. They must agree with
+    # each other and share (batch, heads, head_dim) with q.
+    if k.shape != v.shape:
+        raise ValueError(f"k/v shapes must match; got {tuple(k.shape)}, {tuple(v.shape)}")
+    if (q.shape[0], q.shape[1], q.shape[3]) != (k.shape[0], k.shape[1], k.shape[3]):
+        raise ValueError(f"q/k must share (batch, heads, head_dim); got {tuple(q.shape)} vs {tuple(k.shape)}")
     if q.device != k.device or q.device != v.device:
         raise ValueError(f"q/k/v must be on the same device")
-    B, H, S, D = q.shape
+    B, H, Sq, D = q.shape
+    Skv = k.shape[2]
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
-    # seq_len may be any positive value now; the kernel pads the last K/V block in-place.
-    # if S % 64 != 0:
-    #     raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
-    if S <= 0:
-        raise ValueError(f"seq_len must be positive (got {S})")
-    S_pad = ((S + 63) // 64) * 64    # per-head V_t padding (block-aligned)
+    # Sq and Skv may be any positive values: the kernel masks the partial last q-tile (store)
+    # and the partial last K/V block (score); V_t is per-head padded to a 64-row boundary.
+    if Sq <= 0 or Skv <= 0:
+        raise ValueError(f"seq lens must be positive (got Sq={Sq}, Skv={Skv})")
+    Skv_pad = ((Skv + 63) // 64) * 64    # per-head V_t padding (block-aligned)
 
     hip = _hip_runtime()
     lib = _kernel(round_mode)
@@ -140,30 +145,29 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # bf16 → uint16 view + .numpy() share storage with the torch tensors,
         # so the kernel reads/writes their CPU memory directly.
         q_u, k_u, v_u, o_u = (t.view(torch.uint16).numpy() for t in (q, k, v, out))
-        nbytes = q_u.nbytes
-        vt_nbytes = B * H * S_pad * D * 2     # per-head padded V_t (bf16)
+        vt_nbytes = B * H * Skv_pad * D * 2     # per-head padded V_t (bf16)
         d_q, d_k, d_v, d_out, d_vt = (ctypes.c_void_p() for _ in range(5))
         try:
-            for ptr, src in ((d_q, q_u), (d_k, k_u), (d_v, v_u)):
-                if hip.hipMalloc(ctypes.byref(ptr), nbytes) != 0:
+            for ptr, src in ((d_q, q_u), (d_k, k_u), (d_v, v_u)):   # q is Sq rows; k/v are Skv rows
+                if hip.hipMalloc(ctypes.byref(ptr), src.nbytes) != 0:
                     raise RuntimeError("hipMalloc failed")
-                if hip.hipMemcpy(ptr, src.ctypes.data, nbytes, _HTOD) != 0:
+                if hip.hipMemcpy(ptr, src.ctypes.data, src.nbytes, _HTOD) != 0:
                     raise RuntimeError("hipMemcpy H→D failed")
-            if hip.hipMalloc(ctypes.byref(d_out), nbytes) != 0:
+            if hip.hipMalloc(ctypes.byref(d_out), o_u.nbytes) != 0:
                 raise RuntimeError("hipMalloc(out) failed")
             # L1V kernel: pre-transpose V into V_t before the attention launch.
-            # V_t is per-head padded to ceil(S/64)*64 rows, so it can be larger than V.
+            # V_t is per-head padded to ceil(Skv/64)*64 rows, so it can be larger than V.
             if hip.hipMalloc(ctypes.byref(d_vt), vt_nbytes) != 0:
                 raise RuntimeError("hipMalloc(v_t) failed")
-            rc = lib.launch_v_transpose(d_v, d_vt, B * H * S, S, None)
+            rc = lib.launch_v_transpose(d_v, d_vt, B * H * Skv, Skv, None)
             if rc != 0:
                 raise RuntimeError(f"launch_v_transpose returned {rc}")
-            rc = lib.launch_attention_forward(d_q, d_k, d_vt, d_out, B, H, S, D, None)
+            rc = lib.launch_attention_forward(d_q, d_k, d_vt, d_out, B, H, Sq, Skv, D, None)
             if rc != 0:
                 raise RuntimeError(f"launch_attention_forward returned {rc}")
             if hip.hipDeviceSynchronize() != 0:
                 raise RuntimeError("hipDeviceSynchronize failed")
-            if hip.hipMemcpy(o_u.ctypes.data, d_out, nbytes, _DTOH) != 0:
+            if hip.hipMemcpy(o_u.ctypes.data, d_out, o_u.nbytes, _DTOH) != 0:
                 raise RuntimeError("hipMemcpy D→H failed")
         finally:
             for ptr in (d_q, d_k, d_v, d_out, d_vt):
@@ -174,18 +178,17 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # directly from L1). launch_v_transpose runs first, then the attention
         # kernel — both are issued here so a caller timing forward() includes
         # the V-transpose cost.
-        # v_t = torch.empty_like(v)
-        v_t = torch.empty((B, H, S_pad, D), dtype=v.dtype, device=v.device)  # per-head padded
+        v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t
         rc = lib.launch_v_transpose(
             ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-            B * H * S, S, None,
+            B * H * Skv, Skv, None,
         )
         if rc != 0:
             raise RuntimeError(f"launch_v_transpose returned {rc}")
         rc = lib.launch_attention_forward(
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
             ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-            B, H, S, D, None,
+            B, H, Sq, Skv, D, None,
         )
         if rc != 0:
             raise RuntimeError(f"launch_attention_forward returned {rc}")
@@ -198,7 +201,7 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
 
 
 def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
-                 out=None, round_mode="rtna"):
+                 must_do_list=None, out=None, round_mode="rtna"):
     """LiteAttention forward: skip K-blocks per the cross-timestep skip list.
 
     `read_list` / `write_list` are int16 CUDA tensors shaped
@@ -208,6 +211,13 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     timestep, the blocks whose max score stayed within `threshold` (log2) of the
     running max for ALL 256 q-rows of the CTA. tile = (kBlockM=256, kBlockN=64).
 
+    `must_do_list` (optional): a single GLOBAL int16 1-D tensor in the format
+    [len, tile_start0, tile_end0, tile_start1, tile_end1, ...] (end-exclusive
+    K-block tile indices). Blocks in any [start, end) range are FORCED to be
+    recorded as "compute" in write_list regardless of the skip vote — pinning
+    them in every timestep's read list (e.g. attention sinks / always-attend
+    blocks). None ⇒ no forcing (behaviour identical to before this arg existed).
+
     GPU tensors only (the diffusion use case). Output is an approximation of full
     attention (skipped blocks contribute 0) — exact only with a compute-all list.
     """
@@ -216,40 +226,45 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     for name, t in (("q", q), ("k", k), ("v", v)):
         if t.dtype != torch.bfloat16 or t.dim() != 4 or not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous 4-D bfloat16")
-    if not (q.shape == k.shape == v.shape):
-        raise ValueError("q/k/v shapes must match")
+    if k.shape != v.shape:
+        raise ValueError(f"k/v shapes must match; got {tuple(k.shape)}, {tuple(v.shape)}")
+    if (q.shape[0], q.shape[1], q.shape[3]) != (k.shape[0], k.shape[1], k.shape[3]):
+        raise ValueError(f"q/k must share (batch, heads, head_dim); got {tuple(q.shape)} vs {tuple(k.shape)}")
     if q.device.type not in ("cuda", "hip"):
         raise NotImplementedError("forward_lite requires a CUDA/HIP tensor")
     for nm, t in (("read_list", read_list), ("write_list", write_list)):
         if t.dtype != torch.int16 or not t.is_contiguous() or t.device != q.device:
             raise ValueError(f"{nm} must be a contiguous int16 tensor on q's device")
-    B, H, S, D = q.shape
+    if must_do_list is not None:
+        if must_do_list.dtype != torch.int16 or not must_do_list.is_contiguous() or must_do_list.device != q.device:
+            raise ValueError("must_do_list must be a contiguous int16 tensor on q's device")
+    B, H, Sq, D = q.shape
+    Skv = k.shape[2]
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
-    # seq_len may be any positive value now; the kernel pads the last K/V block in-place.
-    # if S % 64 != 0:
-    #     raise ValueError(f"seq_len must be a multiple of 64 (got {S})")
-    if S <= 0:
-        raise ValueError(f"seq_len must be positive (got {S})")
-    S_pad = ((S + 63) // 64) * 64    # per-head V_t padding (block-aligned)
+    # Sq and Skv may be any positive values: the kernel masks the partial last q-tile (store)
+    # and the partial last K/V block (score); V_t is per-head padded to a 64-row boundary.
+    if Sq <= 0 or Skv <= 0:
+        raise ValueError(f"seq lens must be positive (got Sq={Sq}, Skv={Skv})")
+    Skv_pad = ((Skv + 63) // 64) * 64    # per-head V_t padding (block-aligned)
 
     hip = _hip_runtime()
     lib = _lite_kernel(round_mode)
     if out is None:
         out = torch.empty_like(q)
 
-    # v_t = torch.empty_like(v)
-    v_t = torch.empty((B, H, S_pad, D), dtype=v.dtype, device=v.device)  # per-head padded
+    v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t
     rc = lib.launch_v_transpose(
         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-        B * H * S, S, None)
+        B * H * Skv, Skv, None)
     if rc != 0:
         raise RuntimeError(f"launch_v_transpose returned {rc}")
     rc = lib.launch_attention_forward_lite(
         ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
         ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-        B, H, S, D,
+        B, H, Sq, Skv, D,
         ctypes.c_void_p(read_list.data_ptr()), ctypes.c_void_p(write_list.data_ptr()),
+        ctypes.c_void_p(must_do_list.data_ptr() if must_do_list is not None else None),
         ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), None)
     if rc != 0:
         raise RuntimeError(f"launch_attention_forward_lite returned {rc}")
