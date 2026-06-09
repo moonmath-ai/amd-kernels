@@ -28,10 +28,11 @@ AITER_RTZ  = 2
 
 
 def make_inputs(B, H, S, D, device, pattern):
-    """Generate (Q, K, V) on `device` in (B, H, S, D) layout, bf16."""
+    """Generate (Q, K, V) on `device` in (B, S, H, D) layout, bf16 — consumed natively by both
+    OURS (layout="bshd") and AITER, no transpose either side."""
     torch.manual_seed(42)
     if pattern == "random":
-        return tuple(torch.randn(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+        return tuple(torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device) for _ in range(3))
     if pattern == "realistic":
         # Log-normal K-row norms (sigma=0.6) make attention peaked enough that
         # the online-softmax skip-rescale gate fires on ~10% of (q-tile, K-block)
@@ -39,29 +40,29 @@ def make_inputs(B, H, S, D, device, pattern):
         # plain `random` (Gaussian K-norms) which almost never trips the gate.
         # Q, V ~ N(0, 1); K direction uniform, magnitude exp(N(0, sigma))·√D.
         sigma = 0.6
-        q = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
-        k_dir = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
+        q = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
+        k_dir = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
         k_dir = k_dir / k_dir.norm(dim=-1, keepdim=True)
-        log_norm = torch.randn(B, H, S, 1, dtype=torch.float32, device=device) * sigma
+        log_norm = torch.randn(B, S, H, 1, dtype=torch.float32, device=device) * sigma
         k = k_dir * (torch.exp(log_norm) * (D ** 0.5))
-        v = torch.randn(B, H, S, D, dtype=torch.float32, device=device)
+        v = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
         return q.bfloat16(), k.bfloat16(), v.bfloat16()
     if pattern == "ones":
-        return tuple(torch.ones(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+        return tuple(torch.ones(B, S, H, D, dtype=torch.bfloat16, device=device) for _ in range(3))
     if pattern == "linear":
-        s_idx = (torch.arange(S, dtype=torch.float32, device=device) / S).view(1, 1, S, 1)
+        s_idx = (torch.arange(S, dtype=torch.float32, device=device) / S).view(1, S, 1, 1)
         d_idx = (torch.arange(D, dtype=torch.float32, device=device) / D).view(1, 1, 1, D)
-        q = (s_idx + 0.1 * d_idx).expand(B, H, S, D).contiguous().bfloat16()
-        k = s_idx.expand(B, H, S, D).contiguous().bfloat16()
-        v = (s_idx + d_idx).expand(B, H, S, D).contiguous().bfloat16()
+        q = (s_idx + 0.1 * d_idx).expand(B, S, H, D).contiguous().bfloat16()
+        k = s_idx.expand(B, S, H, D).contiguous().bfloat16()
+        v = (s_idx + d_idx).expand(B, S, H, D).contiguous().bfloat16()
         return q, k, v
     if pattern == "diag":
         eye = torch.eye(D, dtype=torch.float32, device=device)
-        qk = eye.repeat(S // D + 1, 1)[:S]
+        qk = eye.repeat(S // D + 1, 1)[:S]                                                # (S, D)
         v_pat = (torch.arange(S, dtype=torch.float32, device=device) / S).unsqueeze(1).expand(S, D)
-        q = qk.expand(B, H, S, D).contiguous().bfloat16()
+        q = qk.view(1, S, 1, D).expand(B, S, H, D).contiguous().bfloat16()
         k = q.clone()
-        v = v_pat.expand(B, H, S, D).contiguous().bfloat16()
+        v = v_pat.view(1, S, 1, D).expand(B, S, H, D).contiguous().bfloat16()
         return q, k, v
     raise ValueError(f"Unknown input pattern: {pattern}")
 
@@ -138,12 +139,12 @@ def _torch_bshd_to_max_buf(t_bshd, mod, acc):
     return Buffer.from_numpy(u16).view(DType.bfloat16, t_bshd.shape).to(acc)
 
 
-def _max_buf_to_fp32_bhsd(buf, mod):
-    """MAX bf16 Buffer (B,S,H,D) → fp32 torch tensor (B,H,S,D)."""
+def _max_buf_to_fp32(buf, mod):
+    """MAX bf16 Buffer (B,S,H,D) → fp32 torch tensor (B,S,H,D)."""
     DType = mod["DType"]
     u16 = buf.view(DType.uint16, buf.shape).to_numpy()
     f32 = (u16.astype(np.uint32) << np.uint32(16)).view(np.float32)
-    return torch.from_numpy(np.ascontiguousarray(np.transpose(f32, (0, 2, 1, 3))))
+    return torch.from_numpy(np.ascontiguousarray(f32))
 
 
 def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include_max=True):
@@ -151,12 +152,8 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
         sys.exit("Need ROCm-built torch with a HIP device.")
     device = torch.device("cuda")
 
+    # (B, S, H, D) — consumed natively by OURS (layout="bshd"), AITER and MAX. No transpose anywhere.
     q, k, v = make_inputs(B, H, S, D, device, pattern)
-
-    # AITER + MAX expect (B, S, H, D); transpose once outside the timed loop.
-    q_a = q.transpose(1, 2).contiguous()
-    k_a = k.transpose(1, 2).contiguous()
-    v_a = v.transpose(1, 2).contiguous()
 
     flops = 4.0 * B * H * S * S * D
 
@@ -172,12 +169,12 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
 
     aiter_last = {"rtna": None, "rtne": None, "rtz": None}
     fns = {
-        "HIP   RTNA": lambda: ma.forward(q, k, v, out=out_hip_rtna, round_mode="rtna"),
-        "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne"),
-        "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz"),
-        "AITER RTNA": lambda: aiter_last.__setitem__("rtna", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNA)),
-        "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
-        "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
+        "HIP   RTNA": lambda: ma.forward(q, k, v, out=out_hip_rtna, round_mode="rtna", layout="bshd"),
+        "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne", layout="bshd"),
+        "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz",  layout="bshd"),
+        "AITER RTNA": lambda: aiter_last.__setitem__("rtna", flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNA)),
+        "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
+        "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
 
     max_mod = max_skip_reason = None
@@ -188,9 +185,9 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
             session = _max_session(max_mod)
             model = _max_model(B, S, H, D, max_mod, session)
             acc = max_mod["Accelerator"](0)
-            bq = _torch_bshd_to_max_buf(q_a, max_mod, acc)
-            bk = _torch_bshd_to_max_buf(k_a, max_mod, acc)
-            bv = _torch_bshd_to_max_buf(v_a, max_mod, acc)
+            bq = _torch_bshd_to_max_buf(q, max_mod, acc)
+            bk = _torch_bshd_to_max_buf(k, max_mod, acc)
+            bv = _torch_bshd_to_max_buf(v, max_mod, acc)
             fns["MAX"] = lambda: model(bq, bk, bv)[0]
         except (ImportError, OSError, RuntimeError) as exc:
             max_skip_reason = f"{type(exc).__name__}: {exc}"
@@ -203,22 +200,20 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
         d = (a - b).abs()
         return d.max().item(), d.pow(2).mean().sqrt().item()
 
-    # Buffers already hold each kernel's last output from the timing loop.
-    # Re-layout AITER outputs from (B, S, H, D) to (B, H, S, D) for comparison.
-    aiter_rtna_bhsd = aiter_last["rtna"].transpose(1, 2).contiguous()
-    aiter_rtne_bhsd = aiter_last["rtne"].transpose(1, 2).contiguous()
-    aiter_rtz_bhsd  = aiter_last["rtz"].transpose(1, 2).contiguous()
-    rtna_max, rtna_rmse = diff_stats(out_hip_rtna, aiter_rtna_bhsd)
-    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_rtne_bhsd)
-    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_rtz_bhsd)
+    # All outputs are (B, S, H, D) — compare directly.
+    rtna_max, rtna_rmse = diff_stats(out_hip_rtna, aiter_last["rtna"])
+    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_last["rtne"])
+    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_last["rtz"])
 
     out_max_f32 = None
     if max_mod is not None:
-        out_max_f32 = _max_buf_to_fp32_bhsd(fns["MAX"](), max_mod)
+        out_max_f32 = _max_buf_to_fp32(fns["MAX"](), max_mod)
+        # MAX rounds to-nearest — verified by exact bf16-bit match: RTNA ≡ RTNE (both ~50% vs MAX),
+        # far above RTZ (~16%). Compare against RTNE (the round-to-nearest reference).
         max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
-        max_vs_aiter = diff_stats(out_max_f32, aiter_rtne_bhsd)
+        max_vs_aiter = diff_stats(out_max_f32, aiter_last["rtne"])
 
-    print(f"inputs={pattern}  shape=({B},{H},{S},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
+    print(f"inputs={pattern}  BSHD shape=({B},{S},{H},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
     print(f"              ms      TFLOP/s    ratios")
     for name, ms in timings.items():
         tflops = flops / (ms * 1e-3) / 1e12

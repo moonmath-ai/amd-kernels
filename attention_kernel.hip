@@ -286,6 +286,15 @@ constexpr auto kVtLayout = opus::make_layout(
 constexpr auto kKHbmDword = opus::make_layout(kShape2, strides<kKRowDwords, 1>());
 constexpr auto kKLdsDword = opus::make_layout(kShape2, strides<kKLdsStrideDwords, 1>());
 
+// HBM (seq, head-dim/dword) → offset layout for Q/K/Out, parameterized by the input layout.
+// BHSD: rows per-head contiguous → static seq-row stride Stride (byte- and ISA-identical).
+// BSHD: heads interleaved → seq-row stride heads·Stride (dynamic). Unused branch folds away.
+template <bool kBSHD, int Stride>
+__device__ __forceinline__ auto seq_layout(int heads) {
+    if constexpr (kBSHD) return opus::make_layout(kShape2, opus::make_tuple(heads * Stride, opus::number<1>{}));
+    else                 return opus::make_layout(kShape2, opus::make_tuple(opus::number<Stride>{}, opus::number<1>{}));
+}
+
 // ─── Grid + MFMA thread→fragment index maps ─────────────────────────────────
 // Same rule as the memory layouts above (offset = Σ coordᵢ·strideᵢ) but these
 // yield LOGICAL indices — which q-tile / which kv-row / which fragment element —
@@ -362,7 +371,7 @@ __device__ __forceinline__ float cross_lane_sum(float v) {
     return partial + __builtin_bit_cast(float, peer32);
 }
 
-template <bool kLite>
+template <bool kLite, bool kBSHD>
 __global__ __launch_bounds__(kBlockSize, 1)
 void attention_forward(
     const bf16_t* __restrict__ Q,
@@ -373,7 +382,8 @@ void attention_forward(
     const int16_t* __restrict__ read_list,   // LiteAttention skip list (this phase's slice)
     int16_t* __restrict__ write_list,        // skip list written for the next timestep
     const int16_t* __restrict__ must_do_list,// global force-compute list (nullable): [len,s0,e0,...]
-    float thr, int phase                     // skip threshold (log2) + reverse-list phase
+    float thr, int phase,                    // skip threshold (log2) + reverse-list phase
+    int heads                                // #heads — only needed for BSHD addressing (kBSHD)
 ) {
     // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
     // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
@@ -423,9 +433,20 @@ void attention_forward(
     const int num_kv_blocks = (seq_len_kv + kKvBlockRows - 1) / kKvBlockRows;       // ceil
     const int last_kv_rows  = seq_len_kv - (num_kv_blocks - 1) * kKvBlockRows;      // valid rows in the first-processed block ∈ [1,64]
 
-    // Cross-attention: Q/Out use seq_len (Sq rows); K/V use seq_len_kv (Skv rows).
-    const long long bh_offset_q  = (long long)bh_index * seq_len    * kHeadDim;
-    const long long bh_offset_kv = (long long)bh_index * seq_len_kv * kHeadDim;
+    // Only the HBM addressing of Q/K/Out depends on the layout (masking + the LDS/V_t hot loop
+    // don't). Shadow the (seq,hd)→offset layouts with the layout's seq-row stride; head base below.
+    const auto kQOLayout  = seq_layout<kBSHD, kHeadDim>(heads);      // Q/Out (seq, head-dim elems)
+    const auto kKHbmDword = seq_layout<kBSHD, kKRowDwords>(heads);   // K     (seq, dwords)
+    const int  k_row_dwords = kBSHD ? heads * kKRowDwords : kKRowDwords;
+    long long bh_offset_q, bh_offset_kv;
+    if constexpr (kBSHD) {
+        const long long b = bh_index / heads, h = bh_index % heads;
+        bh_offset_q  = b * (long long)seq_len    * heads * kHeadDim + h * kHeadDim;
+        bh_offset_kv = b * (long long)seq_len_kv * heads * kHeadDim + h * kHeadDim;
+    } else {
+        bh_offset_q  = (long long)bh_index * seq_len    * kHeadDim;
+        bh_offset_kv = (long long)bh_index * seq_len_kv * kHeadDim;
+    }
     // V_t is pre-transposed with each head padded to num_kv_blocks·64 rows, so every
     // head's V_t starts on a 64-row block boundary even when seq_len_kv%64≠0.
     const long long bh_offset_v = (long long)bh_index * num_kv_blocks * kKvBlockRows * kHeadDim;
@@ -441,7 +462,9 @@ void attention_forward(
     // [w·16, +16); for each, its 64 lanes stream one full K row — lane L copies dword L.
     // Linear padded LDS.
     constexpr uint32_t kKRowBytes   = (uint32_t)(kKLdsStrideDwords * 4);
-    constexpr uint32_t kKBlockBytes = (uint32_t)(kKvBlockRows * kHeadDim * 2);
+    // K block stride (bytes) = kKvBlockRows seq-rows × the seq-row byte stride. BHSD folds to the
+    // contiguous block size kKvBlockRows·kHeadDim·2 = 16384; BSHD is ×heads (rows interleaved).
+    const uint32_t kKBlockBytes = (uint32_t)(kKvBlockRows * k_row_dwords * 4);
     const int wave_row0 = kKLoadRow(wave_in_group, 0);   // first kv-row this load-wave owns
     // Partial last block (seq_len_kv%64!=0): rows ≥ last_kv_rows are past the K tensor — re-read
     // the last valid row (its score is masked to -inf anyway) to avoid an OOB read. Aligned → no clamp.
@@ -921,11 +944,13 @@ void attention_forward(
 constexpr int kXposeThreadsPerWG = 256;
 constexpr auto kVStageWr = opus::make_layout(kShape2, strides<kHeadDim / 2, 4>()); // (row, octet)→dword
 constexpr auto kVtChunkLane = opus::make_layout(kShape2, strides<kVtChunkElems, kVtLaneElems>()); // (super-chunk, lane)
+template <bool kBSHD>
 __global__ __launch_bounds__(kXposeThreadsPerWG, 4)
 void v_transpose_kernel_16x16(
     const bf16_t* __restrict__ V,
     bf16_t*       __restrict__ V_t,
-    int           seq_len_per_head
+    int           seq_len_per_head,
+    int           heads               // #heads — only for BSHD V addressing (kBSHD)
 ) {
     // Per-head padded V_t: blockIdx.x enumerates (head, kv_iter). Source V is unpadded
     // (head stride seq_len·D); dest V_t is padded to num_kv_blocks·64 rows/head so every
@@ -937,17 +962,28 @@ void v_transpose_kernel_16x16(
     const int head     = blockIdx.x / num_kv_blocks;
     const int kv_iter  = blockIdx.x % num_kv_blocks;
     const int tid = threadIdx.x;
-    // const long long block_base = (long long)kv_iter * kVtBlockElems;  // bf16 elems before this block
-    const long long src_block_base = (long long)head * seq_len_per_head * kHeadDim
-                                   + (long long)kv_iter * kVtBlockElems;   // unpadded source base (bf16 elems)
+    // head = bh index over B·H; for BSHD split into b=head/heads, h=head%heads.
+    long long src_block_base;
+    if constexpr (kBSHD) {
+        const long long b = head / heads, h = head % heads;
+        src_block_base = b * (long long)seq_len_per_head * heads * kHeadDim + h * kHeadDim
+                       + (long long)kv_iter * kKvBlockRows * heads * kHeadDim;   // unpadded BSHD source base
+    } else {
+        src_block_base = (long long)head * seq_len_per_head * kHeadDim
+                       + (long long)kv_iter * kVtBlockElems;                     // unpadded BHSD source base
+    }
     const long long dst_block_base = (long long)head * num_kv_blocks * kVtBlockElems
-                                   + (long long)kv_iter * kVtBlockElems;   // padded dest base (bf16 elems)
+                                   + (long long)kv_iter * kVtBlockElems;   // padded dest base (bf16 elems, V_t packed)
 
     __shared__ uint32_t stage_dw[kKvBlockRows * (kHeadDim / 2)];   // 64 rows × 64 dw = 16 KB
     const auto v_buffer = make_buffer(V);
 
     // ── Phase 1: V[block] HBM → LDS, coalesced. 1024 element-copies cover 64 rows ×
     //    16 head-dim octets; each copies one bf16x8 (= 4 dwords). ───────────
+    // Shadow kQOLayout with the source-V seq-row stride (scoped to phase 1; phase 2 reads the
+    // contiguous LDS stage via the global static kQOLayout).
+    {
+    const auto kQOLayout = seq_layout<kBSHD, kHeadDim>(heads);
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
         const int elem_idx = k * kXposeThreadsPerWG + tid;
@@ -964,6 +1000,7 @@ void v_transpose_kernel_16x16(
         const int dst_dw = kVStageWr(row, octet);            // dword offset in stage_dw
         stage_dw[dst_dw + 0] = v_oct[0]; stage_dw[dst_dw + 1] = v_oct[1];
         stage_dw[dst_dw + 2] = v_oct[2]; stage_dw[dst_dw + 3] = v_oct[3];
+    }
     }
 
     __syncthreads();
@@ -1006,7 +1043,7 @@ extern "C" {
 // first to produce V_t from raw V. V_t and V have identical total byte size.
 int launch_attention_forward(
     const void* q, const void* k, const void* v, void* out,
-    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, void* stream
+    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream
 ) {
     if (batch <= 0 || heads <= 0)             return 1;
     if (seq_len <= 0)                         return 2;   // any Q len (partial last q-tile masked in-kernel)
@@ -1018,11 +1055,16 @@ int launch_attention_forward(
     const dim3  grid((qt + kQTilesPerWG - 1) / kQTilesPerWG, bh);
     const float sl2e = kLog2e / sqrtf((float)kHeadDim);
 
-    hipLaunchKernelGGL(
-        attention_forward<false>, grid, dim3(kBlockSize), 0, (hipStream_t)stream,
-        (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-        (bf16_t*)out, seq_len, seq_len_kv, sl2e,
-        (const int16_t*)nullptr, (int16_t*)nullptr, (const int16_t*)nullptr, 0.f, 0);
+    // layout: 0 = BHSD (q,k,v,out are [B,H,S,D]); 1 = BSHD ([B,S,H,D], read natively, no transpose)
+    // chevron launch (hipLaunchKernelGGL can't parse the template's comma)
+    if (layout)
+        attention_forward<false, true><<<grid, dim3(kBlockSize), 0, (hipStream_t)stream>>>(
+            (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+            (const int16_t*)nullptr, (int16_t*)nullptr, (const int16_t*)nullptr, 0.f, 0, heads);
+    else
+        attention_forward<false, false><<<grid, dim3(kBlockSize), 0, (hipStream_t)stream>>>(
+            (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+            (const int16_t*)nullptr, (int16_t*)nullptr, (const int16_t*)nullptr, 0.f, 0, heads);
     return (int)hipGetLastError();
 }
 
@@ -1034,7 +1076,7 @@ int launch_attention_forward_lite(
     const void* q, const void* k, const void* v, void* out,
     int batch, int heads, int seq_len, int seq_len_kv, int head_dim,
     const void* read_list, void* write_list, const void* must_do_list,
-    float threshold, int phase, void* stream
+    float threshold, int phase, int layout, void* stream
 ) {
     if (batch <= 0 || heads <= 0)                  return 1;
     if (seq_len <= 0)                              return 2;   // any Q len (partial last q-tile masked in-kernel)
@@ -1050,31 +1092,37 @@ int launch_attention_forward_lite(
     // independent of seq_len, so the lite path is not LDS-capped by sequence length.
     const size_t dyn = (size_t)kNumWaves * kVerdictRing;
 
-    hipLaunchKernelGGL(
-        attention_forward<true>, grid, dim3(kBlockSize), dyn, (hipStream_t)stream,
-        (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v,
-        (bf16_t*)out, seq_len, seq_len_kv, sl2e,
-        (const int16_t*)read_list, (int16_t*)write_list, (const int16_t*)must_do_list, threshold, phase);
+    if (layout)
+        attention_forward<true, true><<<grid, dim3(kBlockSize), dyn, (hipStream_t)stream>>>(
+            (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+            (const int16_t*)read_list, (int16_t*)write_list, (const int16_t*)must_do_list, threshold, phase, heads);
+    else
+        attention_forward<true, false><<<grid, dim3(kBlockSize), dyn, (hipStream_t)stream>>>(
+            (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e,
+            (const int16_t*)read_list, (int16_t*)write_list, (const int16_t*)must_do_list, threshold, phase, heads);
     return (int)hipGetLastError();
 }
 
 // V transpose: V[seq_len, 128] (bf16) → V_t in pv_phase's consumed layout.
 // Caller allocates V_t with same byte size as V. n_rows = batch*heads*seq_len.
 int launch_v_transpose(
-    const void* v, void* v_t, int n_rows, int seq_len_per_head, void* stream
+    const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream
 ) {
     // n_rows = B·H·S (unpadded source). V_t is written per-head padded to ceil(S/64)·64 rows,
-    // so launch bh·num_kv_blocks blocks (one per (head, kv_iter)).
-    // if (n_rows <= 0 || (n_rows % kKvBlockRows)) return 2;
+    // so launch bh·num_kv_blocks blocks (one per (head, kv_iter)). heads/layout select the
+    // source V layout: 0 = BHSD ([B,H,S,D]); 1 = BSHD ([B,S,H,D], read strided, no transpose).
     if (n_rows <= 0 || seq_len_per_head <= 0 || (n_rows % seq_len_per_head)) return 2;
     const int bh            = n_rows / seq_len_per_head;
     const int num_kv_blocks = (seq_len_per_head + kKvBlockRows - 1) / kKvBlockRows;
-    // const int iters = n_rows / kKvBlockRows;
     const int iters = bh * num_kv_blocks;
-    hipLaunchKernelGGL(
-        v_transpose_kernel_16x16,
-        dim3(iters), dim3(kXposeThreadsPerWG), 0, (hipStream_t)stream,
-        (const bf16_t*)v, (bf16_t*)v_t, seq_len_per_head);
+    if (layout)
+        hipLaunchKernelGGL(
+            v_transpose_kernel_16x16<true>, dim3(iters), dim3(kXposeThreadsPerWG), 0, (hipStream_t)stream,
+            (const bf16_t*)v, (bf16_t*)v_t, seq_len_per_head, heads);
+    else
+        hipLaunchKernelGGL(
+            v_transpose_kernel_16x16<false>, dim3(iters), dim3(kXposeThreadsPerWG), 0, (hipStream_t)stream,
+            (const bf16_t*)v, (bf16_t*)v_t, seq_len_per_head, heads);
     return (int)hipGetLastError();
 }
 }

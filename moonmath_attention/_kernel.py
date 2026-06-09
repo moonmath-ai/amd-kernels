@@ -5,20 +5,20 @@ from pathlib import Path
 import torch
 
 _PKG = Path(__file__).parent
-# launch_attention_forward(q,k,v,out, B,H,Sq,Skv,D, stream)  [Skv = K/V len; cross-attn]
+# launch_attention_forward(q,k,v,out, B,H,Sq,Skv,D, layout, stream)  [Skv = K/V len; layout 0=BHSD 1=BSHD]
 _LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
-# launch_attention_forward_lite(q,k,v,out, B,H,Sq,Skv,D, read_list,write_list,must_do_list, thr, phase, stream)
+# launch_attention_forward_lite(q,k,v,out, B,H,Sq,Skv,D, read_list,write_list,must_do_list, thr, phase, layout, stream)
 _LITE_LAUNCH_ARGS = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
-# launch_v_transpose(V, V_t, seq_len_total, seq_len_per_head, stream)
+# launch_v_transpose(V, V_t, seq_len_total, seq_len_per_head, heads, layout, stream)
 _VTRANSPOSE_ARGS = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
 ]
 _HTOD, _DTOH = 1, 2
 _hip = None
@@ -80,7 +80,8 @@ def _lite_kernel(round_mode):
 
 def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             out: torch.Tensor | None = None,
-            round_mode: str = "rtna") -> torch.Tensor:
+            round_mode: str = "rtna",
+            layout: str = "bhsd") -> torch.Tensor:
     """Fused forward attention: O = softmax(QKᵀ / √D) V on MI300X.
 
     Args:
@@ -98,25 +99,31 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     """
     if round_mode not in ("rtna", "rtne", "rtz"):
         raise ValueError(f"round_mode must be 'rtna', 'rtne', or 'rtz' (got {round_mode!r})")
+    if layout not in ("bhsd", "bshd"):
+        raise ValueError(f"layout must be 'bhsd' or 'bshd' (got {layout!r})")
+    bshd = (layout == "bshd")
+    layout_int = 1 if bshd else 0
+    # Axis positions for (seq, heads) differ by layout. BHSD: (B,H,S,D); BSHD: (B,S,H,D).
+    sax, hax = (1, 2) if bshd else (2, 1)
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{name} must be torch.Tensor; got {type(t).__name__}")
         if t.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be torch.bfloat16; got dtype={t.dtype}")
         if t.dim() != 4:
-            raise ValueError(f"{name} must be 4-D (batch, heads, seq_len, head_dim); got shape={tuple(t.shape)}")
+            raise ValueError(f"{name} must be 4-D ({layout.upper()}); got shape={tuple(t.shape)}")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     # Cross-attention: k/v may have a different seq_len than q. They must agree with
     # each other and share (batch, heads, head_dim) with q.
     if k.shape != v.shape:
         raise ValueError(f"k/v shapes must match; got {tuple(k.shape)}, {tuple(v.shape)}")
-    if (q.shape[0], q.shape[1], q.shape[3]) != (k.shape[0], k.shape[1], k.shape[3]):
+    if (q.shape[0], q.shape[hax], q.shape[3]) != (k.shape[0], k.shape[hax], k.shape[3]):
         raise ValueError(f"q/k must share (batch, heads, head_dim); got {tuple(q.shape)} vs {tuple(k.shape)}")
     if q.device != k.device or q.device != v.device:
         raise ValueError(f"q/k/v must be on the same device")
-    B, H, Sq, D = q.shape
-    Skv = k.shape[2]
+    B, H, Sq, D = q.shape[0], q.shape[hax], q.shape[sax], q.shape[3]
+    Skv = k.shape[sax]
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
     # Sq and Skv may be any positive values: the kernel masks the partial last q-tile (store)
@@ -159,10 +166,10 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             # V_t is per-head padded to ceil(Skv/64)*64 rows, so it can be larger than V.
             if hip.hipMalloc(ctypes.byref(d_vt), vt_nbytes) != 0:
                 raise RuntimeError("hipMalloc(v_t) failed")
-            rc = lib.launch_v_transpose(d_v, d_vt, B * H * Skv, Skv, None)
+            rc = lib.launch_v_transpose(d_v, d_vt, B * H * Skv, Skv, H, layout_int, None)
             if rc != 0:
                 raise RuntimeError(f"launch_v_transpose returned {rc}")
-            rc = lib.launch_attention_forward(d_q, d_k, d_vt, d_out, B, H, Sq, Skv, D, None)
+            rc = lib.launch_attention_forward(d_q, d_k, d_vt, d_out, B, H, Sq, Skv, D, layout_int, None)
             if rc != 0:
                 raise RuntimeError(f"launch_attention_forward returned {rc}")
             if hip.hipDeviceSynchronize() != 0:
@@ -178,17 +185,17 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         # directly from L1). launch_v_transpose runs first, then the attention
         # kernel — both are issued here so a caller timing forward() includes
         # the V-transpose cost.
-        v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t
+        v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t (internal layout)
         rc = lib.launch_v_transpose(
             ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-            B * H * Skv, Skv, None,
+            B * H * Skv, Skv, H, layout_int, None,
         )
         if rc != 0:
             raise RuntimeError(f"launch_v_transpose returned {rc}")
         rc = lib.launch_attention_forward(
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
             ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-            B, H, Sq, Skv, D, None,
+            B, H, Sq, Skv, D, layout_int, None,
         )
         if rc != 0:
             raise RuntimeError(f"launch_attention_forward returned {rc}")
@@ -256,7 +263,7 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t
     rc = lib.launch_v_transpose(
         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-        B * H * Skv, Skv, None)
+        B * H * Skv, Skv, H, 0, None)   # heads=H, layout=0 (BHSD)
     if rc != 0:
         raise RuntimeError(f"launch_v_transpose returned {rc}")
     rc = lib.launch_attention_forward_lite(
@@ -265,7 +272,7 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
         B, H, Sq, Skv, D,
         ctypes.c_void_p(read_list.data_ptr()), ctypes.c_void_p(write_list.data_ptr()),
         ctypes.c_void_p(must_do_list.data_ptr() if must_do_list is not None else None),
-        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), None)
+        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), ctypes.c_int(0), None)  # layout=0 (BHSD)
     if rc != 0:
         raise RuntimeError(f"launch_attention_forward_lite returned {rc}")
     if hip.hipDeviceSynchronize() != 0:
