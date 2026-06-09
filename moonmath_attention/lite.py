@@ -52,12 +52,16 @@ class LiteAttention:
     """
 
     def __init__(self, threshold: float = -6.0, *, enable_skipping: bool = True,
-                 round_mode: str = "rtna", reverse_skip_list: bool = True):
+                 round_mode: str = "rtna", reverse_skip_list: bool = True,
+                 layout: str = "bhsd"):
         if threshold >= 0:
             raise ValueError(f"threshold must be negative (log2 units); got {threshold}")
+        if layout not in ("bhsd", "bshd"):
+            raise ValueError(f"layout must be 'bhsd' or 'bshd' (got {layout!r})")
         self.threshold = float(threshold)
         self.enable_skipping = bool(enable_skipping)
         self.round_mode = round_mode
+        self.layout = layout           # "bhsd" [B,H,S,D] or "bshd" [B,S,H,D]
         self.reverse_skip_list = True  # only reverse/phase is implemented (byte-exact)
         self._skip = None             # [2, B, H, qtiles, ktiles+2] int16
         self._phase = 0
@@ -95,8 +99,9 @@ class LiteAttention:
         return self._skip[1 - self._phase]
 
     def _ensure(self, q, k):
-        B, H, Sq, D = q.shape
-        Skv = k.shape[2]                       # cross-attn: K/V len may differ from Q
+        sax, hax = (1, 2) if self.layout == "bshd" else (2, 1)
+        B, H, Sq, D = q.shape[0], q.shape[hax], q.shape[sax], q.shape[3]
+        Skv = k.shape[sax]                     # cross-attn: K/V len may differ from Q
         sig = (B, H, Sq, Skv, q.device)
         if self._skip is not None and self._sig == sig:
             return
@@ -118,7 +123,8 @@ class LiteAttention:
         # `must_do_list` (optional int16 [len, s0,e0, ...]): K-block ranges pinned as
         # always-compute in the emitted write list (e.g. attention sinks). None ⇒ pure vote.
         if not self.enable_skipping:
-            return _kernel.forward(q, k, v, out=out, round_mode=self.round_mode)
+            return _kernel.forward(q, k, v, out=out, round_mode=self.round_mode,
+                                   layout=self.layout)
 
         self._ensure(q, k)
         if self._phase == 0:
@@ -132,7 +138,7 @@ class LiteAttention:
         return _kernel.forward_lite(
             q, k, v, read.contiguous(), write.contiguous(),
             threshold=self.threshold, phase=kphase, must_do_list=must_do_list,
-            out=out, round_mode=self.round_mode)
+            out=out, round_mode=self.round_mode, layout=self.layout)
 
 
 # Backward-compatible alias (renamed from MoonLiteAttention -> LiteAttention).

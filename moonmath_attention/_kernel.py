@@ -208,7 +208,7 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
 
 
 def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
-                 must_do_list=None, out=None, round_mode="rtna"):
+                 must_do_list=None, out=None, round_mode="rtna", layout="bhsd"):
     """LiteAttention forward: skip K-blocks per the cross-timestep skip list.
 
     `read_list` / `write_list` are int16 CUDA tensors shaped
@@ -230,12 +230,18 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     """
     if round_mode not in ("rtna", "rtne", "rtz"):
         raise ValueError(f"round_mode must be 'rtna', 'rtne', or 'rtz' (got {round_mode!r})")
+    if layout not in ("bhsd", "bshd"):
+        raise ValueError(f"layout must be 'bhsd' or 'bshd' (got {layout!r})")
+    bshd = (layout == "bshd")
+    layout_int = 1 if bshd else 0
+    # Axis positions for (seq, heads). BHSD: (B,H,S,D); BSHD: (B,S,H,D).
+    sax, hax = (1, 2) if bshd else (2, 1)
     for name, t in (("q", q), ("k", k), ("v", v)):
         if t.dtype != torch.bfloat16 or t.dim() != 4 or not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous 4-D bfloat16")
     if k.shape != v.shape:
         raise ValueError(f"k/v shapes must match; got {tuple(k.shape)}, {tuple(v.shape)}")
-    if (q.shape[0], q.shape[1], q.shape[3]) != (k.shape[0], k.shape[1], k.shape[3]):
+    if (q.shape[0], q.shape[hax], q.shape[3]) != (k.shape[0], k.shape[hax], k.shape[3]):
         raise ValueError(f"q/k must share (batch, heads, head_dim); got {tuple(q.shape)} vs {tuple(k.shape)}")
     if q.device.type not in ("cuda", "hip"):
         raise NotImplementedError("forward_lite requires a CUDA/HIP tensor")
@@ -245,8 +251,8 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     if must_do_list is not None:
         if must_do_list.dtype != torch.int16 or not must_do_list.is_contiguous() or must_do_list.device != q.device:
             raise ValueError("must_do_list must be a contiguous int16 tensor on q's device")
-    B, H, Sq, D = q.shape
-    Skv = k.shape[2]
+    B, H, Sq, D = q.shape[0], q.shape[hax], q.shape[sax], q.shape[3]
+    Skv = k.shape[sax]
     if D != 128:
         raise ValueError(f"head_dim must be 128 (got {D})")
     # Sq and Skv may be any positive values: the kernel masks the partial last q-tile (store)
@@ -260,10 +266,10 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
     if out is None:
         out = torch.empty_like(q)
 
-    v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t
+    v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t (internal layout)
     rc = lib.launch_v_transpose(
         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-        B * H * Skv, Skv, H, 0, None)   # heads=H, layout=0 (BHSD)
+        B * H * Skv, Skv, H, layout_int, None)   # heads=H, layout (0=BHSD,1=BSHD)
     if rc != 0:
         raise RuntimeError(f"launch_v_transpose returned {rc}")
     rc = lib.launch_attention_forward_lite(
@@ -272,7 +278,7 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
         B, H, Sq, Skv, D,
         ctypes.c_void_p(read_list.data_ptr()), ctypes.c_void_p(write_list.data_ptr()),
         ctypes.c_void_p(must_do_list.data_ptr() if must_do_list is not None else None),
-        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), ctypes.c_int(0), None)  # layout=0 (BHSD)
+        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), ctypes.c_int(layout_int), None)
     if rc != 0:
         raise RuntimeError(f"launch_attention_forward_lite returned {rc}")
     if hip.hipDeviceSynchronize() != 0:
