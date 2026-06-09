@@ -183,24 +183,25 @@ def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     elif q.device.type in ("cuda", "hip"):
         # L1V kernel: V must be pre-transposed into V_t (pv_phase consumes V_t
         # directly from L1). launch_v_transpose runs first, then the attention
-        # kernel — both are issued here so a caller timing forward() includes
-        # the V-transpose cost.
+        # kernel — both issued on torch's CURRENT stream so they order correctly
+        # against surrounding torch ops with NO device-wide sync: downstream torch
+        # ops on the same stream wait for our kernel automatically (like aiter).
+        # (v_t is torch-allocated, so its stream-ordered free also waits for us.)
+        stream = ctypes.c_void_p(torch.cuda.current_stream(q.device).cuda_stream)
         v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t (internal layout)
         rc = lib.launch_v_transpose(
             ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-            B * H * Skv, Skv, H, layout_int, None,
+            B * H * Skv, Skv, H, layout_int, stream,
         )
         if rc != 0:
             raise RuntimeError(f"launch_v_transpose returned {rc}")
         rc = lib.launch_attention_forward(
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
             ctypes.c_void_p(v_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-            B, H, Sq, Skv, D, layout_int, None,
+            B, H, Sq, Skv, D, layout_int, stream,
         )
         if rc != 0:
             raise RuntimeError(f"launch_attention_forward returned {rc}")
-        if hip.hipDeviceSynchronize() != 0:
-            raise RuntimeError("hipDeviceSynchronize failed")
     else:
         raise NotImplementedError(f"Unsupported torch device {q.device!r}; expected 'cpu' or 'cuda'/'hip'")
 
@@ -261,15 +262,18 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
         raise ValueError(f"seq lens must be positive (got Sq={Sq}, Skv={Skv})")
     Skv_pad = ((Skv + 63) // 64) * 64    # per-head V_t padding (block-aligned)
 
-    hip = _hip_runtime()
     lib = _lite_kernel(round_mode)
     if out is None:
         out = torch.empty_like(q)
 
+    # Issue on torch's CURRENT stream so everything orders without a device-wide
+    # sync: the next step's read_list == this step's write_list is ready before
+    # the next kernel reads it (same stream), and downstream torch ops wait for us.
+    stream = ctypes.c_void_p(torch.cuda.current_stream(q.device).cuda_stream)
     v_t = torch.empty((B, H, Skv_pad, D), dtype=v.dtype, device=v.device)  # per-head padded V_t (internal layout)
     rc = lib.launch_v_transpose(
         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(v_t.data_ptr()),
-        B * H * Skv, Skv, H, layout_int, None)   # heads=H, layout (0=BHSD,1=BSHD)
+        B * H * Skv, Skv, H, layout_int, stream)   # heads=H, layout (0=BHSD,1=BSHD)
     if rc != 0:
         raise RuntimeError(f"launch_v_transpose returned {rc}")
     rc = lib.launch_attention_forward_lite(
@@ -278,9 +282,7 @@ def forward_lite(q, k, v, read_list, write_list, *, threshold, phase,
         B, H, Sq, Skv, D,
         ctypes.c_void_p(read_list.data_ptr()), ctypes.c_void_p(write_list.data_ptr()),
         ctypes.c_void_p(must_do_list.data_ptr() if must_do_list is not None else None),
-        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), ctypes.c_int(layout_int), None)
+        ctypes.c_float(float(threshold)), ctypes.c_int(int(phase)), ctypes.c_int(layout_int), stream)
     if rc != 0:
         raise RuntimeError(f"launch_attention_forward_lite returned {rc}")
-    if hip.hipDeviceSynchronize() != 0:
-        raise RuntimeError("hipDeviceSynchronize failed")
     return out
