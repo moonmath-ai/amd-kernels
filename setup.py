@@ -1,5 +1,5 @@
-"""Build hook: invoke `hipcc` to compile the kernel into RTNA, RTNE and RTZ .so
-variants and bundle them as package_data."""
+"""Build hook: invoke `hipcc` to compile the dense kernel into RTNA, RTNE and RTZ
+.so variants and bundle them as package_data."""
 import os
 import shutil
 import subprocess
@@ -10,7 +10,6 @@ from setuptools.command.build_py import build_py
 
 ROOT = Path(__file__).parent.resolve()
 KERNEL = ROOT / "attention_kernel.hip"
-KERNEL_LITE = KERNEL  # sparsity branch: skip kernel IS attention_kernel.hip (templated attention_forward<kLite>)
 PKG_DIR = ROOT / "moonmath_attention"
 
 ARCH = os.environ.get("CDNA3_ARCH", "gfx942")
@@ -52,8 +51,7 @@ class BuildPyWithKernel(build_py):
             )
         PKG_DIR.mkdir(exist_ok=True)
         for round_mode in ("RTNA", "RTNE", "RTZ"):
-            _build_kernel(round_mode, PKG_DIR)                                  # champion dense
-            _build_kernel(round_mode, PKG_DIR, src=KERNEL_LITE, tag="lite_")    # LiteAttention skip
+            _build_kernel(round_mode, PKG_DIR)                                  # dense
         super().run()
 
 

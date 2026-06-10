@@ -177,22 +177,10 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
         "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
 
-    max_mod = max_skip_reason = None
-    bq = bk = bv = None
-    if include_max:
-        try:
-            max_mod = _load_max_modules()
-            session = _max_session(max_mod)
-            model = _max_model(B, S, H, D, max_mod, session)
-            acc = max_mod["Accelerator"](0)
-            bq = _torch_bshd_to_max_buf(q, max_mod, acc)
-            bk = _torch_bshd_to_max_buf(k, max_mod, acc)
-            bv = _torch_bshd_to_max_buf(v, max_mod, acc)
-            fns["MAX"] = lambda: model(bq, bk, bv)[0]
-        except (ImportError, OSError, RuntimeError) as exc:
-            max_skip_reason = f"{type(exc).__name__}: {exc}"
-            max_mod = None
-
+    # Time HIP + aiter on a CLEAN process FIRST — MAX is not even imported yet. Modular's MAX
+    # runtime, once initialized, leaves persistent GPU state that perturbs later measurements
+    # (observed: aiter RTZ inflated ~12→18 ms in some envs while every other row stayed put). By
+    # measuring HIP/aiter before any MAX load, those numbers are artifact-free regardless of env.
     timings = {name: time_fn(fn, warmup, iters) for name, fn in fns.items()}
 
     def diff_stats(a, b):
@@ -205,13 +193,30 @@ def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include
     rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_last["rtne"])
     rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_last["rtz"])
 
+    # MAX (Modular flash_attention_gpu) is loaded + timed LAST, after the HIP/aiter numbers above
+    # are fully recorded, so its runtime init can no longer skew them. It is timed in isolation.
+    max_skip_reason = None
     out_max_f32 = None
-    if max_mod is not None:
-        out_max_f32 = _max_buf_to_fp32(fns["MAX"](), max_mod)
-        # MAX rounds to-nearest — verified by exact bf16-bit match: RTNA ≡ RTNE (both ~50% vs MAX),
-        # far above RTZ (~16%). Compare against RTNE (the round-to-nearest reference).
-        max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
-        max_vs_aiter = diff_stats(out_max_f32, aiter_last["rtne"])
+    if include_max:
+        try:
+            torch.cuda.synchronize()   # drain all HIP/aiter work before MAX touches the GPU
+            max_mod = _load_max_modules()
+            session = _max_session(max_mod)
+            model = _max_model(B, S, H, D, max_mod, session)
+            acc = max_mod["Accelerator"](0)
+            bq = _torch_bshd_to_max_buf(q, max_mod, acc)
+            bk = _torch_bshd_to_max_buf(k, max_mod, acc)
+            bv = _torch_bshd_to_max_buf(v, max_mod, acc)
+            max_fn = lambda: model(bq, bk, bv)[0]
+            timings["MAX"] = time_fn(max_fn, warmup, iters)
+            out_max_f32 = _max_buf_to_fp32(max_fn(), max_mod)
+            # MAX rounds to-nearest — verified by exact bf16-bit match: RTNA ≡ RTNE (both ~50% vs MAX),
+            # far above RTZ (~16%). Compare against RTNE (the round-to-nearest reference).
+            max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
+            max_vs_aiter = diff_stats(out_max_f32, aiter_last["rtne"])
+        except (ImportError, OSError, RuntimeError) as exc:
+            max_skip_reason = f"{type(exc).__name__}: {exc}"
+            out_max_f32 = None
 
     print(f"inputs={pattern}  BSHD shape=({B},{S},{H},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
     print(f"              ms      TFLOP/s    ratios")

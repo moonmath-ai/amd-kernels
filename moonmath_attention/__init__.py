@@ -7,8 +7,7 @@
     >>> v = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
     >>> out = ma.forward(q, k, v)         # torch.bfloat16, same shape
 """
-from ._kernel import forward, forward_lite
-from .lite import LiteAttention, MoonLiteAttention  # MoonLiteAttention: deprecated alias
+from ._kernel import forward
 
-__all__ = ["forward", "forward_lite", "LiteAttention", "MoonLiteAttention"]
+__all__ = ["forward"]
 __version__ = "0.1.0"
