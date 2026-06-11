@@ -1,30 +1,63 @@
 // Pybind11 API for moonmath_attention
 // ROCm-only CDNA3 (MI300X/gfx942) fused attention kernel
 
-#include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
 
-#include <string>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 
 namespace py = pybind11;
 
 // Extern "C" launchers from the three round-mode TUs
 extern "C" {
-  int launch_v_transpose_rtna(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
-  int launch_attention_forward_rtna(const void* q, const void* k, const void* v, void* out,
-                                    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
+int launch_v_transpose_rtna(
+    const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
+int launch_attention_forward_rtna(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int batch,
+    int heads,
+    int seq_len,
+    int seq_len_kv,
+    int head_dim,
+    int layout,
+    void* stream);
 
-  int launch_v_transpose_rtne(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
-  int launch_attention_forward_rtne(const void* q, const void* k, const void* v, void* out,
-                                    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
+int launch_v_transpose_rtne(
+    const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
+int launch_attention_forward_rtne(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int batch,
+    int heads,
+    int seq_len,
+    int seq_len_kv,
+    int head_dim,
+    int layout,
+    void* stream);
 
-  int launch_v_transpose_rtz(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
-  int launch_attention_forward_rtz(const void* q, const void* k, const void* v, void* out,
-                                   int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
+int launch_v_transpose_rtz(
+    const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
+int launch_attention_forward_rtz(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int batch,
+    int heads,
+    int seq_len,
+    int seq_len_kv,
+    int head_dim,
+    int layout,
+    void* stream);
 }
 
 // Helper: validate tensor properties
@@ -52,8 +85,7 @@ at::Tensor forward(
     at::Tensor v,
     std::optional<at::Tensor> out_,
     std::string round_mode,
-    std::string layout
-) {
+    std::string layout) {
   // Validate inputs
   check_tensor(q, "q");
   check_tensor(k, "k");
@@ -100,7 +132,8 @@ at::Tensor forward(
   }
 
   if (Sq <= 0 || Skv <= 0) {
-    throw std::invalid_argument("seq_len must be positive, got Sq=" + std::to_string(Sq) + ", Skv=" + std::to_string(Skv));
+    throw std::invalid_argument(
+        "seq_len must be positive, got Sq=" + std::to_string(Sq) + ", Skv=" + std::to_string(Skv));
   }
 
   // Check devices match
@@ -155,8 +188,7 @@ at::Tensor forward(
   }
 
   // Launch attention forward
-  rc = fwd_fn(q.data_ptr(), k.data_ptr(), v_t.data_ptr(), out.data_ptr(),
-              B, H, Sq, Skv, D, layout_int, stream);
+  rc = fwd_fn(q.data_ptr(), k.data_ptr(), v_t.data_ptr(), out.data_ptr(), B, H, Sq, Skv, D, layout_int, stream);
   if (rc != 0) {
     throw std::runtime_error("launch_attention_forward returned error code " + std::to_string(rc));
   }
@@ -176,37 +208,39 @@ at::Tensor forward_lite(
     std::optional<at::Tensor> must_do_list_,
     std::optional<at::Tensor> out_,
     std::string round_mode,
-    std::string layout
-) {
+    std::string layout) {
   throw std::runtime_error(
-    "forward_lite: launch_attention_forward_lite is not defined in the current attention_kernel.hip. "
-    "Add the lite kernel symbol to attention_kernel.hip and rebuild to enable LiteAttention support."
-  );
+      "forward_lite: launch_attention_forward_lite is not defined in the current attention_kernel.hip. "
+      "Add the lite kernel symbol to attention_kernel.hip and rebuild to enable LiteAttention support.");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "moonmath_attention: ROCm CDNA3 (MI300X) fused attention kernel";
 
-  m.def("forward", &forward,
-        "Fused forward attention: O = softmax(QK^T / sqrt(D)) V",
-        py::arg("q"),
-        py::arg("k"),
-        py::arg("v"),
-        py::arg("out") = py::none(),
-        py::arg("round_mode") = "rtna",
-        py::arg("layout") = "bhsd");
+  m.def(
+      "forward",
+      &forward,
+      "Fused forward attention: O = softmax(QK^T / sqrt(D)) V",
+      py::arg("q"),
+      py::arg("k"),
+      py::arg("v"),
+      py::arg("out") = py::none(),
+      py::arg("round_mode") = "rtna",
+      py::arg("layout") = "bhsd");
 
-  m.def("forward_lite", &forward_lite,
-        "LiteAttention forward with K-block skipping (not yet implemented)",
-        py::arg("q"),
-        py::arg("k"),
-        py::arg("v"),
-        py::arg("read_list"),
-        py::arg("write_list"),
-        py::arg("threshold"),
-        py::arg("phase"),
-        py::arg("must_do_list") = py::none(),
-        py::arg("out") = py::none(),
-        py::arg("round_mode") = "rtna",
-        py::arg("layout") = "bhsd");
+  m.def(
+      "forward_lite",
+      &forward_lite,
+      "LiteAttention forward with K-block skipping (not yet implemented)",
+      py::arg("q"),
+      py::arg("k"),
+      py::arg("v"),
+      py::arg("read_list"),
+      py::arg("write_list"),
+      py::arg("threshold"),
+      py::arg("phase"),
+      py::arg("must_do_list") = py::none(),
+      py::arg("out") = py::none(),
+      py::arg("round_mode") = "rtna",
+      py::arg("layout") = "bhsd");
 }

@@ -34,5 +34,5 @@ repos:
         # hook's default type filter and select files via the `files` regex.
         files: ^csrc/.*\.(cpp|hpp|hip)$
         types_or: [file]
-        # Check only: fail on style violations without rewriting the kernels.
-        args: [--style=file, --dry-run, --Werror]
+        # Autoformat: rewrite the files in place to match .clang-format.
+        args: [-i, --style=file]

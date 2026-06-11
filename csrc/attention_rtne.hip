@@ -3,7 +3,7 @@
 // so all three round modes can coexist in the same extension.
 
 #define BF16_ROUND RTNE
-#define launch_attention_forward      launch_attention_forward_rtne
-#define launch_v_transpose            launch_v_transpose_rtne
+#define launch_attention_forward launch_attention_forward_rtne
+#define launch_v_transpose launch_v_transpose_rtne
 
 #include "attention_kernel.hip"
