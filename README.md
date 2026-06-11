@@ -63,7 +63,7 @@ handling is bit- and position-identical with AITER for every rounding mode
 
 ## Layout / build internals
 
-- `attention_kernel.hip` — the kernel (attention + V pre-transpose).
+- `csrc/attention_kernel.hip` — the kernel (attention + V pre-transpose).
 - `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
 - `runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.

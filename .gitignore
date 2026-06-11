@@ -12,6 +12,8 @@ dist/
 *.egg
 .eggs/
 
+.venv/
+
 # hipcc --save-temps output
 *-hip-amdgcn-amd-amdhsa-gfx942.bc
 *-hip-amdgcn-amd-amdhsa-gfx942.hipi

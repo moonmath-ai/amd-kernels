@@ -1,58 +1,86 @@
-"""Build hook: invoke `hipcc` to compile the dense kernel into RTNA, RTNE and RTZ
-.so variants and bundle them as package_data."""
+"""Build moonmath_attention._C extension via torch CUDAExtension (ROCm-only)."""
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
+import torch
 from setuptools import setup
-from setuptools.command.build_py import build_py
+from setuptools.command.build import build as _build
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Verify ROCm build (fail fast if someone tries to build on non-ROCm torch)
+if torch.version.hip is None:
+    raise RuntimeError(
+        "moonmath_attention requires a ROCm build of PyTorch. "
+        "torch.version.hip is None, indicating this is not a ROCm installation. "
+        "Install ROCm PyTorch and ensure hipcc is available on PATH."
+    )
 
 ROOT = Path(__file__).parent.resolve()
-KERNEL = ROOT / "attention_kernel.hip"
-PKG_DIR = ROOT / "moonmath_attention"
+CSRC = ROOT / "csrc"
+DIST = ROOT / "dist"
 
+# Honor CDNA3_ARCH env (default gfx942 for MI300X)
 ARCH = os.environ.get("CDNA3_ARCH", "gfx942")
-HIPCC = os.environ.get("HIPCC", "hipcc")
-EXTRA_FLAGS = [f for f in os.environ.get("EXTRA_LLVM_FLAGS", "").split() if f]
-
-OPUS_INC = ROOT / "third_party" / "aiter" / "csrc" / "include" / "opus"
-
-HIPCC_FLAGS = [
-    "-shared", "-fPIC", "-O3",
-    f"--offload-arch={ARCH}",
-    "-ffast-math", "-fno-math-errno",
-    "-mllvm", "-amdgpu-early-inline-all=true",
-    f"-I{OPUS_INC}",
-] + EXTRA_FLAGS
 
 
-def _build_kernel(round_mode: str, out_dir: Path, src: Path = KERNEL, tag: str = "") -> Path:
-    out = out_dir / f"libattention_{tag}{round_mode.lower()}.so"
-    cmd = [HIPCC, *HIPCC_FLAGS, f"-DBF16_ROUND={round_mode}",
-           "-o", str(out), str(src)]
-    print("[hipcc]", " ".join(cmd), flush=True)
-    subprocess.check_call(cmd)
-    return out
+# Stage csrc/ sources into dist/ and build from there. torch's ROCm hipify writes
+# its generated `<stem>_hip.cpp` next to the source it compiles, so building from
+# dist/ keeps those intermediates out of csrc/.
+DIST.mkdir(parents=True, exist_ok=True)
+
+_compile_names = [
+    "attention_api.cpp",
+    "attention_rtna.hip",
+    "attention_rtne.hip",
+    "attention_rtz.hip",
+]
+_include_names = ["attention_kernel.hip", "opus.hpp"]
+
+sources = []
+for name in _compile_names + _include_names:
+    src = CSRC / name
+    dst = DIST / name
+    if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+        shutil.copy2(src, dst)
+    if name in _compile_names:
+        sources.append(str(dst.relative_to(ROOT)))
+
+# ROCm-only flags (no is_rocm branch, BuildExtension routes "nvcc" to hipcc on ROCm)
+extra_compile_args = {
+    "cxx": ["-O3", "-std=c++17"],
+    "nvcc": [
+        "-O3",
+        "-std=c++17",
+        f"--offload-arch={ARCH}",
+        "-ffast-math",
+        "-fno-math-errno",
+        "-mllvm", "-amdgpu-early-inline-all=true",
+    ],
+}
 
 
-class BuildPyWithKernel(build_py):
-    """Build the kernel .so files into the source package dir before packaging.
+class DistBuild(_build):
+    """Route every build artifact under dist/.
 
-    Building into PKG_DIR (rather than build/lib/cdna3_attention) means the
-    package_data glob picks them up, and editable installs work without extra
-    plumbing.
+    Setting ``build_base`` makes ``build_ext`` (object files, ninja temp files,
+    the assembled ``lib.*`` tree) and ``bdist`` (wheel staging) all live under
+    dist/ instead of spawning a separate top-level build/ directory.
     """
-    def run(self):
-        if shutil.which(HIPCC) is None:
-            raise RuntimeError(
-                f"`{HIPCC}` not found on PATH. Install ROCm and ensure hipcc is "
-                f"reachable, or set HIPCC=/path/to/hipcc."
-            )
-        PKG_DIR.mkdir(exist_ok=True)
-        for round_mode in ("RTNA", "RTNE", "RTZ"):
-            _build_kernel(round_mode, PKG_DIR)                                  # dense
-        super().run()
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.build_base = str(DIST)
 
 
-setup(cmdclass={"build_py": BuildPyWithKernel})
+setup(
+    ext_modules=[
+        CUDAExtension(
+            name="moonmath_attention._C",
+            sources=sources,
+            # include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
+        )
+    ],
+    cmdclass={"build": DistBuild, "build_ext": BuildExtension},
+)

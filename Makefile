@@ -12,14 +12,13 @@ ARCH = gfx942
 
 TARGET_RTNE = libattention_rtne.so
 TARGET_RTZ  = libattention_rtz.so
-SRC         = attention_kernel.hip
+SRC         = csrc/attention_kernel.hip
 
 EXTRA_LLVM_FLAGS ?=
-OPUS_INC = third_party/aiter/csrc/include/opus
 HIPCC_FLAGS = -shared -fPIC -O3 --offload-arch=$(ARCH) \
               -ffast-math -fno-math-errno \
               -mllvm -amdgpu-early-inline-all=true \
-              -I$(OPUS_INC) \
+              -Icsrc \
               $(EXTRA_LLVM_FLAGS)
 
 all: $(TARGET_RTNE) $(TARGET_RTZ)

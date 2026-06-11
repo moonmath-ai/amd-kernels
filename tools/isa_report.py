@@ -67,7 +67,7 @@ def classify(line: str) -> str:
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     temp_asm = root / "temp" / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
-    root_asm = root / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
+    root_asm = root / "csrc" / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
     if len(sys.argv) > 1:
         asm = Path(sys.argv[1])
     elif temp_asm.is_file():

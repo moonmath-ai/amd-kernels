@@ -273,7 +273,7 @@ if [[ -z "${NO_ZIP:-}" ]]; then
     zip -r "${ZIP_PATH}" "${WORKLOAD_NAME}/"
   )
   # Also include the HIP source so ISA HTML source references are portable
-  zip -j "${ZIP_PATH}" "${SCRIPT_DIR}/attention_kernel.hip"
+  zip -j "${ZIP_PATH}" "${SCRIPT_DIR}/csrc/attention_kernel.hip"
   echo "Done: ${ZIP_PATH}"
   echo "  Extract and open ui_thread_trace/stats_*_isa.html in a browser."
   echo "  For ROCprof Compute Viewer: File -> Import -> Rocprofv3 UI -> pick ui_thread_trace/"
