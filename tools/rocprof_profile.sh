@@ -2,15 +2,15 @@
 # Profile the CDNA3 attention HIP kernel with rocprof-compute (PMC) + rocprofv3 (ATT).
 # Generates ISA analysis HTML with HIP source matching, then zips everything up.
 #
-# Usage:
-#   ./rocprof_profile.sh
-#   WORKLOAD_NAME=attn_run1 ./rocprof_profile.sh          # fixed name
-#   WARMUP_ITERS=5 ./rocprof_profile.sh
-#   ROCPROF_NO_UI_TRACE=1 ./rocprof_profile.sh             # skip ATT (faster)
-#   ROCPROF_NO_SUMMARY=1 ./rocprof_profile.sh              # skip analyze + summary CSV
-#   NO_ZIP=1 ./rocprof_profile.sh                          # skip final zip
-#   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder ./rocprof_profile.sh
-#   PYTHON=/path/to/python ./rocprof_profile.sh
+# Usage (from repo root):
+#   ./tools/rocprof_profile.sh
+#   WORKLOAD_NAME=attn_run1 ./tools/rocprof_profile.sh          # fixed name
+#   WARMUP_ITERS=5 ./tools/rocprof_profile.sh
+#   ROCPROF_NO_UI_TRACE=1 ./tools/rocprof_profile.sh             # skip ATT (faster)
+#   ROCPROF_NO_SUMMARY=1 ./tools/rocprof_profile.sh              # skip analyze + summary CSV
+#   NO_ZIP=1 ./tools/rocprof_profile.sh                          # skip final zip
+#   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder ./tools/rocprof_profile.sh
+#   PYTHON=/path/to/python ./tools/rocprof_profile.sh
 #
 # Requires: rocprof-compute, rocprofv3, libamdhip64.so (ROCm).
 # librocprof-trace-decoder.so auto-detected from:
@@ -20,7 +20,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT}"
 
 # Prepend conda lib so rocprofiler-sdk env reset doesn't drop libstdc++.
 if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
@@ -36,7 +37,7 @@ if [[ -z "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
     fi
   done
   if [[ -z "${_decoder_found}" ]]; then
-    _att_default="$(cd "${SCRIPT_DIR}/.." && pwd)/rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64"
+    _att_default="$(cd "${ROOT}/.." && pwd)/rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64"
     [[ -f "${_att_default}/librocprof-trace-decoder.so" ]] && _decoder_found="${_att_default}"
   fi
   if [[ -n "${_decoder_found}" ]]; then
@@ -71,13 +72,13 @@ if ! command -v rocprofv3 &>/dev/null; then
 fi
 
 # Build the kernel shared library with debug info if not already built.
-if [[ ! -f "${SCRIPT_DIR}/libattention.so" ]]; then
-  echo "Building libattention.so..."
-  make -C "${SCRIPT_DIR}"
+if ! compgen -G "${ROOT}/libattention"*.so >/dev/null; then
+  echo "Building libattention*.so..."
+  make -C "${ROOT}"
 fi
 
 # Workload paths.
-ROC_OUT_DIR="${ROC_OUT_DIR:-${SCRIPT_DIR}/rocprof_out}"
+ROC_OUT_DIR="${ROC_OUT_DIR:-${ROOT}/rocprof_out}"
 WORKLOAD_NAME="${WORKLOAD_NAME:-$(date +%Y%m%d_%H%M%S)}"
 WARMUP_ITERS="${WARMUP_ITERS:-3}"
 WORKLOAD_PATH="${ROC_OUT_DIR}/${WORKLOAD_NAME}"
@@ -90,13 +91,13 @@ export PMC_DISPATCH_INFO PMC_PERF
 # Locate ISA HTML generator — prefer local copy, fall back to sibling conv3amd repo.
 FORMAT_ISA_PY="${SCRIPT_DIR}/rocprof_att_stats_to_isa_html.py"
 if [[ ! -f "${FORMAT_ISA_PY}" ]]; then
-  _sibling="$(cd "${SCRIPT_DIR}/.." && pwd)/conv3amd/rocprof_att_stats_to_isa_html.py"
+  _sibling="$(cd "${ROOT}/.." && pwd)/conv3amd/rocprof_att_stats_to_isa_html.py"
   [[ -f "${_sibling}" ]] && FORMAT_ISA_PY="${_sibling}"
 fi
 
 MERGE_PY="${SCRIPT_DIR}/rocprof_merge_percentage_summary.py"
 if [[ ! -f "${MERGE_PY}" ]]; then
-  _sibling="$(cd "${SCRIPT_DIR}/.." && pwd)/conv3amd/rocprof_merge_percentage_summary.py"
+  _sibling="$(cd "${ROOT}/.." && pwd)/conv3amd/rocprof_merge_percentage_summary.py"
   [[ -f "${_sibling}" ]] && MERGE_PY="${_sibling}"
 fi
 
@@ -130,7 +131,7 @@ then
 fi
 
 export ROC_PROFILE_PYTHON="${PYTHON}"
-export ROC_PROFILE_SCRIPT="${SCRIPT_DIR}/runner.py"
+export ROC_PROFILE_SCRIPT="${ROOT}/runner.py"
 if [[ -z "${ROC_PROFILE_LD_PREFIX:-}" && -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
   export ROC_PROFILE_LD_PREFIX="${CONDA_PREFIX}/lib"
 fi
@@ -273,7 +274,7 @@ if [[ -z "${NO_ZIP:-}" ]]; then
     zip -r "${ZIP_PATH}" "${WORKLOAD_NAME}/"
   )
   # Also include the HIP source so ISA HTML source references are portable
-  zip -j "${ZIP_PATH}" "${SCRIPT_DIR}/csrc/attention_kernel.hip"
+  zip -j "${ZIP_PATH}" "${ROOT}/csrc/attention_kernel.hip"
   echo "Done: ${ZIP_PATH}"
   echo "  Extract and open ui_thread_trace/stats_*_isa.html in a browser."
   echo "  For ROCprof Compute Viewer: File -> Import -> Rocprofv3 UI -> pick ui_thread_trace/"

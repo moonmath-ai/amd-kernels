@@ -2,24 +2,19 @@
 """Benchmark CDNA3 HIP attention (RTNA + RTNE + RTZ) vs AITER's flash_attn_func, with
 optional Modular MAX `flash_attention_gpu` if `max` is installed.
 
-Requires ROCm-built torch, the AITER submodule under third_party/aiter, and
+Requires ROCm-built torch, `amd-aiter` (`pip install -e '.[bench]'`), and
 `moonmath_attention` installed (`pip install -e .` builds the kernel .so).
 TFLOP/s = 4*B*H*S^2*D / time (QK + PV matmuls only).
 """
 
 import argparse
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT / "third_party" / "aiter"))
-
-from aiter import flash_attn_func  # noqa: E402
-
-import moonmath_attention as ma  # noqa: E402
+from aiter import flash_attn_func
+import moonmath_attention as ma
 
 # AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA (default), 2=RTZ.
 AITER_RTNE = 0

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hardware counter sample for libattention.so — run on the MI300 host with ROCm.
-# Example:
-#   cd "$(dirname "$0")/.." && ./tools/rocprof_attn.sh
+# Usage (from repo root):
+#   ./tools/rocprof_attn.sh
 # Tweak ROCPROF_OPTS for your ROCm version (see `rocprof --help`).
 
 set -euo pipefail

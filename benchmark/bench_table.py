@@ -6,17 +6,12 @@ in TFLOP/s for both RTNE and RTZ rounding (Mojo MAX has no rounding selector;
 it's listed once per shape).
 """
 import argparse
-import sys
-from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT / "third_party" / "aiter"))
-
-from aiter import flash_attn_func  # noqa: E402
-import moonmath_attention as ma     # noqa: E402
+from aiter import flash_attn_func
+import moonmath_attention as ma
 
 AITER_RTNE = 0
 AITER_RTNA = 1

@@ -13,6 +13,24 @@ dependencies = [
     "torch==2.12.0+rocm7.2",
 ]
 
+[project.optional-dependencies]
+bench = [
+    "numpy",
+    "max",
+    "amd-aiter @ git+https://github.com/ROCm/aiter.git",
+]
+test = [
+    "pytest>=8",
+    "numpy",
+    "amd-aiter @ git+https://github.com/ROCm/aiter.git",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a ROCm HIP device",
+]
+
 [tool.setuptools]
 packages = ["moonmath_attention"]
 

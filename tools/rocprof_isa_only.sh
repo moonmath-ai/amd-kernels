@@ -2,16 +2,17 @@
 # ATT-only profile: run rocprofv3 Advanced Thread Trace on the CDNA3 attention
 # HIP kernel, then generate the ISA analysis HTML. No PMC, no analyze, no zip.
 #
-# Usage:
-#   ./rocprof_isa_only.sh
-#   WORKLOAD_NAME=attn_isa1 ./rocprof_isa_only.sh
-#   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder ./rocprof_isa_only.sh
-#   PYTHON=/path/to/python ./rocprof_isa_only.sh
+# Usage (from repo root):
+#   ./tools/rocprof_isa_only.sh
+#   WORKLOAD_NAME=attn_isa1 ./tools/rocprof_isa_only.sh
+#   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder ./tools/rocprof_isa_only.sh
+#   PYTHON=/path/to/python ./tools/rocprof_isa_only.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT}"
 
 # Prepend conda lib so rocprofiler-sdk env reset doesn't drop libstdc++.
 if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
@@ -27,7 +28,7 @@ if [[ -z "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
     fi
   done
   if [[ -z "${_decoder_found}" ]]; then
-    _att_default="$(cd "${SCRIPT_DIR}/.." && pwd)/rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64"
+    _att_default="$(cd "${ROOT}/.." && pwd)/rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64"
     [[ -f "${_att_default}/librocprof-trace-decoder.so" ]] && _decoder_found="${_att_default}"
   fi
   if [[ -n "${_decoder_found}" ]]; then
@@ -50,13 +51,13 @@ if ! command -v rocprofv3 &>/dev/null; then
 fi
 
 # Build the kernel shared library with debug info if not already built.
-if [[ ! -f "${SCRIPT_DIR}/libattention.so" ]]; then
-  echo "Building libattention.so..."
-  make -C "${SCRIPT_DIR}"
+if ! compgen -G "${ROOT}/libattention"*.so >/dev/null; then
+  echo "Building libattention*.so..."
+  make -C "${ROOT}"
 fi
 
 # Workload paths.
-ROC_OUT_DIR="${ROC_OUT_DIR:-${SCRIPT_DIR}/rocprof_out}"
+ROC_OUT_DIR="${ROC_OUT_DIR:-${ROOT}/rocprof_out}"
 WORKLOAD_NAME="${WORKLOAD_NAME:-$(date +%Y%m%d_%H%M%S)}"
 WORKLOAD_PATH="${ROC_OUT_DIR}/${WORKLOAD_NAME}"
 export WORKLOAD_PATH
@@ -65,7 +66,7 @@ mkdir -p "${WORKLOAD_PATH}"
 # Locate ISA HTML generator — prefer local copy, fall back to sibling conv3amd repo.
 FORMAT_ISA_PY="${SCRIPT_DIR}/rocprof_att_stats_to_isa_html.py"
 if [[ ! -f "${FORMAT_ISA_PY}" ]]; then
-  _sibling="$(cd "${SCRIPT_DIR}/.." && pwd)/conv3amd/rocprof_att_stats_to_isa_html.py"
+  _sibling="$(cd "${ROOT}/.." && pwd)/conv3amd/rocprof_att_stats_to_isa_html.py"
   [[ -f "${_sibling}" ]] && FORMAT_ISA_PY="${_sibling}"
 fi
 
@@ -84,7 +85,7 @@ generate_isa_html() {
 }
 
 export ROC_PROFILE_PYTHON="${PYTHON}"
-export ROC_PROFILE_SCRIPT="${SCRIPT_DIR}/runner.py"
+export ROC_PROFILE_SCRIPT="${ROOT}/runner.py"
 if [[ -z "${ROC_PROFILE_LD_PREFIX:-}" && -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
   export ROC_PROFILE_LD_PREFIX="${CONDA_PREFIX}/lib"
 fi

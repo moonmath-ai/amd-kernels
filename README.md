@@ -66,9 +66,8 @@ handling is bit- and position-identical with AITER for every rounding mode
 - `csrc/attention_kernel.hip` — the kernel (attention + V pre-transpose).
 - `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
-- `runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
-- `bench_table.py` — multi-shape sweep with median-over-passes timing.
-- `third_party/aiter/` — AITER as a git submodule, called through its Python API.
+- `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
+- `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
 
 ## Bench
 
@@ -135,29 +134,23 @@ python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5
 ### Running the bench from scratch
 
 ```sh
-# 1. clone with the AITER submodule
-#    (no recursion needed — we don't use AITER's own 3rdparty/composable_kernel)
 git clone https://github.com/moonmath-ai/cdna3-attention.git
 cd cdna3-attention
-git submodule update --init third_party/aiter
 
-# 2. python env. AITER JIT-compiles a Python-ABI-bound .so, so pin 3.11.
+# python env (ninja required for AITER JIT and our kernel build)
 conda create -n cdna3 python=3.11 ninja -y
 conda activate cdna3
 
-# 3. ROCm-built torch + AITER's runtime deps (skipping flydsl/matplotlib/pytest)
-pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
-pip install pandas pybind11 einops pyyaml psutil flydsl==0.1.3
+# install package + bench deps (torch, amd-aiter, numpy; optional max)
+pip install -e '.[bench]'
 
-# 4. install our package (compiles RTNA + RTNE + RTZ kernels via hipcc)
-pip install -e .
+# --- or with uv ---
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e '.[bench]'
 
-# 5. (optional) Modular MAX for the third bench column
-pip install max
-
-# 6. run. First call JIT-builds two AITER modules (~50s, then cached
-#    under third_party/aiter/aiter/jit/build/).
-python runner.py --warmup-iters 8 --benchmark-iters 30
+# run. First AITER call JIT-builds fmha modules (~50s, then cached under ~/.aiter/).
+python benchmark/runner.py --warmup-iters 8 --benchmark-iters 30
 ```
 
 `ninja` must be on `$PATH` for AITER's JIT, not just installed — the
