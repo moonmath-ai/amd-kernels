@@ -1,4 +1,5 @@
 """Wrapper that calls the compiled _C extension, with CPU fallback support."""
+
 import torch
 
 try:
@@ -43,32 +44,38 @@ def forward(
         if t.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be torch.bfloat16; got dtype={t.dtype}")
         if t.dim() != 4:
-            raise ValueError(f"{name} must be 4-D ({layout.upper()}); got shape={tuple(t.shape)}")
+            raise ValueError(
+                f"{name} must be 4-D ({layout.upper()}); got shape={tuple(t.shape)}"
+            )
 
     # CPU fallback: move to GPU, call _C, move result back
     if q.device.type == "cpu":
         # Ensure k, v are also on CPU
         if k.device.type != "cpu" or v.device.type != "cpu":
-            raise ValueError("q is on CPU but k or v is not; all must be on the same device")
-        
+            raise ValueError(
+                "q is on CPU but k or v is not; all must be on the same device"
+            )
+
         # Move to first available CUDA device
         device = torch.device("cuda:0")
         q_gpu = q.to(device)
         k_gpu = k.to(device)
         v_gpu = v.to(device)
         out_gpu = out.to(device) if out is not None else None
-        
+
         result_gpu = _C.forward(q_gpu, k_gpu, v_gpu, out_gpu, round_mode, layout)
         return result_gpu.cpu()
-    
+
     # GPU path: call _C directly
     elif q.device.type in ("cuda", "hip"):
         # Validate k, v on same device
         if k.device != q.device or v.device != q.device:
-            raise ValueError(f"q/k/v must be on the same device; got q={q.device}, k={k.device}, v={v.device}")
-        
+            raise ValueError(
+                f"q/k/v must be on the same device; got q={q.device}, k={k.device}, v={v.device}"
+            )
+
         return _C.forward(q, k, v, out, round_mode, layout)
-    
+
     else:
         raise NotImplementedError(
             f"Unsupported device {q.device!r}; expected 'cpu' or 'cuda'/'hip'"
@@ -113,6 +120,15 @@ def forward_lite(
     """
     # Currently raises an error from _C.forward_lite
     return _C.forward_lite(
-        q, k, v, read_list, write_list, threshold, phase,
-        must_do_list, out, round_mode, layout
+        q,
+        k,
+        v,
+        read_list,
+        write_list,
+        threshold,
+        phase,
+        must_do_list,
+        out,
+        round_mode,
+        layout,
     )

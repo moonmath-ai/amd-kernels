@@ -17,11 +17,11 @@ extern "C" {
   int launch_v_transpose_rtna(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
   int launch_attention_forward_rtna(const void* q, const void* k, const void* v, void* out,
                                     int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
-  
+
   int launch_v_transpose_rtne(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
   int launch_attention_forward_rtne(const void* q, const void* k, const void* v, void* out,
                                     int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
-  
+
   int launch_v_transpose_rtz(const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream);
   int launch_attention_forward_rtz(const void* q, const void* k, const void* v, void* out,
                                    int batch, int heads, int seq_len, int seq_len_kv, int head_dim, int layout, void* stream);
@@ -58,56 +58,56 @@ at::Tensor forward(
   check_tensor(q, "q");
   check_tensor(k, "k");
   check_tensor(v, "v");
-  
+
   // Validate round_mode
   if (round_mode != "rtna" && round_mode != "rtne" && round_mode != "rtz") {
     throw std::invalid_argument("round_mode must be 'rtna', 'rtne', or 'rtz', got '" + round_mode + "'");
   }
-  
+
   // Validate layout
   bool bshd = (layout == "bshd");
   if (!bshd && layout != "bhsd") {
     throw std::invalid_argument("layout must be 'bhsd' or 'bshd', got '" + layout + "'");
   }
   int layout_int = bshd ? 1 : 0;
-  
+
   // Extract dimensions (layout-aware)
   int sax = bshd ? 1 : 2;  // seq axis
   int hax = bshd ? 2 : 1;  // heads axis
-  
+
   int B = q.size(0);
   int H = q.size(hax);
   int Sq = q.size(sax);
   int D = q.size(3);
   int Skv = k.size(sax);
-  
+
   // Validate shapes
   if (D != 128) {
     throw std::invalid_argument("head_dim must be 128, got " + std::to_string(D));
   }
-  
+
   if (k.size(0) != B || k.size(hax) != H || k.size(3) != D) {
     std::ostringstream oss;
     oss << "k shape mismatch: expected batch=" << B << ", heads=" << H << ", head_dim=" << D
         << ", got k.shape=" << k.sizes();
     throw std::invalid_argument(oss.str());
   }
-  
+
   if (v.size(0) != B || v.size(hax) != H || v.size(sax) != Skv || v.size(3) != D) {
     std::ostringstream oss;
     oss << "v shape mismatch: must match k.shape, got v.shape=" << v.sizes() << ", k.shape=" << k.sizes();
     throw std::invalid_argument(oss.str());
   }
-  
+
   if (Sq <= 0 || Skv <= 0) {
     throw std::invalid_argument("seq_len must be positive, got Sq=" + std::to_string(Sq) + ", Skv=" + std::to_string(Skv));
   }
-  
+
   // Check devices match
   if (q.device() != k.device() || q.device() != v.device()) {
     throw std::invalid_argument("q, k, v must be on the same device");
   }
-  
+
   // Validate or allocate output
   at::Tensor out;
   if (out_.has_value()) {
@@ -124,19 +124,19 @@ at::Tensor forward(
   } else {
     out = at::empty_like(q);
   }
-  
+
   // Set device guard and get stream
   const c10::cuda::CUDAGuard device_guard(q.device());
   void* stream = (void*)at::cuda::getCurrentCUDAStream(q.device().index()).stream();
-  
+
   // Allocate v_t (per-head padded to 64-row boundary)
   int Skv_pad = ((Skv + 63) / 64) * 64;
   at::Tensor v_t = at::empty({B, H, Skv_pad, D}, v.options());
-  
+
   // Dispatch on round_mode
   int (*vt_fn)(const void*, void*, int, int, int, int, void*);
   int (*fwd_fn)(const void*, const void*, const void*, void*, int, int, int, int, int, int, void*);
-  
+
   if (round_mode == "rtna") {
     vt_fn = launch_v_transpose_rtna;
     fwd_fn = launch_attention_forward_rtna;
@@ -147,20 +147,20 @@ at::Tensor forward(
     vt_fn = launch_v_transpose_rtz;
     fwd_fn = launch_attention_forward_rtz;
   }
-  
+
   // Launch V transpose
   int rc = vt_fn(v.data_ptr(), v_t.data_ptr(), B * H * Skv, Skv, H, layout_int, stream);
   if (rc != 0) {
     throw std::runtime_error("launch_v_transpose returned error code " + std::to_string(rc));
   }
-  
+
   // Launch attention forward
   rc = fwd_fn(q.data_ptr(), k.data_ptr(), v_t.data_ptr(), out.data_ptr(),
               B, H, Sq, Skv, D, layout_int, stream);
   if (rc != 0) {
     throw std::runtime_error("launch_attention_forward returned error code " + std::to_string(rc));
   }
-  
+
   return out;
 }
 
@@ -186,7 +186,7 @@ at::Tensor forward_lite(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "moonmath_attention: ROCm CDNA3 (MI300X) fused attention kernel";
-  
+
   m.def("forward", &forward,
         "Fused forward attention: O = softmax(QK^T / sqrt(D)) V",
         py::arg("q"),
@@ -195,7 +195,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("out") = py::none(),
         py::arg("round_mode") = "rtna",
         py::arg("layout") = "bhsd");
-  
+
   m.def("forward_lite", &forward_lite,
         "LiteAttention forward with K-block skipping (not yet implemented)",
         py::arg("q"),

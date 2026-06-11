@@ -1,4 +1,5 @@
 """Build moonmath_attention._C extension via torch CUDAExtension (ROCm-only)."""
+
 import os
 import shutil
 from pathlib import Path
@@ -55,7 +56,8 @@ extra_compile_args = {
         f"--offload-arch={ARCH}",
         "-ffast-math",
         "-fno-math-errno",
-        "-mllvm", "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
     ],
 }
 

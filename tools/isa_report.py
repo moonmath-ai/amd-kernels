@@ -6,7 +6,7 @@ from __future__ import annotations
 import html
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 # Reference notes (order-of-magnitude; exact numbers vary by chip/voltage)
@@ -138,14 +138,26 @@ def main() -> int:
     out_html = asm.parent / "isa_attn_report.html"
     parts: list[str] = []
     h = parts.append
-    h(f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>ISA: {html.escape(kernel_name)}</title>")
-    h("<style>body{font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;margin:1.2rem;max-width:1200px}")
-    h("table{border-collapse:collapse;margin:0.5rem 0} th,td{border:1px solid #ccc;padding:4px 8px;font-size:13px}")
-    h("th{background:#eee} code{background:#f4f4f4;padding:1px 4px} .note{color:#444;font-size:14px}")
+    h(
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>ISA: {html.escape(kernel_name)}</title>"
+    )
+    h(
+        "<style>body{font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;margin:1.2rem;max-width:1200px}"
+    )
+    h(
+        "table{border-collapse:collapse;margin:0.5rem 0} th,td{border:1px solid #ccc;padding:4px 8px;font-size:13px}"
+    )
+    h(
+        "th{background:#eee} code{background:#f4f4f4;padding:1px 4px} .note{color:#444;font-size:14px}"
+    )
     h("</style></head><body>")
     h(f"<h1>gfx942 ISA report: <code>{html.escape(asm.name)}</code></h1>")
-    h(f"<p class='note'>Kernel symbol <code>{html.escape(kernel_name)}</code> starts at line ~{kernel_start} in the listing.</p>")
-    h("<h2>Instruction mix (approximate)</h2><table><tr><th>Category</th><th>Count</th></tr>")
+    h(
+        f"<p class='note'>Kernel symbol <code>{html.escape(kernel_name)}</code> starts at line ~{kernel_start} in the listing.</p>"
+    )
+    h(
+        "<h2>Instruction mix (approximate)</h2><table><tr><th>Category</th><th>Count</th></tr>"
+    )
     for k, v in counts.most_common():
         h(f"<tr><td>{html.escape(k)}</td><td>{v}</td></tr>")
     h("</table>")
@@ -164,7 +176,9 @@ def main() -> int:
     h("</table>")
 
     h("<h2>All <code>s_waitcnt</code> (order)</h2>")
-    h("<p>Column <em>Δlines</em> = source lines since previous wait — rough proxy for schedule distance.</p>")
+    h(
+        "<p>Column <em>Δlines</em> = source lines since previous wait — rough proxy for schedule distance.</p>"
+    )
     h("<table><tr><th>#</th><th>line</th><th>Δlines</th><th>instruction</th></tr>")
     for i, w in enumerate(wait_pairs, 1):
         h(
@@ -174,17 +188,29 @@ def main() -> int:
     h("</table>")
 
     h("<h2>Parallelism / schedule observations</h2><ul>")
-    h("<li><b>K / V tile to LDS</b>: long runs of <code>buffer_load_dword … lds</code> with interleaved "
-      "<code>m0</code> updates — many in-flight VMEM ops.</li>")
-    h("<li><b>Main loop</b>: watch the <code>s_waitcnt vmcnt(...)</code> points before LDS-backed "
-      "consumption; those are the schedule boundaries that matter most for source mapping.</li>")
-    h("<li><b>Q in VGPRs</b>: loaded once; overlaps initial K fills (Q global read hides under K VMEM).</li>")
-    h("<li><b>V overlap</b>: after QK, V tiles issue to the same LDS lines as K; softmax "
-      "(<code>v_exp_f32</code>, <code>v_fma_f32</code>, …) is scheduled in the same region as "
-      "<code>buffer_load_dword</code> from V — look for VMEM loads a few dozen lines before "
-      "<code>v_exp_f32</code> in the loop body (not a hard barrier between V fill and exp).</li>")
-    h("<li><b>PV</b>: <code>s_waitcnt vmcnt(0)</code> before PV MFMAs drains V→LDS; PV then uses LDS reads + MFMA.</li>")
-    h("<li><b>QK/PV MFMA</b>: staggered LDS reads + <code>s_waitcnt lgkmcnt</code> around MFMA issue groups.</li>")
+    h(
+        "<li><b>K / V tile to LDS</b>: long runs of <code>buffer_load_dword … lds</code> with interleaved "
+        "<code>m0</code> updates — many in-flight VMEM ops.</li>"
+    )
+    h(
+        "<li><b>Main loop</b>: watch the <code>s_waitcnt vmcnt(...)</code> points before LDS-backed "
+        "consumption; those are the schedule boundaries that matter most for source mapping.</li>"
+    )
+    h(
+        "<li><b>Q in VGPRs</b>: loaded once; overlaps initial K fills (Q global read hides under K VMEM).</li>"
+    )
+    h(
+        "<li><b>V overlap</b>: after QK, V tiles issue to the same LDS lines as K; softmax "
+        "(<code>v_exp_f32</code>, <code>v_fma_f32</code>, …) is scheduled in the same region as "
+        "<code>buffer_load_dword</code> from V — look for VMEM loads a few dozen lines before "
+        "<code>v_exp_f32</code> in the loop body (not a hard barrier between V fill and exp).</li>"
+    )
+    h(
+        "<li><b>PV</b>: <code>s_waitcnt vmcnt(0)</code> before PV MFMAs drains V→LDS; PV then uses LDS reads + MFMA.</li>"
+    )
+    h(
+        "<li><b>QK/PV MFMA</b>: staggered LDS reads + <code>s_waitcnt lgkmcnt</code> around MFMA issue groups.</li>"
+    )
     h("</ul>")
 
     full_text = asm.read_text(encoding="utf-8", errors="replace")
