@@ -26,3 +26,10 @@ repos:
       - id: codespell
         exclude: '^(csrc/|.*\.ipynb$)'
         args: ['-L', 'VALU,hsa,nd,te,inout']
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.7
+    hooks:
+      - id: clang-format
+        files: ^csrc/.*\.(cpp|hpp|hip)$
+        # Check only: fail on style violations without rewriting the kernels.
+        args: [--style=file, --dry-run, --Werror]
