@@ -36,3 +36,12 @@ repos:
         types_or: [file]
         # Autoformat: rewrite the files in place to match .clang-format.
         args: [-i, --style=file]
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: python3 -m pytest tests/ -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
