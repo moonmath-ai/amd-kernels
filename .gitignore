@@ -1,0 +1,34 @@
+# Compiled libraries / objects
+*.so
+*.o
+*.out
+
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# hipcc --save-temps output
+*-hip-amdgcn-amd-amdhsa-gfx942.bc
+*-hip-amdgcn-amd-amdhsa-gfx942.hipi
+*-hip-amdgcn-amd-amdhsa-gfx942.o
+*-hip-amdgcn-amd-amdhsa-gfx942.out
+*-hip-amdgcn-amd-amdhsa-gfx942.out.resolution.txt
+*-hip-amdgcn-amd-amdhsa-gfx942.s
+*-host-x86_64-unknown-linux-gnu.bc
+*-host-x86_64-unknown-linux-gnu.hipi
+*-host-x86_64-unknown-linux-gnu.o
+*-host-x86_64-unknown-linux-gnu.s
+*.hip-hip-amdgcn-amd-amdhsa.hipfb
+
+# Profiling output
+rocprof_out/
+.rocprofv3/
+.rocprof_app_*.sh
+
+# Local scratch
+temp/

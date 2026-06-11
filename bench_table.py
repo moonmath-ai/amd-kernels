@@ -19,24 +19,20 @@ from aiter import flash_attn_func  # noqa: E402
 import moonmath_attention as ma     # noqa: E402
 
 AITER_RTNE = 0
+AITER_RTNA = 1
 AITER_RTZ  = 2
 
 # Shapes: (label, B, H, S, D). All D=128 since AITER v3 is hd128-only.
 SHAPES = [
-    ("small",     2, 16,  2048, 128),
-    ("medium",    2, 24,  4096, 128),
     ("std",       2, 24,  8192, 128),
     ("long",      2, 24, 16384, 128),
-    ("xlong",     2, 24, 32768, 128),
-    ("wide",      1, 32,  8192, 128),
     ("wide-long", 1, 32, 16384, 128),
-    ("batch",     4, 16,  4096, 128),
     ("batch-long",4, 16, 16384, 128),
     ("70B",       1, 64, 16384, 128),
-    ("xxlong",    2, 16, 65536, 128),
-    ("84K",       2,  8, 86016, 128),
-    ("128K",      1, 16, 131072, 128),
-    ("256K",      1,  8, 262144, 128),
+    ("xlong",     2, 24, 32768, 128),
+    ("64k",       2, 16, 65536, 128),
+    ("86k",       2,  8, 86016, 128),
+    ("128k",      1, 16, 131072, 128),
 ]
 
 
@@ -62,9 +58,10 @@ def time_fn_passes(fn, warmup, iters, passes):
     return samples[len(samples) // 2]
 
 
+from runner import make_inputs   # shared input generator (BSHD)
+
 def make_qkv(B, H, S, D, device):
-    torch.manual_seed(42)
-    return tuple(torch.randn(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+    return make_inputs(B, H, S, D, device, "realistic")
 
 
 # ---- Modular MAX flash_attention_gpu ------------------------------------------
@@ -142,23 +139,30 @@ def bench_shape(B, H, S, D, warmup, iters):
     if not torch.cuda.is_available():
         sys.exit("Need ROCm-built torch")
     device = torch.device("cuda")
+    # BSHD (B, S, H, D) — consumed natively by ours, AITER and MAX; no transposes.
     q, k, v = make_qkv(B, H, S, D, device)
-    q_a = q.transpose(1, 2).contiguous()
-    k_a = k.transpose(1, 2).contiguous()
-    v_a = v.transpose(1, 2).contiguous()
 
     out_rtne = torch.empty_like(q)
+    out_rtna = torch.empty_like(q)
     out_rtz  = torch.empty_like(q)
     sink = {}
 
     fns = {
-        "hip_rtne":   lambda: ma.forward(q, k, v, out=out_rtne, round_mode="rtne"),
-        "hip_rtz":    lambda: ma.forward(q, k, v, out=out_rtz,  round_mode="rtz"),
+        "hip_rtne":   lambda: ma.forward(q, k, v, out=out_rtne, round_mode="rtne", layout="bshd"),
+        "hip_rtna":   lambda: ma.forward(q, k, v, out=out_rtna, round_mode="rtna", layout="bshd"),
+        "hip_rtz":    lambda: ma.forward(q, k, v, out=out_rtz,  round_mode="rtz",  layout="bshd"),
         "aiter_rtne": lambda: sink.__setitem__("a_rtne",
-                          flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
+                          flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
+        "aiter_rtna": lambda: sink.__setitem__("a_rtna",
+                          flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNA)),
         "aiter_rtz":  lambda: sink.__setitem__("a_rtz",
-                          flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
+                          flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
+
+    passes = warmup_passes  # populated by caller via globals
+    # HIP + AITER first on a MAX-free GPU: the MAX runtime, once initialized, perturbs
+    # later measurements (observed on AITER RTZ) — so it is loaded and timed last.
+    timings = {name: time_fn_passes(fn, warmup, iters, passes) for name, fn in fns.items()}
 
     has_max = False
     try:
@@ -166,16 +170,15 @@ def bench_shape(B, H, S, D, warmup, iters):
         _ = _max_session(mod)
         model = _max_model(B, S, H, D)
         acc = mod["Accelerator"](0)
-        bq = _torch_to_max_buf(q_a, mod, acc)
-        bk = _torch_to_max_buf(k_a, mod, acc)
-        bv = _torch_to_max_buf(v_a, mod, acc)
+        bq = _torch_to_max_buf(q, mod, acc)
+        bk = _torch_to_max_buf(k, mod, acc)
+        bv = _torch_to_max_buf(v, mod, acc)
         fns["max"] = lambda: model(bq, bk, bv)[0]
+        torch.cuda.synchronize()
+        timings["max"] = time_fn_passes(fns["max"], warmup, iters, passes)
         has_max = True
     except Exception as exc:
         print(f"# MAX skipped for ({B},{H},{S},{D}): {type(exc).__name__}: {exc}", file=sys.stderr)
-
-    passes = warmup_passes  # populated by caller via globals
-    timings = {name: time_fn_passes(fn, warmup, iters, passes) for name, fn in fns.items()}
     flops = 4.0 * B * H * S * S * D
     tf = {name: flops / (ms * 1e-3) / 1e12 for name, ms in timings.items()}
 
@@ -183,18 +186,20 @@ def bench_shape(B, H, S, D, warmup, iters):
     # comparand). Same-rounding pairs: ours-RTNE vs AITER-RTNE,
     # ours-RTZ vs AITER-RTZ. MAX has no rounding selector → compared to
     # AITER-RTNE only.
-    aiter_rtne_bhsd = sink["a_rtne"].transpose(1, 2).contiguous()
-    aiter_rtz_bhsd  = sink["a_rtz" ].transpose(1, 2).contiguous()
+    a_rtne = sink["a_rtne"][0] if isinstance(sink["a_rtne"], (tuple, list)) else sink["a_rtne"]
+    a_rtna = sink["a_rtna"][0] if isinstance(sink["a_rtna"], (tuple, list)) else sink["a_rtna"]
+    a_rtz  = sink["a_rtz" ][0] if isinstance(sink["a_rtz" ], (tuple, list)) else sink["a_rtz" ]
     err = {}
-    err["hip_rtne"] = diff_stats(out_rtne, aiter_rtne_bhsd)
-    err["hip_rtz"]  = diff_stats(out_rtz,  aiter_rtz_bhsd)
+    err["hip_rtne"] = diff_stats(out_rtne, a_rtne)
+    err["hip_rtna"] = diff_stats(out_rtna, a_rtna)
+    err["hip_rtz"]  = diff_stats(out_rtz,  a_rtz)
     if has_max:
         DType = mod["DType"]
         out_buf = fns["max"]()
         u16 = out_buf.view(DType.uint16, out_buf.shape).to_numpy()
         f32 = (u16.astype(np.uint32) << np.uint32(16)).view(np.float32)
-        max_t = torch.from_numpy(np.ascontiguousarray(np.transpose(f32, (0, 2, 1, 3))))
-        err["max"] = diff_stats(max_t, aiter_rtne_bhsd)
+        max_t = torch.from_numpy(np.ascontiguousarray(f32))
+        err["max"] = diff_stats(max_t, a_rtne.float().cpu())
     return timings, tf, err
 
 
@@ -254,6 +259,8 @@ def main():
         max_str = f"{timings['max']:.3f}" if "max" in timings else "—"
         rows.append([shape_str, "RTNE", f"{timings['hip_rtne']:.3f}",
                      f"{timings['aiter_rtne']:.3f}", max_str])
+        rows.append([shape_str, "RTNA", f"{timings['hip_rtna']:.3f}",
+                     f"{timings['aiter_rtna']:.3f}", max_str])
         rows.append([shape_str, "RTZ",  f"{timings['hip_rtz']:.3f}",
                      f"{timings['aiter_rtz']:.3f}", max_str])
 
@@ -264,6 +271,7 @@ def main():
             return f"{mx:.2e} / {rm:.2e}"
 
         acc_rows.append([shape_str, "RTNE", fmt_err("hip_rtne"), fmt_err("max")])
+        acc_rows.append([shape_str, "RTNA", fmt_err("hip_rtna"), "—"])
         acc_rows.append([shape_str, "RTZ",  fmt_err("hip_rtz"),  "—"])
 
     print(f"**Forward attention runtime (ms per call, lower is better; "

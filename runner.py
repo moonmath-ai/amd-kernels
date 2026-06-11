@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark CDNA3 HIP attention (RTNE + RTZ) vs AITER's flash_attn_func, with
+"""Benchmark CDNA3 HIP attention (RTNA + RTNE + RTZ) vs AITER's flash_attn_func, with
 optional Modular MAX `flash_attention_gpu` if `max` is installed.
 
 Requires ROCm-built torch, the AITER submodule under third_party/aiter, and
@@ -21,32 +21,48 @@ from aiter import flash_attn_func  # noqa: E402
 
 import moonmath_attention as ma  # noqa: E402
 
-# AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA, 2=RTZ.
+# AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA (default), 2=RTZ.
 AITER_RTNE = 0
+AITER_RTNA = 1
 AITER_RTZ  = 2
 
 
 def make_inputs(B, H, S, D, device, pattern):
-    """Generate (Q, K, V) on `device` in (B, H, S, D) layout, bf16."""
+    """Generate (Q, K, V) on `device` in (B, S, H, D) layout, bf16 — consumed natively by both
+    OURS (layout="bshd") and AITER, no transpose either side."""
     torch.manual_seed(42)
     if pattern == "random":
-        return tuple(torch.randn(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+        return tuple(torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+    if pattern == "realistic":
+        # Log-normal K-row norms (sigma=0.6) make attention peaked enough that
+        # the online-softmax skip-rescale gate fires on ~10% of (q-tile, K-block)
+        # pairs — a realistic workload that exercises the rescale path, unlike
+        # plain `random` (Gaussian K-norms) which almost never trips the gate.
+        # Q, V ~ N(0, 1); K direction uniform, magnitude exp(N(0, sigma))·√D.
+        sigma = 0.6
+        q = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
+        k_dir = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
+        k_dir = k_dir / k_dir.norm(dim=-1, keepdim=True)
+        log_norm = torch.randn(B, S, H, 1, dtype=torch.float32, device=device) * sigma
+        k = k_dir * (torch.exp(log_norm) * (D ** 0.5))
+        v = torch.randn(B, S, H, D, dtype=torch.float32, device=device)
+        return q.bfloat16(), k.bfloat16(), v.bfloat16()
     if pattern == "ones":
-        return tuple(torch.ones(B, H, S, D, dtype=torch.bfloat16, device=device) for _ in range(3))
+        return tuple(torch.ones(B, S, H, D, dtype=torch.bfloat16, device=device) for _ in range(3))
     if pattern == "linear":
-        s_idx = (torch.arange(S, dtype=torch.float32, device=device) / S).view(1, 1, S, 1)
+        s_idx = (torch.arange(S, dtype=torch.float32, device=device) / S).view(1, S, 1, 1)
         d_idx = (torch.arange(D, dtype=torch.float32, device=device) / D).view(1, 1, 1, D)
-        q = (s_idx + 0.1 * d_idx).expand(B, H, S, D).contiguous().bfloat16()
-        k = s_idx.expand(B, H, S, D).contiguous().bfloat16()
-        v = (s_idx + d_idx).expand(B, H, S, D).contiguous().bfloat16()
+        q = (s_idx + 0.1 * d_idx).expand(B, S, H, D).contiguous().bfloat16()
+        k = s_idx.expand(B, S, H, D).contiguous().bfloat16()
+        v = (s_idx + d_idx).expand(B, S, H, D).contiguous().bfloat16()
         return q, k, v
     if pattern == "diag":
         eye = torch.eye(D, dtype=torch.float32, device=device)
-        qk = eye.repeat(S // D + 1, 1)[:S]
+        qk = eye.repeat(S // D + 1, 1)[:S]                                                # (S, D)
         v_pat = (torch.arange(S, dtype=torch.float32, device=device) / S).unsqueeze(1).expand(S, D)
-        q = qk.expand(B, H, S, D).contiguous().bfloat16()
+        q = qk.view(1, S, 1, D).expand(B, S, H, D).contiguous().bfloat16()
         k = q.clone()
-        v = v_pat.expand(B, H, S, D).contiguous().bfloat16()
+        v = v_pat.view(1, S, 1, D).expand(B, S, H, D).contiguous().bfloat16()
         return q, k, v
     raise ValueError(f"Unknown input pattern: {pattern}")
 
@@ -123,58 +139,48 @@ def _torch_bshd_to_max_buf(t_bshd, mod, acc):
     return Buffer.from_numpy(u16).view(DType.bfloat16, t_bshd.shape).to(acc)
 
 
-def _max_buf_to_fp32_bhsd(buf, mod):
-    """MAX bf16 Buffer (B,S,H,D) → fp32 torch tensor (B,H,S,D)."""
+def _max_buf_to_fp32(buf, mod):
+    """MAX bf16 Buffer (B,S,H,D) → fp32 torch tensor (B,S,H,D)."""
     DType = mod["DType"]
     u16 = buf.view(DType.uint16, buf.shape).to_numpy()
     f32 = (u16.astype(np.uint32) << np.uint32(16)).view(np.float32)
-    return torch.from_numpy(np.ascontiguousarray(np.transpose(f32, (0, 2, 1, 3))))
+    return torch.from_numpy(np.ascontiguousarray(f32))
 
 
-def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_max=True):
+def run(B=2, H=24, S=16384, D=128, warmup=8, iters=30, pattern="random", include_max=True):
     if not torch.cuda.is_available():
         sys.exit("Need ROCm-built torch with a HIP device.")
     device = torch.device("cuda")
 
+    # (B, S, H, D) — consumed natively by OURS (layout="bshd"), AITER and MAX. No transpose anywhere.
     q, k, v = make_inputs(B, H, S, D, device, pattern)
-
-    # AITER + MAX expect (B, S, H, D); transpose once outside the timed loop.
-    q_a = q.transpose(1, 2).contiguous()
-    k_a = k.transpose(1, 2).contiguous()
-    v_a = v.transpose(1, 2).contiguous()
 
     flops = 4.0 * B * H * S * S * D
 
     # HIP: preallocate output per variant — allocation outside the timed loop;
     # the correctness section reuses each buffer's last value from the loop.
-    # AITER's high-level wrapper allocates internally; the timing reflects that.
+    # ma.forward runs the L1V pipeline: it pre-transposes V into V_t (an extra
+    # launch_v_transpose kernel) and then the attention kernel — so the timed
+    # HIP figure INCLUDES the V-transpose precompute. AITER's high-level wrapper
+    # allocates + transposes V internally too, so the timing is apples-to-apples.
+    out_hip_rtna = torch.empty_like(q)
     out_hip_rtne = torch.empty_like(q)
     out_hip_rtz  = torch.empty_like(q)
 
-    aiter_last = {"rtne": None, "rtz": None}
+    aiter_last = {"rtna": None, "rtne": None, "rtz": None}
     fns = {
-        "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne"),
-        "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz"),
-        "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
-        "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q_a, k_a, v_a, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
+        "HIP   RTNA": lambda: ma.forward(q, k, v, out=out_hip_rtna, round_mode="rtna", layout="bshd"),
+        "HIP   RTNE": lambda: ma.forward(q, k, v, out=out_hip_rtne, round_mode="rtne", layout="bshd"),
+        "HIP   RTZ":  lambda: ma.forward(q, k, v, out=out_hip_rtz,  round_mode="rtz",  layout="bshd"),
+        "AITER RTNA": lambda: aiter_last.__setitem__("rtna", flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNA)),
+        "AITER RTNE": lambda: aiter_last.__setitem__("rtne", flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTNE)),
+        "AITER RTZ":  lambda: aiter_last.__setitem__("rtz",  flash_attn_func(q, k, v, causal=False, how_v3_bf16_cvt=AITER_RTZ)),
     }
 
-    max_mod = max_skip_reason = None
-    bq = bk = bv = None
-    if include_max:
-        try:
-            max_mod = _load_max_modules()
-            session = _max_session(max_mod)
-            model = _max_model(B, S, H, D, max_mod, session)
-            acc = max_mod["Accelerator"](0)
-            bq = _torch_bshd_to_max_buf(q_a, max_mod, acc)
-            bk = _torch_bshd_to_max_buf(k_a, max_mod, acc)
-            bv = _torch_bshd_to_max_buf(v_a, max_mod, acc)
-            fns["MAX"] = lambda: model(bq, bk, bv)[0]
-        except (ImportError, OSError, RuntimeError) as exc:
-            max_skip_reason = f"{type(exc).__name__}: {exc}"
-            max_mod = None
-
+    # Time HIP + aiter on a CLEAN process FIRST — MAX is not even imported yet. Modular's MAX
+    # runtime, once initialized, leaves persistent GPU state that perturbs later measurements
+    # (observed: aiter RTZ inflated ~12→18 ms in some envs while every other row stayed put). By
+    # measuring HIP/aiter before any MAX load, those numbers are artifact-free regardless of env.
     timings = {name: time_fn(fn, warmup, iters) for name, fn in fns.items()}
 
     def diff_stats(a, b):
@@ -182,24 +188,43 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
         d = (a - b).abs()
         return d.max().item(), d.pow(2).mean().sqrt().item()
 
-    # Buffers already hold each kernel's last output from the timing loop.
-    # Re-layout AITER outputs from (B, S, H, D) to (B, H, S, D) for comparison.
-    aiter_rtne_bhsd = aiter_last["rtne"].transpose(1, 2).contiguous()
-    aiter_rtz_bhsd  = aiter_last["rtz"].transpose(1, 2).contiguous()
-    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_rtne_bhsd)
-    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_rtz_bhsd)
+    # All outputs are (B, S, H, D) — compare directly.
+    rtna_max, rtna_rmse = diff_stats(out_hip_rtna, aiter_last["rtna"])
+    rtne_max, rtne_rmse = diff_stats(out_hip_rtne, aiter_last["rtne"])
+    rtz_max,  rtz_rmse  = diff_stats(out_hip_rtz,  aiter_last["rtz"])
 
+    # MAX (Modular flash_attention_gpu) is loaded + timed LAST, after the HIP/aiter numbers above
+    # are fully recorded, so its runtime init can no longer skew them. It is timed in isolation.
+    max_skip_reason = None
     out_max_f32 = None
-    if max_mod is not None:
-        out_max_f32 = _max_buf_to_fp32_bhsd(fns["MAX"](), max_mod)
-        max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
-        max_vs_aiter = diff_stats(out_max_f32, aiter_rtne_bhsd)
+    if include_max:
+        try:
+            torch.cuda.synchronize()   # drain all HIP/aiter work before MAX touches the GPU
+            max_mod = _load_max_modules()
+            session = _max_session(max_mod)
+            model = _max_model(B, S, H, D, max_mod, session)
+            acc = max_mod["Accelerator"](0)
+            bq = _torch_bshd_to_max_buf(q, max_mod, acc)
+            bk = _torch_bshd_to_max_buf(k, max_mod, acc)
+            bv = _torch_bshd_to_max_buf(v, max_mod, acc)
+            max_fn = lambda: model(bq, bk, bv)[0]
+            timings["MAX"] = time_fn(max_fn, warmup, iters)
+            out_max_f32 = _max_buf_to_fp32(max_fn(), max_mod)
+            # MAX rounds to-nearest — verified by exact bf16-bit match: RTNA ≡ RTNE (both ~50% vs MAX),
+            # far above RTZ (~16%). Compare against RTNE (the round-to-nearest reference).
+            max_vs_hip   = diff_stats(out_max_f32, out_hip_rtne)
+            max_vs_aiter = diff_stats(out_max_f32, aiter_last["rtne"])
+        except (ImportError, OSError, RuntimeError) as exc:
+            max_skip_reason = f"{type(exc).__name__}: {exc}"
+            out_max_f32 = None
 
-    print(f"inputs={pattern}  shape=({B},{H},{S},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
+    print(f"inputs={pattern}  BSHD shape=({B},{S},{H},{D})  flops={flops:.3e} (4*B*H*S^2*D)")
     print(f"              ms      TFLOP/s    ratios")
     for name, ms in timings.items():
         tflops = flops / (ms * 1e-3) / 1e12
-        if name == "HIP   RTNE":
+        if name == "HIP   RTNA":
+            ratios = f"HIP/AITER {ms / timings['AITER RTNA']:.2f}x"
+        elif name == "HIP   RTNE":
             ratios = f"HIP/AITER {ms / timings['AITER RTNE']:.2f}x"
         elif name == "HIP   RTZ":
             ratios = f"HIP/AITER {ms / timings['AITER RTZ']:.2f}x"
@@ -210,7 +235,7 @@ def run(B=2, H=24, S=8192, D=128, warmup=8, iters=30, pattern="random", include_
             ratios = ""
         print(f"{name:11s} {ms:.4f}   {tflops:6.1f}    {ratios}")
 
-    print(f"HIP   vs AITER (max_abs / rmse):  RTNE {rtne_max:.2e} / {rtne_rmse:.2e}   RTZ {rtz_max:.2e} / {rtz_rmse:.2e}")
+    print(f"HIP   vs AITER (max_abs / rmse):  RTNA {rtna_max:.2e} / {rtna_rmse:.2e}   RTNE {rtne_max:.2e} / {rtne_rmse:.2e}   RTZ {rtz_max:.2e} / {rtz_rmse:.2e}")
     if out_max_f32 is not None:
         print(f"MAX   vs HIP   RTNE (max_abs / rmse):  {max_vs_hip[0]:.2e} / {max_vs_hip[1]:.2e}")
         print(f"MAX   vs AITER RTNE (max_abs / rmse):  {max_vs_aiter[0]:.2e} / {max_vs_aiter[1]:.2e}")
@@ -222,11 +247,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Benchmark HIP attention vs AITER (and optional MAX)")
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--heads", type=int, default=24)
-    ap.add_argument("--seq-len", type=int, default=8192)
+    ap.add_argument("--seq-len", type=int, default=16384)
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--benchmark-iters", type=int, default=20)
     ap.add_argument("--warmup-iters", type=int, default=3)
-    ap.add_argument("--inputs", choices=["random", "ones", "linear", "diag"], default="random")
+    ap.add_argument("--inputs", choices=["random", "realistic", "ones", "linear", "diag"], default="random")
     ap.add_argument("--no-max", action="store_true",
                     help="Do not run Modular MAX flash_attention_gpu (if installed)")
     args = ap.parse_args()
