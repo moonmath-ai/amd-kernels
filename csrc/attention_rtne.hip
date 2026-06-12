@@ -4,6 +4,7 @@
 
 #define BF16_ROUND RTNE
 #define launch_attention_forward launch_attention_forward_rtne
+#define launch_attention_forward_lite launch_attention_forward_lite_rtne
 #define launch_v_transpose launch_v_transpose_rtne
 
 #include "attention_kernel.hip"

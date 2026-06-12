@@ -300,6 +300,9 @@ __device__ __forceinline__ auto seq_layout(int heads) {
 constexpr int Q2HalfTiles = HeadDimTiles / 2;                        // lo→hi d-tile offset (d_pair vs d_pair+4)
 constexpr int Q2LdsDwords = NumWaves * HeadDimTiles * WaveSize * 2;  // 8192 dwords = whole qg2 (32 KB)
 constexpr auto Q2Lds = opus::make_layout(Shape3, strides<HeadDimTiles * WaveSize * 2, WaveSize * 2, 2>());
+// LITE skip-vote ring: only the live window {step, step-1} is ever read, so depth 2 suffices.
+// It reuses the 4 KB lds_q2 slot freed by evicting qg2's last d-tile to a VGPR (no extra LDS).
+constexpr int VerdictRing = 2;
 
 // ─── Grid + MFMA thread→fragment index maps ─────────────────────────────────
 // Same rule as the memory layouts above (offset = Σ coordᵢ·strideᵢ) but these
@@ -460,7 +463,9 @@ __device__ __forceinline__ void softmax_update(
   row_l = vfma_f32(row_l, rescale, bsum);
 }
 
-template <bool kBSHD>
+constexpr int NumCUs = 304;
+
+template <bool kBSHD, bool isLite = false>
 __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     const bf16_t* __restrict__ Q,
     const bf16_t* __restrict__ K,
@@ -469,7 +474,13 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     int seq_len,
     int seq_len_kv,
     float scale_log2e,  // seq_len = Q rows; seq_len_kv = K/V rows (cross-attn)
-    int heads           // #heads — only needed for BSHD addressing (kBSHD)
+    int heads,          // #heads — only needed for BSHD addressing (kBSHD)
+    // ── LiteAttention skip (isLite only; dense passes the defaults) ──
+    const int16_t* __restrict__ read_list = nullptr,     // this phase's RLE keep-list (one row per CTA)
+    int16_t* __restrict__ write_list = nullptr,          // RLE keep-list emitted for the next timestep
+    const int16_t* __restrict__ must_do_list = nullptr,  // global force-compute ranges [len,s0,e0,…] (nullable)
+    float thr = 0.f,
+    int phase = 0  // skip threshold (log2) + reverse-list phase
 ) {
   // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
   // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
@@ -496,11 +507,13 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   const int num_bh = gridDim.y;
   const int wg_id_raw = blockIdx.y * num_q_blocks + blockIdx.x;
   const int num_wgs = num_q_blocks * num_bh;
-  // Head-first chiplet swizzle co-locates a (B,H)'s q-blocks on one XCD's L2
-  // (~+1.4% @ moderate S) so K+V stay resident.
-  const int wg_id = chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
-  const int q_block = wg_id % num_q_blocks;   // which q-block
-  const int bh_index = wg_id / num_q_blocks;  // which (batch·head)
+  // Block selection (2-D full grid). lite uses identity — per-head-uneven sparsity makes the chiplet
+  // swizzle HARMFUL (dense heads' XCDs saturate while sparse idle: 0.83x); identity spreads a head's
+  // q-tiles across all 8 XCDs. Dense uses the head-first chiplet swizzle (co-locates a (B,H)'s
+  // q-blocks on one XCD's L2, ~+1.4% @ moderate S).
+  const int wg_id = isLite ? wg_id_raw : chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
+  const int q_block = wg_id % num_q_blocks;
+  const int bh_index = wg_id / num_q_blocks;
 
   // Q-tile ownership: each wave owns QTilesPerWave (=3) 16-row q-tiles. For each,
   // q_tile_start_row is the absolute seq-row where that tile begins — a per-tile
@@ -520,6 +533,10 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // ceil block count; last_kv_rows ∈ [1,64] = valid rows in the last (partial) K/V block.
   const int num_kv_blocks = (seq_len_kv + KvBlockRows - 1) / KvBlockRows;
   const int last_kv_rows = seq_len_kv - (num_kv_blocks - 1) * KvBlockRows;
+  // KV stride/offset: walk all blocks (stride 1, offset 0). For lite the cursor applies them to KEPT
+  // blocks; for dense it's plain arithmetic. The whole stream is [0, num_kv_blocks).
+  const int kv_stride = 1;
+  const int kv_offset = 0;
 
   // Cross-attention offsets. Q/K/Out keep the TRUE seq lens with their SRD bounded to the valid
   // byte extent: a partial last q-tile / K block (rows past the true seq len) then reads 0 /
@@ -544,9 +561,13 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // BHSD: per-head contiguous (seq·HeadDim·2). BSHD: rows interleaved → ×heads addressable span.
   const uint32_t q_bytes = (uint32_t)((long long)seq_len * (kBSHD ? heads : 1) * HeadDim * 2);
   const uint32_t kv_bytes = (uint32_t)((long long)seq_len_kv * (kBSHD ? heads : 1) * HeadDim * 2);
+  // V_t is the kernel's per-head-contiguous layout (v_transpose output, padded to num_kv_blocks·64
+  // rows) regardless of input layout. Bound the SRD to that span so a stray pv offset CLAMPS to 0
+  // instead of faulting into unmapped memory (Q/K/Out are bounded too; V must be as well).
+  const uint32_t v_bytes = (uint32_t)((long long)num_kv_blocks * KvBlockRows * HeadDim * 2);
   const auto q_buffer = make_buffer(Q + bh_offset_q, q_bytes);
   const auto k_buffer = make_buffer(K + bh_offset_kv, kv_bytes);
-  const auto v_buffer = make_buffer(V + bh_offset_v);
+  const auto v_buffer = make_buffer(V + bh_offset_v, v_bytes);
   const auto out_buffer = make_buffer(Out + bh_offset_q, q_bytes);
 
   constexpr int KLdsBufDwords = KvBlockRows * KLdsStrideDwords;  // 4096 dwords/buffer (64 rows × 64)
@@ -556,10 +577,14 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // q-group 2 (all 8 d-tiles) is parked in one 32 KB LDS array (Q2Lds, d-tile t at slot t). qk
   // reads the lo MFMA operand from d-tile d_pair, the hi operand from d-tile d_pair+Q2HalfTiles.
   // 32 KB K + 32 KB qg2 = exactly 64 KB LDS. qg2 reads (lgkmcnt) overlap pv's V loads (vmcnt).
-  __shared__ uint32_t lds_q2[Q2LdsDwords];      // 32 KB (entire qg2, d-tiles 0..7)
-  auto load_q2 = [&](int d_tile) -> bf16x4_t {  // d-tile d_tile of qg2 for this lane
+  __shared__ uint32_t lds_q2[Q2LdsDwords];      // 32 KB (entire qg2, d-tiles 0..7; lite: 0..6)
+  auto load_q2 = [&](int d_tile) -> bf16x4_t {  // d-tile d_tile of qg2 for this lane (d_tile < last for lite)
     return *reinterpret_cast<const bf16x4_t*>(&lds_q2[Q2Lds(wave_id, d_tile, lane)]);
   };
+  // LITE skip-vote ring, reusing the lds_q2 slot of the evicted last d-tile (unused for Q in lite).
+  // Each wave's votes live in its own d-tile-(last) region → no cross-wave write contention; the
+  // record() AND-of-8 reads one dword per wave. Stored as a dword (0/1) to avoid sub-dword RMW.
+  auto sverdict = [&](int w, int r) -> uint32_t& { return lds_q2[Q2Lds(w, HeadDimTiles - 1, 0) + r]; };
 
   // K[kv_block] HBM→LDS into double-buffer half `k_buf` (group B). Wave w owns rows
   // [w·16, +16); for each, its 64 lanes stream one full K row. The XOR swizzle is realized
@@ -605,10 +630,64 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     }
   };
 
-  // Prologue: first processed K-block → LDS (group B only); group A idle until iter 1.
-  const int first_blk = 0;
-  const bool any = (num_kv_blocks > 0);
-  if (!group_a && any) direct_lds_k(first_blk, 0);
+  // ── LITE read-list setup (RLE keep-list, one row per CTA) ────────────────────
+  // The skip-list is row-major [bh, q_block, num_k_blocks] in HBM; lbase is this CTA's row
+  // origin. read_list[lbase] = RLE length; the ranges follow. lstep is the reverse-list
+  // direction (skip_list.h: phase 1 ascends, phase 0 descends). rl() reads the cursor through
+  // to_scalar so it stays in SGPRs, off the MFMA loop's VGPR budget.
+  const int lstep = phase ? 1 : -1;
+  long long lbase = 0;
+  int list_len = 0;
+  auto rl = [&](int idx) -> int { return to_scalar((int)read_list[lbase + idx]); };
+
+  // Lite cursor over the read-list's kept blocks. range_block = current block; range_end = the
+  // range's exclusive walk-end; rle_idx = next marker pair. range_cont tracks whether the last step
+  // stayed inside its range (drives record()'s range-end marker). The cursor honors kv_stride /
+  // kv_offset (both 1/0 here), walking every KEPT block in turn.
+  int rle_idx = 0, range_block = 0, range_end = 0;
+  bool range_cont = false;
+  auto open_range = [&]() {  // load the next range at rle_idx (always non-empty)
+    range_block = rl(rle_idx) + lstep;
+    range_end = rl(rle_idx - 1) + lstep;
+    rle_idx -= 2;
+  };
+  auto next_kept = [&](int cur) -> int {  // next kept block after `cur` (one step), -1 if done
+    const int nb = cur + lstep;
+    if ((lstep > 0) ? (nb < range_end) : (nb > range_end)) {
+      range_block = nb;
+      range_cont = true;
+      return nb;
+    }
+    range_cont = false;
+    if (rle_idx >= 1) {
+      open_range();
+      return range_block;
+    }
+    return -1;
+  };
+  auto advance = [&](int cur, int n) -> int {  // skip `n` kept blocks (stride), -1 if exhausted
+    for (int s = 0; s < n && cur >= 0; ++s)
+      cur = next_kept(cur);
+    return cur;
+  };
+
+  // Prologue: first processed K-block → LDS (group B only; group A idle until iter 1). Dense starts
+  // at kv_offset; lite advances the cursor kv_offset KEPT blocks in.
+  int first_blk = kv_offset;
+  bool any = (kv_offset < num_kv_blocks);
+  if constexpr (isLite) {
+    const int num_k_blocks = num_kv_blocks + 2;  // RLE row width: [len, markers…]
+    const int nqb_list = num_q_blocks;
+    lbase = ((long long)bh_index * nqb_list + q_block) * num_k_blocks;
+    list_len = to_scalar((int)read_list[lbase]);
+    rle_idx = list_len;
+    if (list_len > 0) {
+      open_range();
+      first_blk = advance(range_block, kv_offset);
+    }
+    any = (first_blk >= 0);
+  }
+  if (!group_a && any) direct_lds_k(first_blk, /*k_buf=*/0);  // step starts at 0 → slot 0
 
   // Persistent VGPR Q (no reload across K-blocks). Lane (q_tile_start_row+col) owns one
   // q-row; each load_bf16x4 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
@@ -627,10 +706,19 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
 #pragma unroll
   for (int d = 0; d < HeadDimTiles; ++d)
     q_frag[1][d] = load_q(1, d);
-// q_group=2: all 8 d-tiles → lds_q2 (d-tile d at slot d). HBM→VGPR temp→LDS.
+  // q_group=2: all 8 d-tiles → lds_q2 (d-tile d at slot d). HBM→VGPR temp→LDS.
+  // LITE: the LAST d-tile stays in a VGPR (q2_last) instead of LDS, freeing its 4 KB slot for
+  // the cross-wave skip-vote ring. dense parks all 8 (lds_q2 unchanged → byte-exact).
+  bf16x4_t q2_last{0, 0, 0, 0};
 #pragma unroll
   for (int d = 0; d < HeadDimTiles; ++d) {
     bf16x4_t v = load_q(2, d);
+    if constexpr (isLite) {
+      if (d == HeadDimTiles - 1) {
+        q2_last = v;
+        continue;
+      }
+    }
     u32x2_t raw;
     __builtin_memcpy(&raw, &v, 8);
     const uint32_t off = Q2Lds(wave_id, d, lane);
@@ -714,7 +802,15 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       for (int g = 0; g < QTilesPerWave; ++g)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const bf16x4_t qf = (g < 2) ? q_frag[g][d_pair + h * Q2HalfTiles] : q2[h][q2_slot];
+          // qg0,1 from VGPR; qg2 from the LDS ping-pong — except (lite) its last d-tile
+          // (top d_pair, h=1), which was evicted to q2_last (VGPR).
+          bf16x4_t qf;
+          if constexpr (isLite)
+            qf = (g < 2)                                 ? q_frag[g][d_pair + h * Q2HalfTiles]
+                 : (h == 1 && d_pair == Q2HalfTiles - 1) ? q2_last
+                                                         : q2[h][q2_slot];
+          else
+            qf = (g < 2) ? q_frag[g][d_pair + h * Q2HalfTiles] : q2[h][q2_slot];
           if (d_pair == 0 && h == 0)
             scores[g][kv_sub] = asm_mfma_zero(k_pair[0], qf);
           else
@@ -727,9 +823,15 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       }
       // Prefetch the next qg2 d-tile pair (d_pair+Q2Depth) into its ping-pong slot.
       if (kv_sub == KvSubtiles - 1 && d_pair + Q2Depth < Q2HalfTiles) {
+        const int pf = d_pair + Q2Depth;  // d_pair being prefetched
 #pragma unroll
-        for (int h = 0; h < 2; ++h)
-          q2[h][q2_slot] = load_q2(d_pair + Q2Depth + h * Q2HalfTiles);
+        for (int h = 0; h < 2; ++h) {
+          // LITE: the last d-tile (h=1, top d_pair) lives in q2_last (VGPR), not LDS.
+          if constexpr (isLite) {
+            if (h == 1 && pf == Q2HalfTiles - 1) continue;
+          }
+          q2[h][q2_slot] = load_q2(pf + h * Q2HalfTiles);
+        }
       }
     }
     mfma_prio_lo();
@@ -743,7 +845,15 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     return (uint32_t)(VtLayout(kv_iter, chunk, lane) * 2);  // bf16 elems → bytes
   };
 
-  auto pv_phase = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles]) {
+  // verdict_step = the processing step of the block being pv'd (its verdict-ring slot;
+  // ignored when !isLite). Part B soft block-skip: a wave whose vote for this block is "skip"
+  // does NO pv — its probs were zeroed in softmax, so the result is unchanged; this just drops
+  // the 0-adding MFMAs + V_t loads. The vote is in LDS from this wave's own softmax (group A:
+  // prev iter P2; group B: this iter P1), visible across the same barriers record() relies on.
+  auto pv_phase = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles], int verdict_step) {
+    if constexpr (isLite) {
+      if (sverdict(wave_id, verdict_step & (VerdictRing - 1))) return;
+    }
     constexpr int PvDepth = 4;  // V_t prefetch ring depth (VtChunks=16 super-chunks / kv-iter)
     mfma_prio_hi();
     sched_fence();
@@ -791,14 +901,17 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     }
   };
 
-  auto softmax = [&](fp32x4_t scores[QTilesPerWave][KvSubtiles], bf16x4_t probs[QTilesPerWave][KvSubtiles], int step) {
+  auto softmax = [&](fp32x4_t scores[QTilesPerWave][KvSubtiles],
+                     bf16x4_t probs[QTilesPerWave][KvSubtiles],
+                     int step,
+                     int kv_block) {
     // Per-q-group block max — local: written below before every read, not loop-carried.
     float bmax_local[QTilesPerWave];
     // Partial last K/V block (seq_len_kv%64≠0): K-OOB rows read 0 (SRD-bounded) → score 0,
     // which would pollute the denominator. Force kv-rows ≥ last_kv_rows to -inf (exp2→0).
     // Bound is q_group-independent (computed once, applied to all 3 — compiler CSEs). `step`
     // = block index; partial block is last. No-op for aligned (last_kv_rows==64).
-    if (last_kv_rows < KvBlockRows && step == num_kv_blocks - 1) {
+    if (last_kv_rows < KvBlockRows && kv_block == num_kv_blocks - 1) {
       const int row0 = quad * 4;
 #pragma unroll
       for (int kv_sub = 0; kv_sub < KvSubtiles; ++kv_sub)
@@ -826,6 +939,28 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       }
       bmax_local[q_group] = bm;
     }
+    // LITE skip vote: keep the block iff some valid q-row's block-max is within thr (log2) of
+    // its running max. A skipping wave zeros its probs (the block then adds nothing to o_acc/
+    // row_sum); record() ANDs the 8 wave votes next phase.
+    if constexpr (isLite) {
+      bool any_keep = false;
+#pragma unroll
+      for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
+        any_keep = any_keep || (valid[q_group] && ((bmax_local[q_group] * scale_log2e - row_max[q_group]) > thr));
+      bool skip_wave = (__any(any_keep) == 0);
+      if (step == 0) skip_wave = false;  // never skip the first processed block
+      if (lane == 0) sverdict(wave_id, step & (VerdictRing - 1)) = skip_wave ? 1u : 0u;
+      if (skip_wave) {
+// Zero probs so the skipped pv adds nothing; the keep predicate guarantees this block
+// never raises the running max, so row_max/row_sum/o_acc stay correct.
+#pragma unroll
+        for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
+#pragma unroll
+          for (int kv_sub = 0; kv_sub < KvSubtiles; ++kv_sub)
+            probs[q_group][kv_sub] = bf16x4_t{0, 0, 0, 0};
+        return;
+      }
+    }
 // ── Fold + online update, per q-group (free function → scoped temporaries). ──
 #pragma unroll
     for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
@@ -850,28 +985,92 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // `step` = processing-step counter (drives K double-buffer parity); `kv_block`/
   // `prev_block` are the blocks being qk'd / pv'd; `next_block` is what group B streams
   // into LDS. Two-phase warp-spec: each iter A and B swap roles across the mid-barrier.
-  int prev_block = -1, step = 0;
-  bool have = (num_kv_blocks > 0);
+  // Dense and lite share ONE warp-spec body; only how each step's block is produced differs.
+  // Dense: kv_block == step, walking 0..num_kv_blocks-1. Lite: the cursor (set up above) walks
+  // the read list's kept blocks and tid 0 records the next-step write list. Lite constructs `if
+  // constexpr` out for dense.
+  int write_idx = 1;       // write-list output cursor (slot 0 holds the final length)
+  bool skip_state = true;  // running skip/compute state, for transition detection
+  bool prev_ended_range = false;
+
+  // MustDoList: a global force-compute RLE [len, s0,e0, …] of [start,end) K-blocks pinned as
+  // "compute" (the 8-wave vote can't drop them — e.g. attention sinks). Walked monotonically
+  // in lstep order, tid 0 only; nullptr/len-0 ⇒ dormant (byte-identical to plain skip).
+  const bool have_md = isLite && (must_do_list != nullptr) && ((int)must_do_list[0] > 0);
+  const int md_nr = have_md ? ((int)must_do_list[0] >> 1) : 0;  // # of [s,e) ranges
+  int md_ri = (lstep > 0) ? 0 : (md_nr - 1);                    // range cursor (walk dir = lstep)
+  auto md_force = [&](int block) -> bool {                      // is `block` forced-compute? advances the cursor
+    if (!have_md) return false;
+    if (lstep > 0) {
+      while (md_ri < md_nr && block >= (int)must_do_list[2 + 2 * md_ri])
+        ++md_ri;
+      return md_ri < md_nr && block >= (int)must_do_list[1 + 2 * md_ri] && block < (int)must_do_list[2 + 2 * md_ri];
+    } else {
+      while (md_ri >= 0 && block < (int)must_do_list[1 + 2 * md_ri])
+        --md_ri;
+      return md_ri >= 0 && block >= (int)must_do_list[1 + 2 * md_ri] && block < (int)must_do_list[2 + 2 * md_ri];
+    }
+  };
+  // block's completed vote: AND the 8 wave votes (skip iff every wave voted skip), with
+  // MustDoList pins forced to compute.
+  auto vote = [&](int block, int verdict_step) -> bool {
+    int sk = 1;
+#pragma unroll
+    for (int w = 0; w < NumWaves; ++w)
+      sk &= (int)sverdict(w, verdict_step & (VerdictRing - 1));
+    bool skip = (sk != 0);
+    if (md_force(block)) skip = false;  // MustDoList: pin as compute
+    return skip;
+  };
+  // RLE-encode the vote inline: emit a marker on each skip<->compute flip, plus a range-end
+  // marker when a kept range closes.
+  auto record = [&](int block, int verdict_step, bool is_range_end) {
+    bool skip = vote(block, verdict_step);
+    if (skip != skip_state) {
+      write_list[lbase + write_idx++] = (int16_t)block;
+      skip_state = skip;
+    }
+    if (is_range_end) {
+      skip_state = true;
+      if (!skip) write_list[lbase + write_idx++] = (int16_t)(block + lstep);
+    }
+  };
+
+  int prev_block = -1, step = 0;  // step counts PROCESSED blocks (drives K double-buffer parity)
+  int kv_block = first_blk;       // current processed block
+  bool have = any;
 
   while (have) {
-    const int kv_block = step;
-    const int next_block = step + 1;
-    const bool has_next = (step + 1 < num_kv_blocks);
+    // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense arithmetic stride.
+    // cur_ended (from the cursor's last step) = "kv_block ended its RLE range" → record's flush.
+    int next_block;
+    bool has_next;
+    if constexpr (isLite) {
+      next_block = advance(kv_block, kv_stride);
+      has_next = (next_block >= 0);
+    } else {
+      next_block = kv_block + kv_stride;
+      has_next = (next_block < num_kv_blocks);
+    }
+    const bool cur_ended = isLite ? !range_cont : false;
     const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
     const bool first = (step == 0);
     if (group_a) {  // P1
-      if (!first) pv_phase(prev_block, probs);
+      if (!first) pv_phase(prev_block, probs, step - 1);
       qk_phase(k_buf_cur, scores);
     } else {
-      if (!first) softmax(scores, probs, step - 1);
+      if (!first) softmax(scores, probs, step - 1, prev_block);
       if (has_next) direct_lds_k(next_block, k_buf_next);
     }
     __builtin_amdgcn_s_barrier();
     if (group_a) {  // P2
-      softmax(scores, probs, step);
+      softmax(scores, probs, step, kv_block);
+      if constexpr (isLite) {  // tid 0 RLE-records prev_block's vote (after its softmax)
+        if (tid == 0 && !first) record(prev_block, step - 1, prev_ended_range);
+      }
       if (has_next) prefetch_v_t_l1(kv_block);
     } else {
-      if (!first) pv_phase(prev_block, probs);
+      if (!first) pv_phase(prev_block, probs, step - 1);
       qk_phase(k_buf_cur, scores);
     }
     // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is
@@ -881,11 +1080,20 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     lds_barrier();
     prev_block = kv_block;
     ++step;
-    have = (step < num_kv_blocks);
+    prev_ended_range = cur_ended;
+    kv_block = next_block;
+    have = has_next;
   }
-  // Epilogue: last block's softmax + pv.
-  if (!group_a && step > 0) softmax(scores, probs, step - 1);
-  if (step > 0) pv_phase(prev_block, probs);
+  // Epilogue: last block's softmax + pv, then (lite) flush its always-range-end vote + count.
+  if (!group_a && step > 0) softmax(scores, probs, step - 1, prev_block);
+  if (step > 0) pv_phase(prev_block, probs, step - 1);
+  if constexpr (isLite) {
+    lds_barrier();  // group B's last-block vote → visible to tid 0
+    if (tid == 0 && step > 0) {
+      record(prev_block, step - 1, /*is_range_end=*/true);  // finalize inline RLE
+      write_list[lbase] = (int16_t)(write_idx - 1);         // RLE length
+    }
+  }
 
 // ─── Output ────────────────────────────────────────────────────────────
 // row_sum is summed across the 4 quad-lanes once here (math-equiv since
@@ -1024,18 +1232,83 @@ int launch_attention_forward(
 
   const int bh = batch * heads;
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
-  const dim3 grid((qt + QTilesPerWG - 1) / QTilesPerWG, bh);
+  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
+  const dim3 grid(nqb, bh);
   const float sl2e = Log2e / sqrtf((float)HeadDim);
-
-  // layout: 0 = BHSD (q,k,v,out are [B,H,S,D]); 1 = BSHD ([B,S,H,D], read natively, no transpose).
-  // chevron launch (hipLaunchKernelGGL can't parse the template's comma — single arg here, but
-  // keep chevron for symmetry with the BSHD dispatch).
+  // layout: 0 = BHSD ([B,H,S,D]); 1 = BSHD ([B,S,H,D], read natively, no transpose).
   if (layout)
     attention_forward<true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>(
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e, heads);
   else
     attention_forward<false><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>(
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e, heads);
+  return (int)hipGetLastError();
+}
+
+// LiteAttention forward (Part A cross-timestep block-skip + Part B per-wave soft-skip).
+// read_list / write_list are int16 RLE keep-lists, [B,H,num_q_blocks,num_kv_blocks+2] slices
+// (read = skip_list[phase], write = skip_list[1-phase]); tile = (QTilesPerWG·QTileRows q-rows,
+// 64 kv). must_do_list is an optional global force-compute RLE [len,s0,e0,…] (nullable).
+// threshold is log2 (~ -10); phase selects the reverse-list direction. V must be pre-transposed.
+// (Verdict ring reuses the evicted qg2 d-tile's LDS slot → no dynamic LDS; total LDS == dense's.)
+// Each CTA writes its own next-step RLE inline; one full-grid launch.
+int launch_attention_forward_lite(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int batch,
+    int heads,
+    int seq_len,
+    int seq_len_kv,
+    int head_dim,
+    const void* read_list,
+    void* write_list,
+    const void* must_do_list,
+    float threshold,
+    int phase,
+    int layout,
+    void* stream) {
+  if (batch <= 0 || heads <= 0) return 1;
+  if (seq_len <= 0) return 2;     // any Q len (partial last q-tile masked by valid[])
+  if (seq_len_kv <= 0) return 5;  // any K/V len (partial last block masked in softmax)
+  if (head_dim != HeadDim) return 3;
+  if (!read_list || !write_list) return 4;  // must_do_list is optional
+
+  const int bh = batch * heads;
+  const int qt = (seq_len + QTileRows - 1) / QTileRows;
+  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
+  const dim3 grid(nqb, bh);
+  const float sl2e = Log2e / sqrtf((float)HeadDim);
+
+#define RL (const int16_t*)read_list
+#define WL (int16_t*)write_list
+#define MDL (const int16_t*)must_do_list
+// Lite runs the full grid as one launch; each CTA walks its read list's kept blocks and RLE-encodes
+// the next-step write list inline.
+#define LAUNCH_LITE(BSHD)                                                           \
+  attention_forward<BSHD, true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>( \
+      (const bf16_t*)q,                                                             \
+      (const bf16_t*)k,                                                             \
+      (const bf16_t*)v,                                                             \
+      (bf16_t*)out,                                                                 \
+      seq_len,                                                                      \
+      seq_len_kv,                                                                   \
+      sl2e,                                                                         \
+      heads,                                                                        \
+      RL,                                                                           \
+      WL,                                                                           \
+      MDL,                                                                          \
+      threshold,                                                                    \
+      phase)
+  if (layout)
+    LAUNCH_LITE(true);
+  else
+    LAUNCH_LITE(false);
+#undef LAUNCH_LITE
+#undef RL
+#undef WL
+#undef MDL
   return (int)hipGetLastError();
 }
 

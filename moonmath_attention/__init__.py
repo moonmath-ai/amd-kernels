@@ -9,6 +9,6 @@
 """
 
 from ._kernel import forward, forward_lite
+from .lite import LiteAttention
 
-__all__ = ["forward", "forward_lite"]
-__version__ = "0.1.0"
+__all__ = ["forward", "forward_lite", "LiteAttention"]
