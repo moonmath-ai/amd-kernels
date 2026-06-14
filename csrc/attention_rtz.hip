@@ -6,5 +6,6 @@
 #define launch_attention_forward launch_attention_forward_rtz
 #define launch_attention_forward_lite launch_attention_forward_lite_rtz
 #define launch_v_transpose launch_v_transpose_rtz
+#define tail_workspace_bytes tail_workspace_bytes_rtz
 
 #include "attention_kernel.hip"

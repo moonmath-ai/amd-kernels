@@ -140,6 +140,9 @@ def diff_stats(out_bhsd, ref_bhsd):
 warmup_passes = 3  # number of timing-pass repeats; CLI overrides
 
 
+_INCLUDE_MAX = True
+
+
 def bench_shape(B, H, S, D, warmup, iters):
     if not torch.cuda.is_available():
         sys.exit("Need ROCm-built torch")
@@ -182,6 +185,8 @@ def bench_shape(B, H, S, D, warmup, iters):
 
     has_max = False
     try:
+        if not _INCLUDE_MAX:
+            raise RuntimeError("MAX disabled (--no-max)")
         mod = _load_max()
         _ = _max_session(mod)
         model = _max_model(B, S, H, D)
@@ -282,9 +287,15 @@ def main():
         default=5,
         help="Number of independent timing passes to take median over.",
     )
+    ap.add_argument(
+        "--no-max",
+        action="store_true",
+        help="Skip Modular MAX (stable competitor; its runtime perturbs later timings).",
+    )
     args = ap.parse_args()
-    global warmup_passes
+    global warmup_passes, _INCLUDE_MAX
     warmup_passes = args.passes
+    _INCLUDE_MAX = not args.no_max
 
     rows = []
     acc_rows = []

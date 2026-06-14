@@ -463,9 +463,34 @@ __device__ __forceinline__ void softmax_update(
   row_l = vfma_f32(row_l, rescale, bsum);
 }
 
-constexpr int NumCUs = 304;
+// ─── Tail KV-split (dense only) ─────────────────────────────────────────────
+// The grid tiles into 384-row q-blocks run in rounds of NumCUs. A fractional last round strands CUs:
+// its q-blocks still walk the FULL kv stream while the other CUs sit idle. We recover that wasted
+// round by splitting each stranded q-block's kv work `split_ways` (= G) ways across all the CUs —
+// part p of a q-block processes every G-th kv block starting at offset p (a strided KV-split). Each
+// part writes its fp32 (o, m, l) partial to a scratch workspace; merge_parts then recombines a
+// q-block's G partials with the online-softmax rule and writes the final bf16 output.
+constexpr int NumCUs = 304;           // MI300X compute units (= one occupancy-1 CTA each)
+constexpr int MaxParts = 2 * NumCUs;  // upper bound on total parts (the planner caps the split at ≤2 CU rounds)
+constexpr int PartRows = QTilesPerWG * QTileRows;  // 384 q-rows owned by one part (== one q-block)
+constexpr int PartOFloats = PartRows * HeadDim;    // fp32 `o` values per part (384·128)
+constexpr int PartMlFloats = PartRows * 2;         // fp32 (m,l) pair per row, per part (384·2)
+// The scratch workspace is one flat float buffer split into an `o` region then an `(m,l)` region.
+// Both are addressed by compile-time-strided opus layouts (offset = Σ coordᵢ·strideᵢ):
+constexpr auto PartO = opus::make_layout(Shape3, strides<PartOFloats, HeadDim, 1>());  // (part, row, hd) → o
+constexpr auto PartMl = opus::make_layout(Shape2, strides<PartMlFloats, 2>());         // (part, row) → m; +1 → l
+struct TailScratch {
+  float* o;   // [MaxParts][PartRows][HeadDim] fp32 output partials, indexed by PartO(part, row, hd)
+  float* ml;  // [MaxParts][PartRows][2]       fp32 (row max, row sum), indexed by PartMl(part, row){+1}
+  __device__ __host__ explicit TailScratch(float* ws) : o(ws), ml(ws + (long long)MaxParts * PartOFloats) {}
+};
 
-template <bool kBSHD, bool isLite = false>
+// Host-uploaded schedule, two regions of int4 (read on device by the split + merge kernels):
+//   tail_sched[0 .. parts)            one entry PER PART      = (q_block, bh, _, _)
+//   tail_sched[MaxParts .. +tail)     one entry PER Q-BLOCK   = (q_block, bh, part_base, n_parts=G)
+__device__ int4 tail_sched[2 * MaxParts];
+
+template <bool kBSHD, bool isLite = false, bool Split = false>
 __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     const bf16_t* __restrict__ Q,
     const bf16_t* __restrict__ K,
@@ -480,8 +505,14 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     int16_t* __restrict__ write_list = nullptr,          // RLE keep-list emitted for the next timestep
     const int16_t* __restrict__ must_do_list = nullptr,  // global force-compute ranges [len,s0,e0,…] (nullable)
     float thr = 0.f,
-    int phase = 0  // skip threshold (log2) + reverse-list phase
+    int phase = 0,  // skip threshold (log2) + reverse-list phase
+    // ── Tail KV-split ──
+    float* __restrict__ part_buf = nullptr,  // Split: the TailScratch workspace
+    int grid_nqb = 0,                        // real #q-blocks when the grid is 1-D (prefix/split);
+                                             //   0 ⇒ 2-D full grid (uses gridDim.x)
+    int split_ways = 0                       // Split: G = strided parts per q-block (= the kv stride)
 ) {
+  static_assert(!(isLite && Split), "lite has no tail KV-split (removed); Split is dense-only");
   // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
   // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
   // q_group (q-group). 8 waves → 2 groups of 4 for warp-spec.
@@ -507,13 +538,26 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   const int num_bh = gridDim.y;
   const int wg_id_raw = blockIdx.y * num_q_blocks + blockIdx.x;
   const int num_wgs = num_q_blocks * num_bh;
-  // Block selection (2-D full grid). lite uses identity — per-head-uneven sparsity makes the chiplet
-  // swizzle HARMFUL (dense heads' XCDs saturate while sparse idle: 0.83x); identity spreads a head's
-  // q-tiles across all 8 XCDs. Dense uses the head-first chiplet swizzle (co-locates a (B,H)'s
-  // q-blocks on one XCD's L2, ~+1.4% @ moderate S).
-  const int wg_id = isLite ? wg_id_raw : chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
-  const int q_block = wg_id % num_q_blocks;
-  const int bh_index = wg_id / num_q_blocks;
+  // Block selection. Split: this part's (q_block, bh) come from tail_sched. Prefix/split run a 1-D
+  // grid (grid_nqb = real #q-blocks, bh-major, tail rounds stripped → no swizzle). 2-D full grid
+  // (grid_nqb==0): lite uses identity — per-head-uneven sparsity makes the chiplet swizzle HARMFUL
+  // (dense heads' XCDs saturate while sparse idle: 0.83x); identity spreads a head's q-tiles across
+  // all 8 XCDs. Dense full uses the head-first chiplet swizzle (co-locates a (B,H)'s q-blocks on one
+  // XCD's L2, ~+1.4% @ moderate S).
+  int q_block, bh_index;
+  if constexpr (Split) {
+    // One CTA per part: its (q_block, bh) come straight from the uploaded per-part schedule entry.
+    const int4 sched_entry = tail_sched[blockIdx.x];
+    q_block = sched_entry.x;
+    bh_index = sched_entry.y;
+  } else if (grid_nqb) {
+    q_block = wg_id_raw % grid_nqb;
+    bh_index = wg_id_raw / grid_nqb;
+  } else {
+    const int wg_id = isLite ? wg_id_raw : chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
+    q_block = wg_id % num_q_blocks;
+    bh_index = wg_id / num_q_blocks;
+  }
 
   // Q-tile ownership: each wave owns QTilesPerWave (=3) 16-row q-tiles. For each,
   // q_tile_start_row is the absolute seq-row where that tile begins — a per-tile
@@ -533,10 +577,12 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // ceil block count; last_kv_rows ∈ [1,64] = valid rows in the last (partial) K/V block.
   const int num_kv_blocks = (seq_len_kv + KvBlockRows - 1) / KvBlockRows;
   const int last_kv_rows = seq_len_kv - (num_kv_blocks - 1) * KvBlockRows;
-  // KV stride/offset: walk all blocks (stride 1, offset 0). For lite the cursor applies them to KEPT
-  // blocks; for dense it's plain arithmetic. The whole stream is [0, num_kv_blocks).
-  const int kv_stride = 1;
-  const int kv_offset = 0;
+  // KV stride/offset over the [0, num_kv_blocks) stream. A dense Split part walks every split_ways-th
+  // block from its own offset (the strided KV-split); everyone else — including all of lite — walks
+  // every block (stride 1, offset 0). The same stride drives the dense arithmetic walk and the lite
+  // cursor uniformly; since Split is dense-only (static_assert), lite always gets stride 1.
+  const int kv_stride = Split ? split_ways : 1;
+  const int kv_offset = Split ? (blockIdx.x % split_ways) : 0;
 
   // Cross-attention offsets. Q/K/Out keep the TRUE seq lens with their SRD bounded to the valid
   // byte extent: a partial last q-tile / K block (rows past the true seq len) then reads 0 /
@@ -643,7 +689,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // Lite cursor over the read-list's kept blocks. range_block = current block; range_end = the
   // range's exclusive walk-end; rle_idx = next marker pair. range_cont tracks whether the last step
   // stayed inside its range (drives record()'s range-end marker). The cursor honors kv_stride /
-  // kv_offset (both 1/0 here), walking every KEPT block in turn.
+  // kv_offset for uniformity with the dense walk, but lite is never a Split, so here that is always
+  // stride 1 / offset 0 (it visits every kept block).
   int rle_idx = 0, range_block = 0, range_end = 0;
   bool range_cont = false;
   auto open_range = [&]() {  // load the next range at rle_idx (always non-empty)
@@ -676,8 +723,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   int first_blk = kv_offset;
   bool any = (kv_offset < num_kv_blocks);
   if constexpr (isLite) {
-    const int num_k_blocks = num_kv_blocks + 2;  // RLE row width: [len, markers…]
-    const int nqb_list = num_q_blocks;
+    const int num_k_blocks = num_kv_blocks + 2;               // RLE row width: [len, markers…]
+    const int nqb_list = grid_nqb ? grid_nqb : num_q_blocks;  // 1-D grids: gridDim.x ≠ #q-blocks
     lbase = ((long long)bh_index * nqb_list + q_block) * num_k_blocks;
     list_len = to_scalar((int)read_list[lbase]);
     rle_idx = list_len;
@@ -986,9 +1033,9 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // `prev_block` are the blocks being qk'd / pv'd; `next_block` is what group B streams
   // into LDS. Two-phase warp-spec: each iter A and B swap roles across the mid-barrier.
   // Dense and lite share ONE warp-spec body; only how each step's block is produced differs.
-  // Dense: kv_block == step, walking 0..num_kv_blocks-1. Lite: the cursor (set up above) walks
-  // the read list's kept blocks and tid 0 records the next-step write list. Lite constructs `if
-  // constexpr` out for dense.
+  // Dense: kv_block follows the arithmetic stride — every block (non-split), or every split_ways-th
+  // from this part's offset (dense Split). Lite: the cursor (set up above) walks the read list's kept
+  // blocks (stride 1) and tid 0 records the next-step write list. Lite constructs `if constexpr` out.
   int write_idx = 1;       // write-list output cursor (slot 0 holds the final length)
   bool skip_state = true;  // running skip/compute state, for transition detection
   bool prev_ended_range = false;
@@ -1101,6 +1148,25 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
 #pragma unroll
   for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
     row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
+  if constexpr (Split) {
+    // A split part exports its raw fp32 partial (o, and the row's softmax max `m` and sum `l`),
+    // UNSCALED — the o/l division and bf16 packing are merge_parts' job. One CTA == one part.
+    TailScratch parts(part_buf);
+    const int part = blockIdx.x;
+#pragma unroll
+    for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
+      // Absolute row of this (wave, q_group, lane) within the part's 384 rows.
+      const int row = (wave_id * QTilesPerWave + q_group) * QTileRows + col;
+#pragma unroll
+      for (int t = 0; t < HeadDimTiles; ++t)  // store each head-dim fragment (4 fp32) of the o accumulator
+        *reinterpret_cast<fp32x4_t*>(&parts.o[PartO(part, row, HdFrag(t, quad))]) = o_acc[q_group][t];
+      if (quad == 0) {  // m and l are per-row scalars — only the first quad-lane of the row writes them
+        parts.ml[PartMl(part, row)] = row_max[q_group];      // m = running softmax max
+        parts.ml[PartMl(part, row) + 1] = row_sum[q_group];  // l = running softmax denominator
+      }
+    }
+    return;
+  }
 #pragma unroll
   for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
     if (!valid[q_group]) continue;
@@ -1115,6 +1181,68 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       store_bf16x4(out_buffer, QOLayout(q_tile_start_row[q_group] + col, HdFrag(t, quad)) * 2, out);
     }
   }
+}
+
+// ─── Tail-part merge ────────────────────────────────────────────────────────
+constexpr int MergeThreads = 256;                                // threads per merge CTA
+constexpr int MergeWGs = PartRows * HeadDim / 4 / MergeThreads;  // 48 CTAs cover one q-block's 384×128 output
+
+// Per-(B,H) base element offset + SRD byte span of the [seq, (heads,) HeadDim] output tensor for
+// head-row `bh`. BHSD: heads contiguous. BSHD: heads interleaved → a head's rows span ×heads and
+// start at h·HeadDim. (Mirrors the main kernel's bh_offset_q / q_bytes, scoped to the merge.)
+template <bool kBSHD>
+__device__ __forceinline__ long long head_base_offset(int bh, int seq, int heads) {
+  if constexpr (kBSHD)
+    return (long long)(bh / heads) * seq * heads * HeadDim + (long long)(bh % heads) * HeadDim;
+  else
+    return (long long)bh * seq * HeadDim;
+}
+template <bool kBSHD>
+__device__ __forceinline__ uint32_t head_span_bytes(int seq, int heads) {
+  return (uint32_t)((long long)seq * (kBSHD ? heads : 1) * HeadDim * sizeof(bf16_t));
+}
+
+// Recombine a tail q-block's `n_parts` (=G) strided KV partials into the final output. MergeWGs CTAs
+// serve one q-block; each of a CTA's MergeThreads threads owns ONE output cell = 4 contiguous
+// head-dims of one of the 384 rows. Online-softmax merge across the parts: with run_max = maxₚ mₚ and
+// weight wₚ = exp2(mₚ − run_max),   out = (Σₚ wₚ·oₚ) / (Σₚ wₚ·lₚ),  then bf16-packed.
+template <bool kBSHD>
+__global__ __launch_bounds__(MergeThreads, 4) void merge_parts(
+    bf16_t* __restrict__ Out, int seq_len, int heads, const float* __restrict__ part_buf) {
+  // Per-q-block meta: target (q_block, bh) + the [part_base, part_base+n_parts) slice of parts to merge.
+  const int4 meta = tail_sched[MaxParts + blockIdx.x / MergeWGs];
+  const int part_base = meta.z, n_parts = meta.w;
+  // This thread's output cell within the q-block: a (row, hd) with hd 4-aligned.
+  const int cell = ((blockIdx.x % MergeWGs) * MergeThreads + threadIdx.x) * 4;
+  const int row = cell / HeadDim, hd = cell % HeadDim;
+  const TailScratch parts(const_cast<float*>(part_buf));
+
+  // Pass 1: run_max = max of the parts' softmax maxima (each part's m is a lower bound on the true max).
+  float run_max = -FLT_MAX;
+  for (int p = 0; p < n_parts; ++p)
+    run_max = fmaxf(run_max, parts.ml[PartMl(part_base + p, row)]);
+  // Pass 2: weighted sums — numerators of this cell's 4 head-dims (out0..out3) + the shared denom l_sum.
+  float out0 = 0, out1 = 0, out2 = 0, out3 = 0, l_sum = 0;
+  for (int p = 0; p < n_parts; ++p) {
+    const float* ml = &parts.ml[PartMl(part_base + p, row)];   // ml[0] = m_p, ml[1] = l_p
+    const float* o = &parts.o[PartO(part_base + p, row, hd)];  // o_p[hd .. hd+3]
+    const float weight = fast_exp2(ml[0] - run_max);
+    out0 = fmaf(weight, o[0], out0);
+    out1 = fmaf(weight, o[1], out1);
+    out2 = fmaf(weight, o[2], out2);
+    l_sum = fmaf(weight, ml[1], l_sum);
+    out3 = fmaf(weight, o[3], out3);
+  }
+  const float inv_l = (l_sum == 0.0f) ? 0.0f : fast_rcp(l_sum);
+
+  // Scatter the normalized bf16x4 to Out at this (q-block row, hd).
+  const auto OutLayout = seq_layout<kBSHD, HeadDim>(heads);
+  const auto out_buffer =
+      make_buffer(Out + head_base_offset<kBSHD>(meta.y, seq_len, heads), head_span_bytes<kBSHD>(seq_len, heads));
+  store_bf16x4(
+      out_buffer,
+      OutLayout(meta.x * PartRows + row, hd) * 2,
+      pack4_bf16</*MaybeNaN=*/true>(out0 * inv_l, out1 * inv_l, out2 * inv_l, out3 * inv_l));
 }
 
 // ─── V transpose for 16x16x16 mfma ─────────────────────────────────────────────
@@ -1208,11 +1336,133 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
   }
 }
 
+// ─── Tail KV-split planner (dense) ───────────────────────────────────────────
+// Decide whether/how to recover the stranded fractional CU-round, and if so upload the schedule.
+// Returns "no split" (tail==0, split_ways==1: the whole grid runs as the ordinary prefix) when
+// recovery isn't worth the merge; parts<0 signals a schedule-upload failure.
+struct TailPlan {
+  int prefix_wgs;  // CTAs run as the ordinary full-stream prefix (wgs − tail; 0 ⇒ none)
+  int tail;        // stranded q-blocks recovered by the split (0 ⇒ no split at all)
+  int split_ways;  // G: number of strided parts per stranded q-block
+  int parts;       // total split parts = tail·G (<0 ⇒ upload error)
+};
+constexpr int MinKvBlocksToSplit = 48;  // below this, the merge can't amortize — don't split
+constexpr int MinBlocksPerPart = 4;     // floor on kv blocks/part — finer splits let fixed cost dominate
+constexpr int MergeCostBlocks = 3;      // merge kernel's modelled cost, in kv-block-time units
+
+TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t stream) {
+  const int wgs = nqb * num_bh;
+  const TailPlan no_split{wgs, 0, 1, 0};
+  const int tail = enable ? (wgs % NumCUs) : 0;
+  // Bail to a single ordinary launch when the grid tiles evenly, the last round is ≥95% full (too
+  // little to recover), or kv is too short for the merge to pay for itself.
+  if (!tail || tail > NumCUs * 19 / 20 || nkb < MinKvBlocksToSplit) return no_split;
+
+  // Choose G minimizing the split's wall-time span = (CU-rounds the parts take) × (kv blocks per part)
+  // + merge cost. G=1 is the baseline of just running the full stranded round (span = nkb).
+  int G = 1;
+  long long best_span = (long long)nkb + MergeCostBlocks;
+  for (int g = 2; g <= MaxParts / tail && nkb / g >= MinBlocksPerPart; ++g) {
+    const long long cu_rounds = (tail * g + NumCUs - 1) / NumCUs;  // ceil(tail·g / NumCUs)
+    const long long blocks_per_part = (nkb + g - 1) / g;           // ceil(nkb / g)
+    const long long span = cu_rounds * blocks_per_part + MergeCostBlocks;
+    if (span < best_span) {
+      best_span = span;
+      G = g;
+    }
+  }
+  if (G == 1) return no_split;  // no split factor beats running the full stranded round
+
+  // Build the schedule: per stranded q-block, G strided parts + one per-q-block merge-meta entry.
+  // NOTE: `sched` is reused across calls; correctness relies on the single-stream contract and the
+  // pageable H2D copy staging before the next plan overwrites it (stream-ordered; multi-stream is UB).
+  static int4 sched[2 * MaxParts];
+  int parts = 0;
+  for (int t = 0; t < tail; ++t) {
+    const int wg = (wgs - tail) + t;  // stranded CTA index, in the prefix's bh-major order
+    const int q_block = wg % nqb, bh = wg / nqb;
+    sched[MaxParts + t] = int4{q_block, bh, parts, G};  // per-q-block: (q_block, bh, part_base, n_parts)
+    for (int i = 0; i < G; ++i)
+      sched[parts + i] = int4{q_block, bh, 0, 0};  // per-part:    (q_block, bh, _, _)
+    parts += G;
+  }
+  if (hipMemcpyToSymbolAsync(
+          HIP_SYMBOL(tail_sched), sched, sizeof(int4) * (MaxParts + tail), 0, hipMemcpyHostToDevice, stream) !=
+      hipSuccess)
+    return TailPlan{wgs, 0, 1, -1};
+  return TailPlan{wgs - tail, tail, G, parts};
+}
+
+// Launch the dense tail KV-split (templated on layout): ordinary prefix (if non-empty) → split parts
+// → merge, all stream-ordered. Factored out of the launcher so the long forward-kernel arg list isn't
+// duplicated per layout. All of the forward kernel's lite/threshold/must-do params are unused here.
+template <bool kBSHD>
+void launch_tail_split(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int seq_len,
+    int seq_len_kv,
+    float scale_log2e,
+    int heads,
+    int nqb,
+    void* workspace,
+    const TailPlan& tp,
+    hipStream_t stream) {
+  // Prefix: the full-stream waves as one ordinary 1-D bh-major launch (grid_nqb=nqb strips the tail).
+  // Empty when the entire grid is the stranded round.
+  if (tp.prefix_wgs)
+    attention_forward<kBSHD, /*isLite=*/false, /*Split=*/false><<<dim3(tp.prefix_wgs), dim3(BlockSize), 0, stream>>>(
+        (const bf16_t*)q,
+        (const bf16_t*)k,
+        (const bf16_t*)v,
+        (bf16_t*)out,
+        seq_len,
+        seq_len_kv,
+        scale_log2e,
+        heads,
+        /*read_list=*/nullptr,
+        /*write_list=*/nullptr,
+        /*must_do_list=*/nullptr,
+        /*thr=*/0.f,
+        /*phase=*/0,
+        /*part_buf=*/nullptr,
+        /*grid_nqb=*/nqb,
+        /*split_ways=*/0);
+  // Split: one CTA per part; each walks every G-th kv block of its q-block and writes an fp32 partial.
+  attention_forward<kBSHD, /*isLite=*/false, /*Split=*/true><<<dim3(tp.parts), dim3(BlockSize), 0, stream>>>(
+      (const bf16_t*)q,
+      (const bf16_t*)k,
+      (const bf16_t*)v,
+      (bf16_t*)out,
+      seq_len,
+      seq_len_kv,
+      scale_log2e,
+      heads,
+      nullptr,
+      nullptr,
+      nullptr,
+      /*thr=*/0.f,
+      /*phase=*/0,
+      /*part_buf=*/(float*)workspace,
+      /*grid_nqb=*/nqb,
+      /*split_ways=*/tp.split_ways);
+  // Merge: recombine each stranded q-block's parts into the final bf16 output.
+  merge_parts<kBSHD><<<dim3(tp.tail * MergeWGs), dim3(MergeThreads), 0, stream>>>(
+      (bf16_t*)out, seq_len, heads, (const float*)workspace);
+}
+
 }  // namespace
 
 extern "C" {
 // IMPORTANT: V here must point to pre-transposed V_t. Call launch_v_transpose
 // first to produce V_t from raw V. V_t and V have identical total byte size.
+// Tail KV-split workspace (dense only): fp32 o + (m,l) for MaxParts parts. workspace==nullptr ⇒ no split.
+size_t tail_workspace_bytes(void) {
+  return (size_t)MaxParts * (PartOFloats + PartMlFloats) * sizeof(float);
+}
+
 int launch_attention_forward(
     const void* q,
     const void* k,
@@ -1224,6 +1474,7 @@ int launch_attention_forward(
     int seq_len_kv,
     int head_dim,
     int layout,
+    void* workspace,
     void* stream) {
   if (batch <= 0 || heads <= 0) return 1;
   if (seq_len <= 0) return 2;     // any Q len (partial last q-tile SRD-padded)
@@ -1232,10 +1483,22 @@ int launch_attention_forward(
 
   const int bh = batch * heads;
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
-  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
+  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG, nkb = (seq_len_kv + 63) / 64;
   const dim3 grid(nqb, bh);
   const float sl2e = Log2e / sqrtf((float)HeadDim);
   // layout: 0 = BHSD ([B,H,S,D]); 1 = BSHD ([B,S,H,D], read natively, no transpose).
+
+  // Tail KV-split: recover the stranded fractional round (when a workspace is given). Prefix runs
+  // the full waves as one ordinary launch; the split parts + merge run the stranded round.
+  const TailPlan tp = plan_tail_split(nqb, bh, nkb, workspace != nullptr, (hipStream_t)stream);
+  if (tp.parts < 0) return 6;
+  if (tp.tail) {
+    if (layout)
+      launch_tail_split<true>(q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
+    else
+      launch_tail_split<false>(q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
+    return (int)hipGetLastError();
+  }
   if (layout)
     attention_forward<true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>(
         (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e, heads);
@@ -1251,7 +1514,7 @@ int launch_attention_forward(
 // 64 kv). must_do_list is an optional global force-compute RLE [len,s0,e0,…] (nullable).
 // threshold is log2 (~ -10); phase selects the reverse-list direction. V must be pre-transposed.
 // (Verdict ring reuses the evicted qg2 d-tile's LDS slot → no dynamic LDS; total LDS == dense's.)
-// Each CTA writes its own next-step RLE inline; one full-grid launch.
+// Each CTA writes its own next-step RLE inline; one full-grid launch (no tail KV-split — lite only).
 int launch_attention_forward_lite(
     const void* q,
     const void* k,
@@ -1284,8 +1547,8 @@ int launch_attention_forward_lite(
 #define RL (const int16_t*)read_list
 #define WL (int16_t*)write_list
 #define MDL (const int16_t*)must_do_list
-// Lite runs the full grid as one launch; each CTA walks its read list's kept blocks and RLE-encodes
-// the next-step write list inline.
+// Lite runs the full grid as one launch (no tail KV-split — its stranded round is sparse); each CTA
+// walks its read list's kept blocks and RLE-encodes the next-step write list inline.
 #define LAUNCH_LITE(BSHD)                                                           \
   attention_forward<BSHD, true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>( \
       (const bf16_t*)q,                                                             \

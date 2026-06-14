@@ -7,6 +7,12 @@ registers, the third staged through LDS; K streams HBM→LDS by direct DMA and V
 consumed pre-transposed straight from L1. Inputs are taken natively in either
 `[B, S, H, D]` (BSHD) or `[B, H, S, D]` (BHSD) layout — no transposes anywhere.
 
+A FlashDecoding-style **dense tail KV-split** recovers the stranded fractional
+CU-round: when the grid doesn't tile evenly across the 304 CUs, the last partial
+round's q-blocks are split along KV across the idle CUs and merged in fp32. It
+turns on automatically only when a cost model says it pays (otherwise a single
+launch), and is the main reason RTZ now beats AITER on every benchmarked shape.
+
 ## Install
 
 Requires ROCm with `hipcc` on PATH and a gfx942 device.
@@ -80,55 +86,62 @@ HIP/AITER timings complete so its runtime cannot perturb them.
 
 ### Results — MI300X, bf16, head\_dim = 128
 
-Median of 5 independent timing passes (30 iters each) per shape. Speedups are
-`other_ms / ours_ms`, so >1× means we win. Modular MAX has no rounding-mode
-selector and rounds RTNE internally (verified empirically).
+Median of 5 independent timing passes (30 iters each) per shape, **with the dense
+tail KV-split enabled**. Speedups are `other_ms / ours_ms`, so >1× means we win.
+Ours and AITER are a fresh idle-GPU run; Modular MAX figures are carried from the
+prior measurement on the same GPU (MAX is kernel-independent — the tail only
+affects our column — and its runtime perturbs co-located timings). MAX has no
+rounding-mode selector and rounds RTNE internally (verified empirically).
 
 | Shape (B, H, S, D) | Round | Ours (ms) | AITER v3 (ms) | Speedup vs AITER | Modular MAX (ms) | Speedup vs MAX |
 |---|---|---|---|---|---|---|
-| (2, 24, 8192, 128) | RTNE | **3.345** | 3.796 | 1.13× | 4.237 | 1.27× |
-| (2, 24, 8192, 128) | RTNA | **3.274** | 3.604 | 1.10× | 4.237 | 1.29× |
-| (2, 24, 8192, 128) | RTZ | **3.226** | 3.303 | 1.02× | 4.237 | 1.31× |
-| (2, 24, 16384, 128) | RTNE | **11.670** | 14.669 | 1.26× | 17.923 | 1.54× |
-| (2, 24, 16384, 128) | RTNA | **11.525** | 13.785 | 1.20× | 17.923 | 1.56× |
-| (2, 24, 16384, 128) | RTZ | **11.406** | 12.591 | 1.10× | 17.923 | 1.57× |
-| (1, 32, 16384, 128) | RTNE | **8.505** | 8.995 | 1.06× | 11.030 | 1.30× |
-| (1, 32, 16384, 128) | RTNA | **8.431** | 8.574 | 1.02× | 11.030 | 1.31× |
-| (1, 32, 16384, 128) | RTZ | 8.338 | **7.919** | 0.95× | 11.030 | 1.32× |
-| (4, 16, 16384, 128) | RTNE | **17.335** | 18.245 | 1.05× | 22.061 | 1.27× |
-| (4, 16, 16384, 128) | RTNA | **17.068** | 17.496 | 1.03× | 22.061 | 1.29× |
-| (4, 16, 16384, 128) | RTZ | 16.958 | **16.138** | 0.95× | 22.061 | 1.30× |
-| (1, 64, 16384, 128) | RTNE | **17.270** | 18.262 | 1.06× | 22.763 | 1.32× |
-| (1, 64, 16384, 128) | RTNA | **17.041** | 17.511 | 1.03× | 22.763 | 1.34× |
-| (1, 64, 16384, 128) | RTZ | 16.891 | **16.128** | 0.95× | 22.763 | 1.35× |
-| (2, 24, 32768, 128) | RTNE | **46.444** | 54.747 | 1.18× | 69.947 | 1.51× |
-| (2, 24, 32768, 128) | RTNA | **45.809** | 52.400 | 1.14× | 69.947 | 1.53× |
-| (2, 24, 32768, 128) | RTZ | **45.354** | 48.468 | 1.07× | 69.947 | 1.54× |
-| (2, 16, 65536, 128) | RTNE | **117.228** | 136.591 | 1.17× | 171.273 | 1.46× |
-| (2, 16, 65536, 128) | RTNA | **115.663** | 130.469 | 1.13× | 171.273 | 1.48× |
-| (2, 16, 65536, 128) | RTZ | **114.837** | 121.431 | 1.06× | 171.273 | 1.49× |
-| (2, 8, 86016, 128) | RTNE | **100.713** | 118.902 | 1.18× | 141.319 | 1.40× |
-| (2, 8, 86016, 128) | RTNA | **100.181** | 114.447 | 1.14× | 141.319 | 1.41× |
-| (2, 8, 86016, 128) | RTZ | **99.530** | 106.613 | 1.07× | 141.319 | 1.42× |
-| (1, 16, 131072, 128) | RTNE | **231.065** | 269.271 | 1.17× | 339.322 | 1.47× |
-| (1, 16, 131072, 128) | RTNA | **228.830** | 258.065 | 1.13× | 339.322 | 1.48× |
-| (1, 16, 131072, 128) | RTZ | **227.051** | 240.015 | 1.06× | 339.322 | 1.49× |
+| (2, 24, 8192, 128) | RTNE | **3.083** | 3.792 | 1.23× | 4.237 | 1.37× |
+| (2, 24, 8192, 128) | RTNA | **3.022** | 3.605 | 1.19× | 4.237 | 1.40× |
+| (2, 24, 8192, 128) | RTZ | **2.983** | 3.303 | 1.11× | 4.237 | 1.42× |
+| (2, 24, 16384, 128) | RTNE | **11.670** | 14.691 | 1.26× | 17.923 | 1.54× |
+| (2, 24, 16384, 128) | RTNA | **11.479** | 13.801 | 1.20× | 17.923 | 1.56× |
+| (2, 24, 16384, 128) | RTZ | **11.385** | 12.629 | 1.11× | 17.923 | 1.57× |
+| (1, 32, 16384, 128) | RTNE | **8.013** | 9.031 | 1.13× | 11.030 | 1.38× |
+| (1, 32, 16384, 128) | RTNA | **7.828** | 8.656 | 1.11× | 11.030 | 1.41× |
+| (1, 32, 16384, 128) | RTZ | **7.731** | 7.989 | 1.03× | 11.030 | 1.43× |
+| (4, 16, 16384, 128) | RTNE | **15.591** | 18.337 | 1.18× | 22.061 | 1.41× |
+| (4, 16, 16384, 128) | RTNA | **15.331** | 17.567 | 1.15× | 22.061 | 1.44× |
+| (4, 16, 16384, 128) | RTZ | **15.055** | 16.183 | 1.07× | 22.061 | 1.47× |
+| (1, 64, 16384, 128) | RTNE | **15.528** | 18.333 | 1.18× | 22.763 | 1.47× |
+| (1, 64, 16384, 128) | RTNA | **15.239** | 17.535 | 1.15× | 22.763 | 1.49× |
+| (1, 64, 16384, 128) | RTZ | **15.040** | 16.161 | 1.07× | 22.763 | 1.51× |
+| (2, 24, 32768, 128) | RTNE | **46.002** | 54.794 | 1.19× | 69.947 | 1.52× |
+| (2, 24, 32768, 128) | RTNA | **44.440** | 52.363 | 1.18× | 69.947 | 1.57× |
+| (2, 24, 32768, 128) | RTZ | **44.075** | 48.549 | 1.10× | 69.947 | 1.59× |
+| (2, 16, 65536, 128) | RTNE | **117.612** | 136.301 | 1.16× | 171.273 | 1.46× |
+| (2, 16, 65536, 128) | RTNA | **115.550** | 130.278 | 1.13× | 171.273 | 1.48× |
+| (2, 16, 65536, 128) | RTZ | **114.665** | 121.668 | 1.06× | 171.273 | 1.49× |
+| (2, 8, 86016, 128) | RTNE | **101.071** | 118.939 | 1.18× | 141.319 | 1.40× |
+| (2, 8, 86016, 128) | RTNA | **100.165** | 114.515 | 1.14× | 141.319 | 1.41× |
+| (2, 8, 86016, 128) | RTZ | **99.397** | 106.513 | 1.07× | 141.319 | 1.42× |
+| (1, 16, 131072, 128) | RTNE | **232.517** | 269.278 | 1.16× | 339.322 | 1.46× |
+| (1, 16, 131072, 128) | RTNA | **228.475** | 258.092 | 1.13× | 339.322 | 1.49× |
+| (1, 16, 131072, 128) | RTZ | **226.152** | 239.587 | 1.06× | 339.322 | 1.50× |
 
 
 Geomean speedup across shapes:
-- **RTNE** — ours **1.14×** vs AITER, **1.39×** vs MAX
-- **RTNA** — ours **1.10×** vs AITER, **1.41×** vs MAX
-- **RTZ** — ours **1.02×** vs AITER, **1.42×** vs MAX
+- **RTNE** — ours **1.18×** vs AITER, **1.44×** vs MAX
+- **RTNA** — ours **1.15×** vs AITER, **1.47×** vs MAX
+- **RTZ** — ours **1.08×** vs AITER, **1.49×** vs MAX
 
-We beat AITER on RTNE and RTNA on every shape (up to 1.26× at 16K), and on RTZ on
-6 of 9 shapes (1.02–1.10×); the three 16K shapes with B·H ≥ 32 are within 5% on
-RTZ. The lead grows with context — 32K through 128K hold 1.06–1.18× across all
-modes. Against Modular MAX we are 1.27–1.57× faster everywhere.
+We now beat AITER on **every shape and every rounding mode**. RTNE/RTNA lead by
+1.11–1.26×; RTZ — historically the tightest race, since RTZ is AITER's own fastest
+variant — wins 1.03–1.11×. The dense tail KV-split is what erased the prior RTZ
+losses at the three 16K B·H ≥ 32 shapes (e.g. (4, 16, 16384) RTZ went 0.95× → 1.07×).
+The lead holds with context — 32K through 128K stay 1.06–1.19× across all modes.
+Against Modular MAX we are 1.37–1.59× faster everywhere.
 
 Reproduce with:
 
 ```sh
-python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5
+# --no-max gives the cleanest ours/AITER numbers (MAX's runtime perturbs co-located timings);
+# drop it to also measure Modular MAX.
+python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 ```
 
 ### Running the bench from scratch

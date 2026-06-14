@@ -27,6 +27,7 @@ int launch_attention_forward_rtna(
     int seq_len_kv,
     int head_dim,
     int layout,
+    void* workspace,
     void* stream);
 
 int launch_v_transpose_rtne(
@@ -42,6 +43,7 @@ int launch_attention_forward_rtne(
     int seq_len_kv,
     int head_dim,
     int layout,
+    void* workspace,
     void* stream);
 
 int launch_v_transpose_rtz(
@@ -57,6 +59,7 @@ int launch_attention_forward_rtz(
     int seq_len_kv,
     int head_dim,
     int layout,
+    void* workspace,
     void* stream);
 
 // LiteAttention launchers (one per round-mode TU). read_list/write_list/must_do_list are int16.
@@ -111,6 +114,11 @@ int launch_attention_forward_lite_rtz(
     int phase,
     int layout,
     void* stream);
+
+// Dense tail KV-split workspace size (round-mode-independent; one per TU).
+size_t tail_workspace_bytes_rtna(void);
+size_t tail_workspace_bytes_rtne(void);
+size_t tail_workspace_bytes_rtz(void);
 }
 
 // Helper: validate tensor properties
@@ -221,17 +229,32 @@ at::Tensor forward(
 
   // Dispatch on round_mode
   int (*vt_fn)(const void*, void*, int, int, int, int, void*);
-  int (*fwd_fn)(const void*, const void*, const void*, void*, int, int, int, int, int, int, void*);
+  int (*fwd_fn)(const void*, const void*, const void*, void*, int, int, int, int, int, int, void*, void*);
+  size_t (*wsbytes_fn)(void);
 
   if (round_mode == "rtna") {
     vt_fn = launch_v_transpose_rtna;
     fwd_fn = launch_attention_forward_rtna;
+    wsbytes_fn = tail_workspace_bytes_rtna;
   } else if (round_mode == "rtne") {
     vt_fn = launch_v_transpose_rtne;
     fwd_fn = launch_attention_forward_rtne;
+    wsbytes_fn = tail_workspace_bytes_rtne;
   } else {  // rtz
     vt_fn = launch_v_transpose_rtz;
     fwd_fn = launch_attention_forward_rtz;
+    wsbytes_fn = tail_workspace_bytes_rtz;
+  }
+
+  // Tail KV-split workspace: recovers the stranded fractional round (dense). Allocated via the
+  // caching allocator, so it's effectively reused across calls. Dev toggle MOONMATH_NO_TAIL=1
+  // passes a null workspace (plan_tail_split disables the split) for A/B against the same build.
+  const bool no_tail = (getenv("MOONMATH_NO_TAIL") != nullptr);
+  at::Tensor workspace;
+  void* workspace_ptr = nullptr;
+  if (!no_tail) {
+    workspace = at::empty({(int64_t)wsbytes_fn()}, at::TensorOptions().dtype(at::kByte).device(q.device()));
+    workspace_ptr = workspace.data_ptr();
   }
 
   // Launch V transpose
@@ -240,8 +263,9 @@ at::Tensor forward(
     throw std::runtime_error("launch_v_transpose returned error code " + std::to_string(rc));
   }
 
-  // Launch attention forward
-  rc = fwd_fn(q.data_ptr(), k.data_ptr(), v_t.data_ptr(), out.data_ptr(), B, H, Sq, Skv, D, layout_int, stream);
+  // Launch attention forward (with the tail workspace)
+  rc = fwd_fn(
+      q.data_ptr(), k.data_ptr(), v_t.data_ptr(), out.data_ptr(), B, H, Sq, Skv, D, layout_int, workspace_ptr, stream);
   if (rc != 0) {
     throw std::runtime_error("launch_attention_forward returned error code " + std::to_string(rc));
   }
