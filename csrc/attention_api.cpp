@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -79,6 +80,7 @@ int launch_attention_forward_lite_rtna(
     float threshold,
     int phase,
     int layout,
+    void* workspace,
     void* stream);
 int launch_attention_forward_lite_rtne(
     const void* q,
@@ -96,6 +98,7 @@ int launch_attention_forward_lite_rtne(
     float threshold,
     int phase,
     int layout,
+    void* workspace,
     void* stream);
 int launch_attention_forward_lite_rtz(
     const void* q,
@@ -113,12 +116,18 @@ int launch_attention_forward_lite_rtz(
     float threshold,
     int phase,
     int layout,
+    void* workspace,
     void* stream);
 
 // Dense tail KV-split workspace size (round-mode-independent; one per TU).
 size_t tail_workspace_bytes_rtna(void);
 size_t tail_workspace_bytes_rtne(void);
 size_t tail_workspace_bytes_rtz(void);
+
+// Lite LPT order-buffer size (one int per work-group). One per round-mode TU.
+size_t lite_workspace_bytes_rtna(int batch, int heads, int seq_len);
+size_t lite_workspace_bytes_rtne(int batch, int heads, int seq_len);
+size_t lite_workspace_bytes_rtz(int batch, int heads, int seq_len);
 }
 
 // Helper: validate tensor properties
@@ -371,16 +380,29 @@ at::Tensor forward_lite(
       float,
       int,
       int,
+      void*,  // workspace (LPT order buffer)
       void*);
+  size_t (*ltwsbytes_fn)(int, int, int);
   if (round_mode == "rtna") {
     vt_fn = launch_v_transpose_rtna;
     lite_fn = launch_attention_forward_lite_rtna;
+    ltwsbytes_fn = lite_workspace_bytes_rtna;
   } else if (round_mode == "rtne") {
     vt_fn = launch_v_transpose_rtne;
     lite_fn = launch_attention_forward_lite_rtne;
+    ltwsbytes_fn = lite_workspace_bytes_rtne;
   } else {  // rtz
     vt_fn = launch_v_transpose_rtz;
     lite_fn = launch_attention_forward_lite_rtz;
+    ltwsbytes_fn = lite_workspace_bytes_rtz;
+  }
+
+  // LPT work-balance order buffer (default). MOONMATH_LITE_PLAIN=1 → null → plain identity-order grid.
+  void* ws_ptr = nullptr;
+  at::Tensor workspace;
+  if (std::getenv("MOONMATH_LITE_PLAIN") == nullptr) {
+    workspace = at::empty({(int64_t)ltwsbytes_fn(B, H, Sq)}, at::TensorOptions().dtype(at::kByte).device(q.device()));
+    ws_ptr = workspace.data_ptr();
   }
 
   int rc = vt_fn(v.data_ptr(), v_t.data_ptr(), B * H * Skv, Skv, H, layout_int, stream);
@@ -403,6 +425,7 @@ at::Tensor forward_lite(
       threshold,
       phase,
       layout_int,
+      ws_ptr,
       stream);
   if (rc != 0) {
     throw std::runtime_error("launch_attention_forward_lite returned error code " + std::to_string(rc));

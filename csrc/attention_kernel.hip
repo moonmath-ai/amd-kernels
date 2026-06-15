@@ -510,9 +510,11 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     float* __restrict__ part_buf = nullptr,  // Split: the TailScratch workspace
     int grid_nqb = 0,                        // real #q-blocks when the grid is 1-D (prefix/split);
                                              //   0 ⇒ 2-D full grid (uses gridDim.x)
-    int split_ways = 0                       // Split: G = strided parts per q-block (= the kv stride)
+    int split_ways = 0,                      // Split: G = strided parts per q-block (= the kv stride)
+    // ── LiteAttention LPT work-balance reorder (lite full grid only) ──
+    const int* __restrict__ lpt_order = nullptr  // lpt_order[grid slot] = work-group to run here (longest-first)
 ) {
-  static_assert(!(isLite && Split), "lite has no tail KV-split (removed); Split is dense-only");
+  static_assert(!(isLite && Split), "lite has no tail KV-split; Split is dense-only");
   // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
   // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
   // q_group (q-group). 8 waves → 2 groups of 4 for warp-spec.
@@ -551,8 +553,12 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     q_block = sched_entry.x;
     bh_index = sched_entry.y;
   } else if (grid_nqb) {
-    q_block = wg_id_raw % grid_nqb;
-    bh_index = wg_id_raw / grid_nqb;
+    // 1-D grid (grid_nqb = real #q-blocks). lite passes lpt_order to run the heaviest q-blocks first
+    // (LPT work balance); null = identity. Pure reorder of the grid-slot→work-group map: every
+    // q-block still reads/writes its own rows, so the output is bit-identical.
+    const int wg = lpt_order ? lpt_order[wg_id_raw] : wg_id_raw;
+    q_block = wg % grid_nqb;
+    bh_index = wg / grid_nqb;
   } else {
     const int wg_id = isLite ? wg_id_raw : chiplet_swizzle(wg_id_raw, num_wgs, num_q_blocks);
     q_block = wg_id % num_q_blocks;
@@ -1350,6 +1356,64 @@ constexpr int MinKvBlocksToSplit = 48;  // below this, the merge can't amortize 
 constexpr int MinBlocksPerPart = 4;     // floor on kv blocks/part — finer splits let fixed cost dominate
 constexpr int MergeCostBlocks = 3;      // merge kernel's modelled cost, in kv-block-time units
 
+// ─── LiteAttention LPT (longest-processing-time) work-balance order ───────────
+// Lite work is non-uniform: each q-block keeps a different number of K-blocks. The grid is
+// occupancy-1, so the hardware runs one CTA per CU and greedily picks the next CTA in grid order as
+// CUs free up — that dynamic dispatch already balances the bulk of the work, leaving only a ramp-down
+// loss (a heavy q-block dispatched late finishes after everyone else). LPT removes it by running the
+// heaviest q-blocks first so the light ones backfill the tail → makespan ≈ total_work / NumCUs.
+//
+// We don't run the LPT assignment ourselves: the hardware's dynamic dispatch IS the "give the next
+// job to the freest CU" step. We only choose the ORDER — a counting sort of the work-groups by their
+// kept-block count, descending. lpt_order[slot] = the work-group the CTA at grid slot `slot` runs.
+// Output is unchanged (each work-group still owns its own rows) → bit-identical, no split/merge.
+constexpr int kWorkBuckets = 256;  // kept-count buckets for the counting sort (coarse order is fine)
+__global__ __launch_bounds__(256, 1) void plan_lite_order(
+    const int16_t* __restrict__ read_list,
+    int* __restrict__ lpt_order,
+    int num_q_blocks,
+    int num_kv_blocks,
+    int num_bh,
+    int phase) {
+  const int num_wgs = num_q_blocks * num_bh;
+  const int lstep = phase ? 1 : -1;
+  __shared__ int bucket_count[kWorkBuckets];  // # work-groups whose work falls in each bucket
+  __shared__ int bucket_slot[kWorkBuckets];   // running next free output slot per bucket
+  for (int b = threadIdx.x; b < kWorkBuckets; b += blockDim.x)
+    bucket_count[b] = 0;
+  __syncthreads();
+
+  // Map a work-group to its work bucket: count kept K-blocks from its skip-list RLE row, bucketize.
+  auto work_bucket = [&](int wg) -> int {
+    const int q_block = wg % num_q_blocks, bh = wg / num_q_blocks;
+    const long long row = ((long long)bh * num_q_blocks + q_block) * (num_kv_blocks + 2);
+    const int len = (int)read_list[row];
+    int kept = 0;
+    for (int i = len; i >= 2; i -= 2) {
+      const int lo = (int)read_list[row + i] + lstep;
+      const int hi = (int)read_list[row + i - 1] + lstep;
+      kept += (lstep > 0) ? (hi - lo) : (lo - hi);
+    }
+    const int b = kept * kWorkBuckets / (num_kv_blocks + 1);
+    return b < kWorkBuckets ? b : kWorkBuckets - 1;
+  };
+
+  for (int wg = threadIdx.x; wg < num_wgs; wg += blockDim.x)
+    atomicAdd(&bucket_count[work_bucket(wg)], 1);
+  __syncthreads();
+  // Exclusive scan HIGH→LOW so the heaviest buckets get the earliest grid slots (longest-first).
+  if (threadIdx.x == 0) {
+    int slot = 0;
+    for (int b = kWorkBuckets - 1; b >= 0; --b) {
+      bucket_slot[b] = slot;
+      slot += bucket_count[b];
+    }
+  }
+  __syncthreads();
+  for (int wg = threadIdx.x; wg < num_wgs; wg += blockDim.x)
+    lpt_order[atomicAdd(&bucket_slot[work_bucket(wg)], 1)] = wg;
+}
+
 TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t stream) {
   const int wgs = nqb * num_bh;
   const TailPlan no_split{wgs, 0, 1, 0};
@@ -1393,11 +1457,47 @@ TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t 
   return TailPlan{wgs - tail, tail, G, parts};
 }
 
-// Launch the dense tail KV-split (templated on layout): ordinary prefix (if non-empty) → split parts
-// → merge, all stream-ordered. Factored out of the launcher so the long forward-kernel arg list isn't
-// duplicated per layout. All of the forward kernel's lite/threshold/must-do params are unused here.
-template <bool kBSHD>
+// Single launch site for the forward kernel. Resolves the runtime `bshd` flag to the kBSHD template
+// and forwards every argument (defaulted to the kernel's own defaults), so each caller spells out only
+// the params that differ. Collapses the otherwise-identical <<<>>> argument lists (prefix / split /
+// lite-ordered / dense-full / lite-full) to one readable call each. Pure host glue — kernel unchanged.
+template <bool isLite, bool Split>
+void fwd_launch(
+    bool bshd,
+    dim3 grid,
+    hipStream_t stream,
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int seq_len,
+    int seq_len_kv,
+    float scale_log2e,
+    int heads,
+    const void* read_list = nullptr,
+    void* write_list = nullptr,
+    const void* must_do_list = nullptr,
+    float thr = 0.f,
+    int phase = 0,
+    float* part_buf = nullptr,
+    int grid_nqb = 0,
+    int split_ways = 0,
+    const int* lpt_order = nullptr) {
+#define FWD_ARGS                                                                                  \
+  (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv,        \
+      scale_log2e, heads, (const int16_t*)read_list, (int16_t*)write_list,                        \
+      (const int16_t*)must_do_list, thr, phase, part_buf, grid_nqb, split_ways, lpt_order
+  if (bshd)
+    attention_forward<true, isLite, Split><<<grid, dim3(BlockSize), 0, stream>>>(FWD_ARGS);
+  else
+    attention_forward<false, isLite, Split><<<grid, dim3(BlockSize), 0, stream>>>(FWD_ARGS);
+#undef FWD_ARGS
+}
+
+// Launch the dense tail KV-split: ordinary prefix (if non-empty) → split parts → merge, all
+// stream-ordered. All of the forward kernel's lite/threshold/must-do params are unused here.
 void launch_tail_split(
+    bool bshd,
     const void* q,
     const void* k,
     const void* v,
@@ -1413,44 +1513,53 @@ void launch_tail_split(
   // Prefix: the full-stream waves as one ordinary 1-D bh-major launch (grid_nqb=nqb strips the tail).
   // Empty when the entire grid is the stranded round.
   if (tp.prefix_wgs)
-    attention_forward<kBSHD, /*isLite=*/false, /*Split=*/false><<<dim3(tp.prefix_wgs), dim3(BlockSize), 0, stream>>>(
-        (const bf16_t*)q,
-        (const bf16_t*)k,
-        (const bf16_t*)v,
-        (bf16_t*)out,
-        seq_len,
-        seq_len_kv,
-        scale_log2e,
-        heads,
-        /*read_list=*/nullptr,
-        /*write_list=*/nullptr,
-        /*must_do_list=*/nullptr,
-        /*thr=*/0.f,
-        /*phase=*/0,
-        /*part_buf=*/nullptr,
-        /*grid_nqb=*/nqb,
-        /*split_ways=*/0);
+    fwd_launch</*isLite=*/false, /*Split=*/false>(
+        bshd, dim3(tp.prefix_wgs), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads,
+        nullptr, nullptr, nullptr, 0.f, 0, /*part_buf=*/nullptr, /*grid_nqb=*/nqb);
   // Split: one CTA per part; each walks every G-th kv block of its q-block and writes an fp32 partial.
-  attention_forward<kBSHD, /*isLite=*/false, /*Split=*/true><<<dim3(tp.parts), dim3(BlockSize), 0, stream>>>(
-      (const bf16_t*)q,
-      (const bf16_t*)k,
-      (const bf16_t*)v,
-      (bf16_t*)out,
-      seq_len,
-      seq_len_kv,
-      scale_log2e,
-      heads,
-      nullptr,
-      nullptr,
-      nullptr,
-      /*thr=*/0.f,
-      /*phase=*/0,
-      /*part_buf=*/(float*)workspace,
-      /*grid_nqb=*/nqb,
+  fwd_launch</*isLite=*/false, /*Split=*/true>(
+      bshd, dim3(tp.parts), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads, nullptr,
+      nullptr, nullptr, 0.f, 0, /*part_buf=*/(float*)workspace, /*grid_nqb=*/nqb,
       /*split_ways=*/tp.split_ways);
   // Merge: recombine each stranded q-block's parts into the final bf16 output.
-  merge_parts<kBSHD><<<dim3(tp.tail * MergeWGs), dim3(MergeThreads), 0, stream>>>(
-      (bf16_t*)out, seq_len, heads, (const float*)workspace);
+  if (bshd)
+    merge_parts<true><<<dim3(tp.tail * MergeWGs), dim3(MergeThreads), 0, stream>>>(
+        (bf16_t*)out, seq_len, heads, (const float*)workspace);
+  else
+    merge_parts<false><<<dim3(tp.tail * MergeWGs), dim3(MergeThreads), 0, stream>>>(
+        (bf16_t*)out, seq_len, heads, (const float*)workspace);
+}
+
+// Lite full-grid launch with LPT work-balance reordering: build the longest-first order, then run one
+// 1-D grid where grid slot i processes lpt_order[i]. No split/merge — a pure reorder of the
+// grid-slot→work-group map, so the output is bit-identical to the plain full grid, just with a tighter
+// (work-balanced) makespan. `order_buf` holds num_wgs ints (the permutation).
+void launch_lite_ordered(
+    bool bshd,
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    int seq_len,
+    int seq_len_kv,
+    float scale_log2e,
+    int heads,
+    int nqb,
+    int bh,
+    int nkb,
+    const void* read_list,
+    void* write_list,
+    const void* must_do_list,
+    float threshold,
+    int phase,
+    void* order_buf,
+    hipStream_t stream) {
+  int* lpt_order = (int*)order_buf;
+  plan_lite_order<<<1, dim3(256), 0, stream>>>((const int16_t*)read_list, lpt_order, nqb, nkb, bh, phase);
+  fwd_launch</*isLite=*/true, /*Split=*/false>(
+      bshd, dim3(nqb * bh), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads, read_list,
+      write_list, must_do_list, threshold, phase, /*part_buf=*/nullptr, /*grid_nqb=*/nqb,
+      /*split_ways=*/0, lpt_order);
 }
 
 }  // namespace
@@ -1461,6 +1570,14 @@ extern "C" {
 // Tail KV-split workspace (dense only): fp32 o + (m,l) for MaxParts parts. workspace==nullptr ⇒ no split.
 size_t tail_workspace_bytes(void) {
   return (size_t)MaxParts * (PartOFloats + PartMlFloats) * sizeof(float);
+}
+
+// Lite LPT order buffer: one int per work-group (q-block × batch·head). workspace==nullptr ⇒ plain
+// full-grid lite (no reorder).
+size_t lite_workspace_bytes(int batch, int heads, int seq_len) {
+  const int qt = (seq_len + QTileRows - 1) / QTileRows;
+  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
+  return (size_t)batch * heads * nqb * sizeof(int);
 }
 
 int launch_attention_forward(
@@ -1493,18 +1610,11 @@ int launch_attention_forward(
   const TailPlan tp = plan_tail_split(nqb, bh, nkb, workspace != nullptr, (hipStream_t)stream);
   if (tp.parts < 0) return 6;
   if (tp.tail) {
-    if (layout)
-      launch_tail_split<true>(q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
-    else
-      launch_tail_split<false>(q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
+    launch_tail_split(layout, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
     return (int)hipGetLastError();
   }
-  if (layout)
-    attention_forward<true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>(
-        (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e, heads);
-  else
-    attention_forward<false><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>(
-        (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, sl2e, heads);
+  fwd_launch</*isLite=*/false, /*Split=*/false>(
+      layout, grid, (hipStream_t)stream, q, k, v, out, seq_len, seq_len_kv, sl2e, heads);
   return (int)hipGetLastError();
 }
 
@@ -1514,7 +1624,9 @@ int launch_attention_forward(
 // 64 kv). must_do_list is an optional global force-compute RLE [len,s0,e0,…] (nullable).
 // threshold is log2 (~ -10); phase selects the reverse-list direction. V must be pre-transposed.
 // (Verdict ring reuses the evicted qg2 d-tile's LDS slot → no dynamic LDS; total LDS == dense's.)
-// Each CTA writes its own next-step RLE inline; one full-grid launch (no tail KV-split — lite only).
+// One full-grid launch; each CTA writes its own next-step RLE inline. With a workspace (the LPT order
+// buffer), the q-blocks run heaviest-first for a work-balanced makespan (bit-identical output);
+// workspace==nullptr runs the plain identity-order grid.
 int launch_attention_forward_lite(
     const void* q,
     const void* k,
@@ -1531,6 +1643,7 @@ int launch_attention_forward_lite(
     float threshold,
     int phase,
     int layout,
+    void* workspace,
     void* stream) {
   if (batch <= 0 || heads <= 0) return 1;
   if (seq_len <= 0) return 2;     // any Q len (partial last q-tile masked by valid[])
@@ -1540,38 +1653,25 @@ int launch_attention_forward_lite(
 
   const int bh = batch * heads;
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
-  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
+  const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG, nkb = (seq_len_kv + 63) / 64;
   const dim3 grid(nqb, bh);
   const float sl2e = Log2e / sqrtf((float)HeadDim);
 
-#define RL (const int16_t*)read_list
-#define WL (int16_t*)write_list
-#define MDL (const int16_t*)must_do_list
-// Lite runs the full grid as one launch (no tail KV-split — its stranded round is sparse); each CTA
-// walks its read list's kept blocks and RLE-encodes the next-step write list inline.
-#define LAUNCH_LITE(BSHD)                                                           \
-  attention_forward<BSHD, true><<<grid, dim3(BlockSize), 0, (hipStream_t)stream>>>( \
-      (const bf16_t*)q,                                                             \
-      (const bf16_t*)k,                                                             \
-      (const bf16_t*)v,                                                             \
-      (bf16_t*)out,                                                                 \
-      seq_len,                                                                      \
-      seq_len_kv,                                                                   \
-      sl2e,                                                                         \
-      heads,                                                                        \
-      RL,                                                                           \
-      WL,                                                                           \
-      MDL,                                                                          \
-      threshold,                                                                    \
-      phase)
-  if (layout)
-    LAUNCH_LITE(true);
-  else
-    LAUNCH_LITE(false);
-#undef LAUNCH_LITE
-#undef RL
-#undef WL
-#undef MDL
+  // LPT work-balance reorder (default when a workspace is given and kv is long enough to amortize the
+  // ~few-µs sort kernel): run the heaviest q-blocks first so the hardware's dynamic dispatch finishes
+  // near the work-bound floor. Pure reorder → bit-identical to the plain grid below.
+  if (workspace && nkb >= MinKvBlocksToSplit) {
+    launch_lite_ordered(
+        layout, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, bh, nkb, read_list, write_list,
+        must_do_list, threshold, phase, workspace, (hipStream_t)stream);
+    return (int)hipGetLastError();
+  }
+
+  // Lite runs the full grid as one launch (no tail KV-split — its stranded round is sparse); each CTA
+  // walks its read list's kept blocks and RLE-encodes the next-step write list inline.
+  fwd_launch</*isLite=*/true, /*Split=*/false>(
+      layout, grid, (hipStream_t)stream, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, read_list,
+      write_list, must_do_list, threshold, phase);
   return (int)hipGetLastError();
 }
 

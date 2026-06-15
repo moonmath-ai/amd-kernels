@@ -7,5 +7,6 @@
 #define launch_attention_forward_lite launch_attention_forward_lite_rtne
 #define launch_v_transpose launch_v_transpose_rtne
 #define tail_workspace_bytes tail_workspace_bytes_rtne
+#define lite_workspace_bytes lite_workspace_bytes_rtne
 
 #include "attention_kernel.hip"
