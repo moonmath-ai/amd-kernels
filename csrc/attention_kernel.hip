@@ -7,14 +7,13 @@
 //   Phase 1  pv[N-1] + qk[N]           K[N+1] HBM→LDS + softmax[N-1]
 //   Phase 2  softmax[N] + V_t prefetch  pv[N-1] + qk[N]
 //
-// One group keeps the SIMD's MFMA engine active while the other does VALU+memory.
-// L1V variant: V is pre-transposed offline (v_transpose_kernel_16x16) into V_t laid
-// out for direct load_u32x4 consumption in pv_phase — no LDS staging for V.
+// One group keeps the MFMA engine active while the other does VALU+memory. L1V variant: V is
+// pre-transposed offline (v_transpose_kernel_16x16) into V_t for direct load_u32x4 in pv_phase, no LDS staging.
 //
-// Key facts for the 16x16x16 MFMA layout:
-//   • Lane split: col = lane&15, quad = lane>>4 (4 quads, fp32x4 C-frag).
-//   • Each wave handles QTilesPerWave=3 q-tiles of 16 rows.
-//   • qk reads K in d-tile pairs {d_pair, d_pair+4}; pv consumes V_t super-chunks.
+// MFMA layout: lane col=lane&15, quad=lane>>4 (4 quads/fp32x4 C-frag); wave owns QTilesPerWave=3
+// q-tiles of 16 rows; qk reads K in d-tile pairs {d_pair,d_pair+4}; pv consumes V_t super-chunks.
+//
+// One TU, top to bottom. Round modes built by attention_{rtna,rtne,rtz}.hip shims (#define launcher, #include this).
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
@@ -27,9 +26,11 @@
 
 namespace {
 
+// ===== BUILDING BLOCKS: types, constants, intrinsics, layouts, tail scratch
+
 using bf16_t = __hip_bfloat16;
 using bf16x4_t = short __attribute__((ext_vector_type(4)));  // 4 bf16 = 8 bytes
-// RTNE/RTZ/RTNA bf16 rounding selected at compile time via -DBF16_ROUND.
+// bf16 rounding selected at compile time via -DBF16_ROUND.
 #ifndef BF16_ROUND
 #define BF16_ROUND RTZ
 #endif
@@ -58,17 +59,14 @@ constexpr int KRowsPerLoadWave = KvBlockRows / LoadWaves;  // 16
 constexpr float Log2e = 1.4426950408889634f;
 constexpr uint32_t BufferConfig = 0x00020000u;  // SRD word3: DATA_FORMAT=32 (raw 32-bit elems)
 
-// Online-softmax rescale gate: rescale o_acc only when a block raises the running max by
-// MORE than RescaleThreshold (log2). DEFAULT 0 = exact running max → dominant softmax prob
-// is exactly 1.0 (lossless in bf16) → output rmse vs an fp32 reference ~6e-5; a positive threshold lets the max
-// lag (dominant prob exp2(lag)≠1.0, bf16-packs with ~2^-8 error → rmse ~1.2e-3 at 8). It's
-// perf-neutral on this warp-spec pipeline (rescale hides in P2 under the other group's MFMAs),
-// so 0 costs nothing. Override only where softmax is on the critical path: -DRESCALE_THRESHOLD=8.0f
+// Rescale gate: rescale o_acc only when block raises running max by >RescaleThreshold (log2). DEFAULT 0 =
+// exact max → rmse ~6e-5, perf-neutral (rescale hides in P2). Override -DRESCALE_THRESHOLD=8.0f if softmax critical.
 #ifndef RESCALE_THRESHOLD
 #define RESCALE_THRESHOLD 0.0f
 #endif
 constexpr float RescaleThreshold = RESCALE_THRESHOLD;
 
+// ─── MFMA + scalar math ──────────────────────────────────────────────────────
 __device__ __forceinline__ fp32x4_t zero_fp32x4() {
   return fp32x4_t{0, 0, 0, 0};
 }
@@ -80,22 +78,19 @@ __device__ __forceinline__ float fast_rcp(float x) {
   return __builtin_amdgcn_rcpf(x);
 }
 
-// Inline-asm mfma: forces in/out same VGPR for accumulator (no compiler rename
-// → no v_mov copies) and keeps issue in source order via asm-volatile.
+// Inline-asm mfma: forces in/out same VGPR (no v_mov copies) and keeps issue in source order.
 __device__ __forceinline__ void asm_mfma(bf16x4_t a, bf16x4_t b, fp32x4_t& c) {
   asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
 }
 
-// Literal-0 C operand skips the v_mov init the compiler emits to zero a fresh
-// accumulator. "=&v" prevents aliasing the dst onto the A VGPRs.
+// Literal-0 C operand skips the v_mov zero-init; "=&v" prevents aliasing dst onto A VGPRs.
 __device__ __forceinline__ fp32x4_t asm_mfma_zero(bf16x4_t a, bf16x4_t b) {
   fp32x4_t r;
   asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, 0" : "=&v"(r) : "v"(a), "v"(b));
   return r;
 }
 
-// Scalar v_add/v_mul: avoids compiler-natural v_pk_*_f32 sharing writeback
-// ports with MFMA on the same wave-pair.
+// Scalar v_add/v_mul: avoids v_pk_*_f32 sharing writeback ports with MFMA on the same wave-pair.
 __device__ __forceinline__ float vadd_f32(float a, float b) {
   float r;
   asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
@@ -110,10 +105,8 @@ __device__ __forceinline__ bool wave_all(bool p) {
   return __all((int)p) != 0;
 }
 
-// bf16 packing. MaybeNaN=true guards 0×inf NaN. The NaN guard is left to the compiler
-// (v_cmp_u + fused v_add3 / builtin select) rather than pinned inline asm — at 3 q-groups
-// the compiler-scheduled form holds ~50 VGPR fewer in the softmax pack (pinning f + an out
-// copy per round, ×4 per pack, spills the 256-VGPR budget).
+// ─── bf16 rounding + pack ────────────────────────────────────────────────────
+// bf16 packing. MaybeNaN=true guards 0×inf NaN; guard left to compiler (pinned asm spills ~50 VGPR past 256 budget).
 template <bool MaybeNaN>
 __device__ __forceinline__ unsigned bf16_round_one(float f) {
   if constexpr (RoundMode == BF16Round::RTNE) {
@@ -136,10 +129,8 @@ __device__ __forceinline__ unsigned bf16_round_one(float f) {
   } else if constexpr (RoundMode == BF16Round::RTNA) {
     unsigned biased = __builtin_bit_cast(unsigned, f) + 0x8000u;  // ties-away rounding bias
     if constexpr (MaybeNaN) {
-      // NaN → canonical 0x7FFF0000. The check MUST be inline asm:
-      // -ffast-math (-ffinite-math-only) folds __builtin_isunordered to false, silently
-      // disabling a C-level guard — RTNA would then leak the biased NaN bits (0xFFC0)
-      // instead of 0x7FFF. (RTNE's guard survives only because it too is inline asm.)
+      // NaN → canonical 0x7FFF0000. MUST be inline asm: -ffast-math folds __builtin_isunordered to false,
+      // disabling a C guard → RTNA leaks biased NaN 0xFFC0 instead of 0x7FFF.
       u32x2_t nan_mask;
       asm volatile(
           "v_cmp_u_f32 %0, %2, %2\n"
@@ -156,6 +147,7 @@ template <bool MaybeNaN = false>
 __device__ __forceinline__ bf16x4_t pack4_bf16(float a, float b, float c, float d) {
   const unsigned ua = bf16_round_one<MaybeNaN>(a), ub = bf16_round_one<MaybeNaN>(b);
   const unsigned uc = bf16_round_one<MaybeNaN>(c), ud = bf16_round_one<MaybeNaN>(d);
+  // perm 0x07060302 keeps bytes [3,2] (upper 16b = bf16) of each source, packs 2 bf16/dword: w0=[bf16(b)|bf16(a)].
   const unsigned w0 = __builtin_amdgcn_perm(ub, ua, 0x07060302u);
   const unsigned w1 = __builtin_amdgcn_perm(ud, uc, 0x07060302u);
   bf16x4_t o;
@@ -164,10 +156,9 @@ __device__ __forceinline__ bf16x4_t pack4_bf16(float a, float b, float c, float 
   return o;
 }
 
-// Wrap a global pointer in a buffer resource descriptor (SRD = the 128-bit "V#" that
-// raw_buffer_load/store address through). Args: (base, stride=0 → not structured,
-// num_records=0xFFFFFFFF → effectively unbounded, config=BufferConfig). const_cast
-// because the builtin takes a non-const base; a load resource is never written through.
+// ─── Buffer / LDS load-store ─────────────────────────────────────────────────
+// Wrap a global ptr in a 128-bit SRD ("V#"): stride=0 (unstructured), num_records=0xFFFFFFFF (unbounded),
+// config=BufferConfig. const_cast: builtin takes non-const base, but a load resource is never written.
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer(const void* p, uint32_t num_records = 0xFFFFFFFFu) {
   return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, num_records, BufferConfig);
 }
@@ -186,8 +177,7 @@ __device__ __forceinline__ void store_bf16x4(__amdgpu_buffer_rsrc_t buffer, int 
   __builtin_memcpy(&bits, &v, 8);
   __builtin_amdgcn_raw_buffer_store_b64(bits, buffer, byte_off, 0, 0);
 }
-// Split a u32x4 (one b128 K/V load = a d-tile pair) into its two bf16x4 MFMA operands:
-// lo2 = the low d-tile (dwords 0,1), hi2 = the high d-tile (dwords 2,3).
+// Split a u32x4 (one b128 K/V load = d-tile pair) into 2 bf16x4 MFMA operands: lo2=dwords 0,1; hi2=dwords 2,3.
 __device__ __forceinline__ bf16x4_t lo2(u32x4_t v) {
   return __builtin_bit_cast(bf16x4_t, u32x2_t{v[0], v[1]});
 }
@@ -195,24 +185,19 @@ __device__ __forceinline__ bf16x4_t hi2(u32x4_t v) {
   return __builtin_bit_cast(bf16x4_t, u32x2_t{v[2], v[3]});
 }
 
-// Low 32 bits of an LDS pointer = its byte offset within the LDS segment. Hides
-// the pointer→integer cast at call sites.
+// Low 32 bits of an LDS pointer = its byte offset within the LDS segment.
 template <typename T>
 __device__ __forceinline__ uint32_t lds_addr(const T* p) {
   return (uint32_t)(uintptr_t)p;
 }
 
-// Broadcast a wave-uniform value into a scalar register (SGPR) via readfirstlane.
-// Every lane computes the same value here, so this lets the compiler use scalar
-// addressing instead of carrying it in a per-lane VGPR.
+// Broadcast a wave-uniform value into an SGPR via readfirstlane → scalar addressing, not a per-lane VGPR.
 __device__ __forceinline__ uint32_t to_scalar(uint32_t v) {
   return __builtin_amdgcn_readfirstlane(v);
 }
 
-// Immediate-offset ds_read2_b64: Offset0/Offset1 (units of 8 B) are baked into the
-// instruction; <0,16> fetches a d-tile pair in one op — offset0=0 is d-tile d_pair,
-// offset1=16 (+128 B) is the hi d-tile d_pair+4. The d_pair iteration rides the swizzled
-// base (k_addr's per-read xor+shift), not the immediate. %c emits the bare constant.
+// Immediate-offset ds_read2_b64: Offset0/Offset1 (8-B units) baked in; <0,16> fetches a d-tile pair in one op
+// (offset1=16=128B=HeadDimTiles/2 ahead). d_pair rides the swizzled base, not the immediate; %c emits the bare const.
 template <int Offset0, int Offset1>
 __device__ __forceinline__ u32x4_t ds_read2_b64_imm(uint32_t lds_base) {
   u32x4_t result;
@@ -222,8 +207,8 @@ __device__ __forceinline__ u32x4_t ds_read2_b64_imm(uint32_t lds_base) {
   return result;
 }
 
-// Pinned lgkmcnt wait — anchors the consumer so the compiler can't reorder above.
-// Count = how many outstanding LDS reads may remain in flight past this point.
+// ─── Wait-counts, barriers, scheduling ───────────────────────────────────────
+// Pinned lgkmcnt wait — anchors the consumer so the compiler can't reorder above it. Count = LDS reads left in flight.
 #define WAIT_LGKM_CASE(N) \
   if constexpr (Count == N) asm volatile("s_waitcnt lgkmcnt(" #N ")" : "+v"(anchor)::"memory");
 template <int Count, typename T>
@@ -245,10 +230,8 @@ __device__ __forceinline__ void lds_barrier() {
   wait_lgkmcnt0();  // lgkmcnt(0)
   __builtin_amdgcn_s_barrier();
 }
-// Issue-priority hints: in the 8-wave warp-spec, the MFMA-heavy group raises
-// priority so it wins issue arbitration over the memory/VALU group, then lowers
-// it back. sched_fence = compiler scheduling barrier (pins instruction order so
-// hand-placed prefetches don't sink past it). All fold to one inline op each.
+// Issue-priority: the MFMA-heavy group raises prio to win issue arbitration over the memory/VALU group, then lowers.
+// sched_fence = compiler scheduling barrier (pins order so hand-placed prefetches don't sink past it).
 __device__ __forceinline__ void mfma_prio_hi() {
   asm volatile("s_setprio 3" ::: "memory");
 }
@@ -259,77 +242,9 @@ __device__ __forceinline__ void sched_fence() {
   __builtin_amdgcn_sched_barrier(0);
 }
 
-// opus layouts: offset(coords) = Σ coordᵢ·strideᵢ, in bf16 ELEMENTS (×2 → bytes).
-// Static strides (opus::number<>) fold to shifts at compile time.
-template <int... S>
-constexpr auto strides() {
-  return opus::make_tuple(opus::number<S>{}...);
-}
-constexpr auto Shape2 = opus::make_tuple(opus::number<1>{}, opus::number<1>{});
-constexpr auto Shape3 = opus::make_tuple(opus::number<1>{}, opus::number<1>{}, opus::number<1>{});
-
-// Q / Out: row-major (seq, head_dim).
-constexpr auto QOLayout = opus::make_layout(Shape2, strides<HeadDim, 1>());
-
-// V_t (pre-transposed): (kv-iter, super-chunk, lane). bf16x8 / lane.
-constexpr int VtChunks = 16;                           // super-chunks / kv-block
-constexpr int VtBlockElems = KvBlockRows * HeadDim;    // 8192 elems / kv-block
-constexpr int VtChunkElems = VtBlockElems / VtChunks;  // 512  elems / super-chunk
-constexpr int VtLaneElems = 8;                         // bf16x8 / lane
-constexpr auto VtLayout = opus::make_layout(Shape3, strides<VtBlockElems, VtChunkElems, VtLaneElems>());
-
-// K addressed in DWORDS (2 bf16), row-major (kv_row, dword):
-//   HBM source: 64 dw/row.  LDS dest: same stride 64, but XOR-swizzled (see direct_lds_k
-//   and qk_swz_base) so the 32-way qk-read bank conflict (stride 64 ≡ 0 mod 32) is broken
-//   without padding (padded stride 66 is slower here — non-pow2 address mults).
-constexpr auto KLdsDword = opus::make_layout(Shape2, strides<KLdsStrideDwords, 1>());
-
-// HBM (seq, head-dim/dword) → offset layout for Q/K/Out, parameterized by the input layout.
-// BHSD: rows per-head contiguous → static seq-row stride Stride (byte- and ISA-identical).
-// BSHD: heads interleaved → seq-row stride heads·Stride (dynamic). Unused branch folds away.
-template <bool kBSHD, int Stride>
-__device__ __forceinline__ auto seq_layout(int heads) {
-  if constexpr (kBSHD)
-    return opus::make_layout(Shape2, opus::make_tuple(heads * Stride, opus::number<1>{}));
-  else
-    return opus::make_layout(Shape2, opus::make_tuple(opus::number<Stride>{}, opus::number<1>{}));
-}
-
-// qg2 LDS park: the ENTIRE q-group 2 (all HeadDimTiles d-tiles) staged in LDS, addressed in
-// DWORDS by (wave, d-tile, lane); each lane holds a bf16x4 (2 dwords) → lane stride 2.
-constexpr int Q2HalfTiles = HeadDimTiles / 2;                        // lo→hi d-tile offset (d_pair vs d_pair+4)
-constexpr int Q2LdsDwords = NumWaves * HeadDimTiles * WaveSize * 2;  // 8192 dwords = whole qg2 (32 KB)
-constexpr auto Q2Lds = opus::make_layout(Shape3, strides<HeadDimTiles * WaveSize * 2, WaveSize * 2, 2>());
-// LITE skip-vote ring: only the live window {step, step-1} is ever read, so depth 2 suffices.
-// It reuses the 4 KB lds_q2 slot freed by evicting qg2's last d-tile to a VGPR (no extra LDS).
-constexpr int VerdictRing = 2;
-
-// ─── Grid + MFMA thread→fragment index maps ─────────────────────────────────
-// Same rule as the memory layouts above (offset = Σ coordᵢ·strideᵢ) but these
-// yield LOGICAL indices — which q-tile / which kv-row / which fragment element —
-// not byte offsets, so callers don't multiply by 2.
-
-// (block_x, wave, q-group) → absolute q-tile index. A workgroup owns
-// QTilesPerWG tiles, a wave owns QTilesPerWave, a q-group is one tile.
-constexpr auto QTileGrid = opus::make_layout(Shape3, strides<QTilesPerWG, QTilesPerWave, 1>());
-
-// (load-wave, local row) → kv-row that load-wave owns. LoadWaves waves ×
-// KRowsPerLoadWave rows tile the KvBlockRows-row K block.
-constexpr auto KLoadRow = opus::make_layout(Shape2, strides<KRowsPerLoadWave, 1>());
-
-// (load-wave, i) → V_t super-chunk to L1-prefetch (VtChunks chunks / LoadWaves).
-constexpr auto VtPrefetch = opus::make_layout(Shape2, strides<VtChunks / LoadWaves, 1>());
-
-// MFMA 16x16x16 A/B fragment: lane = (col = lane&15, quad = lane>>4); the 16-wide
-// contraction is tiled by 4 quad-lanes, each holding QuadSpan contiguous elems.
-constexpr int QuadSpan = MfmaK / 4;  // 4 bf16 contraction elems / quad-lane
-// (d-tile, quad) → head-dim element, for Q / Out (bf16 elements).
-constexpr auto HdFrag = opus::make_layout(Shape2, strides<MfmaK, QuadSpan>());
-
-// HBM→LDS direct dword load. Inline-asm `s_mov_b32 m0` (not s_add chain) so the
-// compiler sees m0 as a fresh write per call — Clang's cselect pattern around
-// the builtin form can substitute m0=-1 when lds_dest is small, silently
-// dropping writes.
+// ─── HBM→LDS direct load ─────────────────────────────────────────────────────
+// HBM→LDS direct dword load. Inline-asm `s_mov_b32 m0`: Clang's cselect around the builtin can sub m0=-1 when
+// lds_dest is small, silently dropping writes.
 __device__ __forceinline__ void
 buffer_load_b32_to_lds(__amdgpu_buffer_rsrc_t buffer, uint32_t lds_dest, uint32_t voff, uint32_t soff) {
   asm volatile(
@@ -340,29 +255,11 @@ buffer_load_b32_to_lds(__amdgpu_buffer_rsrc_t buffer, uint32_t lds_dest, uint32_
       : "memory");
 }
 
-// Head-first chiplet swizzle: chunk_size = blocks_per_head co-locates all
-// q-blocks of one (B,H) on a single XCD's L2 → K+V stay resident.
-constexpr int NumXcds = 8;
-__device__ __forceinline__ int chiplet_swizzle(int wg_id, int num_wgs, int chunk_size) {
-  const int block = NumXcds * chunk_size;
-  const int limit = (num_wgs / block) * block;
-  if (wg_id >= limit) return wg_id;
-  const int xcd = wg_id % NumXcds;
-  const int local_id = wg_id / NumXcds;
-  const int chunk_idx = local_id / chunk_size;
-  const int pos_in_chunk = local_id % chunk_size;
-  return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
-}
-
-// Cross-lane reduce over {l, l^16, l^32, l^48}: in 16x16x16 C-layout each lane
-// outputs at q_row = col, so the 4 quad-lanes sharing col span all 64 kvs of the
-// q-row. ds_swizzle 0x401F folds l^16, ds_bpermute folds l^32 (covers l^48 too).
-// Explicit lgkm(0) wait avoids a race when the bpermute is the only LGKM in flight.
-// Cross-32-half bpermute. The source-lane index ((lane^32)<<2) is computed INSIDE the asm
-// from mbcnt each call — recomputable/pure, so the allocator never pins a long-lived index
-// VGPR that would SPILL at the softmax-top peak (the kernel runs at the 256-VGPR ceiling).
-// The lgkmcnt(0) wait is BAKED IN right after the bpermute so the result read can't run
-// before it (a correctness guard tied to THIS bpermute).
+// ─── Cross-lane reductions ───────────────────────────────────────────────────
+// Cross-lane reduce over {l,l^16,l^32,l^48}: 4 quad-lanes sharing col span all 64 kvs. ds_swizzle 0x401F folds
+// l^16; ds_bpermute folds l^32 (covers l^48). bperm_xor32: source-lane ((lane^32)<<2) computed INSIDE the asm from
+// mbcnt each call (pure/remat) so no long-lived index VGPR SPILLS at the softmax peak (256-VGPR); lgkmcnt(0) baked
+// in after bpermute. In asm: <<2 = lane→byte (4B/lane); XOR 0x80 = the "^32" peer (32 lanes·4B).
 __device__ __forceinline__ int bperm_xor32(int data) {
   int idx, r;
   asm volatile(
@@ -390,12 +287,106 @@ __device__ __forceinline__ float cross_lane_sum(float v) {
   return partial + __builtin_bit_cast(float, peer32);
 }
 
-// Online-softmax update for ONE q-group. Extracting this per-q-group keeps each q-group's
-// softmax temporaries scoped to the call, which holds the 3-q-group kernel under the 256-VGPR
-// cap — inlining all q-groups' softmax into the kernel scope spills ~110 VGPR. Folds the block
-// into the running (max, sum, o_acc): skip-rescale gate (RescaleThreshold), then exp2 +
-// NaN-safe pack of probs, then row_sum. Cross-lane sum is deferred to the epilogue (rescale is
-// a per-row global factor → math-equivalent).
+// ─── opus layouts + index maps ───────────────────────────────────────────────
+template <int... S>
+constexpr auto strides() {
+  return opus::make_tuple(opus::number<S>{}...);
+}
+constexpr auto Shape2 = opus::make_tuple(opus::number<1>{}, opus::number<1>{});
+constexpr auto Shape3 = opus::make_tuple(opus::number<1>{}, opus::number<1>{}, opus::number<1>{});
+
+// Q / Out: row-major (seq, head_dim).
+constexpr auto QOLayout = opus::make_layout(Shape2, strides<HeadDim, 1>());
+
+// V_t (pre-transposed): (kv-iter, super-chunk, lane). bf16x8 / lane.
+constexpr int VtChunks = 16;                           // super-chunks / kv-block
+constexpr int VtBlockElems = KvBlockRows * HeadDim;    // 8192 elems / kv-block
+constexpr int VtChunkElems = VtBlockElems / VtChunks;  // 512  elems / super-chunk
+constexpr int VtLaneElems = 8;                         // bf16x8 / lane
+constexpr auto VtLayout = opus::make_layout(Shape3, strides<VtBlockElems, VtChunkElems, VtLaneElems>());
+
+// K in DWORDS (2 bf16), row-major (kv_row,dword), 64 dw/row. LDS dest: same stride 64 but XOR-swizzled
+// (direct_lds_k/qk_swz_base) to break the 32-way qk-read bank conflict (stride 64≡0 mod 32) without padding (pad is
+// slower).
+constexpr auto KLdsDword = opus::make_layout(Shape2, strides<KLdsStrideDwords, 1>());
+
+// HBM (seq, head-dim/dword) → Q/K/Out offset layout by input layout. BHSD: per-head contiguous → static stride
+// Stride (byte-identical). BSHD: heads interleaved → dynamic stride heads·Stride. Unused branch folds away.
+template <bool kBSHD, int Stride>
+__device__ __forceinline__ auto seq_layout(int heads) {
+  if constexpr (kBSHD)
+    return opus::make_layout(Shape2, opus::make_tuple(heads * Stride, opus::number<1>{}));
+  else
+    return opus::make_layout(Shape2, opus::make_tuple(opus::number<Stride>{}, opus::number<1>{}));
+}
+
+// qg2 LDS park: entire q-group 2 (all HeadDimTiles d-tiles) staged in LDS, addressed in DWORDS by
+// (wave, d-tile, lane); each lane holds a bf16x4 (2 dwords) → lane stride 2.
+constexpr int Q2HalfTiles = HeadDimTiles / 2;  // 4 = #d-tiles per half; also the lo→hi stride (d_pair → d_pair+4)
+constexpr int Q2LdsDwords = NumWaves * HeadDimTiles * WaveSize * 2;  // 8192 dwords = whole qg2 (32 KB)
+constexpr auto Q2Lds = opus::make_layout(Shape3, strides<HeadDimTiles * WaveSize * 2, WaveSize * 2, 2>());
+// LITE skip-vote ring: live window {step,step-1} → depth 2. Reuses the 4 KB lds_q2 slot freed by evicting qg2's last
+// d-tile to VGPR.
+constexpr int VerdictRing = 2;
+
+// ─── Grid + MFMA thread→fragment index maps ─────────────────────────────────
+// Same rule as the memory layouts (offset = Σ coordᵢ·strideᵢ) but yield LOGICAL indices (q-tile/kv-row/frag elem), not
+// bytes.
+
+// (block_x, wave, q-group) → absolute q-tile index (WG owns QTilesPerWG, wave QTilesPerWave, q-group 1).
+constexpr auto QTileGrid = opus::make_layout(Shape3, strides<QTilesPerWG, QTilesPerWave, 1>());
+
+// (load-wave, local row) → kv-row owned: LoadWaves × KRowsPerLoadWave tile the K block.
+constexpr auto KLoadRow = opus::make_layout(Shape2, strides<KRowsPerLoadWave, 1>());
+
+// (load-wave, i) → V_t super-chunk to L1-prefetch (VtChunks chunks / LoadWaves).
+constexpr auto VtPrefetch = opus::make_layout(Shape2, strides<VtChunks / LoadWaves, 1>());
+
+// MFMA 16x16x16 A/B fragment: lane=(col=lane&15, quad=lane>>4); 16-wide contraction tiled by 4 quad-lanes, QuadSpan
+// elems each.
+constexpr int QuadSpan = MfmaK / 4;  // 4 bf16 contraction elems / quad-lane
+// (d-tile, quad) → head-dim element, for Q / Out (bf16 elements).
+constexpr auto HdFrag = opus::make_layout(Shape2, strides<MfmaK, QuadSpan>());
+
+// Head-first chiplet swizzle: chunk_size=blocks_per_head co-locates one (B,H)'s q-blocks on one XCD's L2 → K+V stay
+// resident.
+constexpr int NumXcds = 8;
+__device__ __forceinline__ int chiplet_swizzle(int wg_id, int num_wgs, int chunk_size) {
+  const int block = NumXcds * chunk_size;
+  const int limit = (num_wgs / block) * block;
+  if (wg_id >= limit) return wg_id;
+  const int xcd = wg_id % NumXcds;
+  const int local_id = wg_id / NumXcds;
+  const int chunk_idx = local_id / chunk_size;
+  const int pos_in_chunk = local_id % chunk_size;
+  return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
+}
+
+// ─── Dense tail KV-split scratch (dense only) ────────────────────────────────
+// 384-row q-blocks run in rounds of NumCUs; a fractional last round strands CUs. Recover it by splitting each
+// stranded q-block's kv work G ways (split_ways): part p walks every G-th kv block from offset p, writing an fp32
+// (o,m,l) partial; merge_parts recombines a q-block's G partials via online-softmax into bf16.
+constexpr int NumCUs = 304;           // MI300X compute units (= one occupancy-1 CTA each)
+constexpr int MaxParts = 2 * NumCUs;  // upper bound on total parts (the planner caps the split at ≤2 CU rounds)
+constexpr int PartRows = QTilesPerWG * QTileRows;  // 384 q-rows owned by one part (== one q-block)
+constexpr int PartOFloats = PartRows * HeadDim;    // fp32 `o` values per part (384·128)
+constexpr int PartMlFloats = PartRows * 2;         // fp32 (m,l) pair per row, per part (384·2)
+// One flat float buffer: `o` region then `(m,l)` region, each addressed by a compile-time-strided opus layout.
+constexpr auto PartO = opus::make_layout(Shape3, strides<PartOFloats, HeadDim, 1>());  // (part, row, hd) → o
+constexpr auto PartMl = opus::make_layout(Shape2, strides<PartMlFloats, 2>());         // (part, row) → m; +1 → l
+struct TailScratch {
+  float* o;   // [MaxParts][PartRows][HeadDim] fp32 output partials, indexed by PartO(part, row, hd)
+  float* ml;  // [MaxParts][PartRows][2]       fp32 (row max, row sum), indexed by PartMl(part, row){+1}
+  __device__ __host__ explicit TailScratch(float* ws) : o(ws), ml(ws + (long long)MaxParts * PartOFloats) {}
+};
+
+// Host-uploaded schedule (static single-stream buffer) read by split+merge kernels: [0,parts)=per-part
+// (q_block,bh,_,_); [MaxParts,+tail)=per-q-block (q_block,bh,part_base,n_parts=G).
+__device__ int4 tail_sched[2 * MaxParts];
+// ===== FORWARD KERNEL: online softmax + attention_forward (dense / lite / split)
+
+// Online-softmax update for ONE q-group (per-q-group scoping keeps kernel <256-VGPR; inlining all spills ~110). Folds
+// block into running (max,sum,o_acc): skip-rescale gate, exp2+NaN-safe pack, row_sum; cross-lane sum to epilogue.
 __device__ __forceinline__ void softmax_update(
     fp32x4_t scores[],
     fp32x4_t oreg[],
@@ -409,10 +400,10 @@ __device__ __forceinline__ void softmax_update(
   const bool lane_ok = (new_m_local - row_m) < RescaleThreshold;
   const bool all_ok = wave_all(lane_ok) && !first_block;
 
-  float neg_m;
+  float neg_max;
   float rescale = 1.f;
   if (__builtin_expect(all_ok, 1)) {
-    neg_m = -row_m;
+    neg_max = -row_m;
   } else {
     const float bmax = cross_lane_max(bmax_local);
     const float old_m = row_m;
@@ -420,9 +411,8 @@ __device__ __forceinline__ void softmax_update(
     if (new_m != old_m) {
       rescale = first_block ? 0.f : fast_exp2(old_m - new_m);
       if (!first_block) {
-        // o_acc writeback fence: the "+v"(oreg[t]) pins + "memory" clobber order this
-        // rescale after pv's asm MFMA writes (LLVM cannot see those defs); the same-wave
-        // MFMA->VALU hardware interlock covers writeback latency.
+        // o_acc writeback fence: "+v"(oreg)+"memory" orders rescale after pv's asm MFMA writes (LLVM can't see those
+        // defs); same-wave MFMA→VALU HW interlock covers writeback.
         asm volatile(""
                      : "+v"(oreg[0]),
                        "+v"(oreg[1]),
@@ -442,53 +432,24 @@ __device__ __forceinline__ void softmax_update(
       }
     }
     row_m = new_m;
-    neg_m = -new_m;
+    neg_max = -new_m;
   }
 
-  float bs[KvSubtiles];
+  float sub_sum[KvSubtiles];
 #pragma unroll
   for (int kv_sub = 0; kv_sub < KvSubtiles; ++kv_sub) {
-    const float p0 = fast_exp2(fmaf(scores[kv_sub][0], scale_log2e, neg_m));
-    const float p1 = fast_exp2(fmaf(scores[kv_sub][1], scale_log2e, neg_m));
-    const float p2 = fast_exp2(fmaf(scores[kv_sub][2], scale_log2e, neg_m));
-    const float p3 = fast_exp2(fmaf(scores[kv_sub][3], scale_log2e, neg_m));
-    bs[kv_sub] = (p0 + p1) + (p2 + p3);
-    // No NaN guard here (hot path): exp2 yields [0,1] or NaN — never Inf — and a NaN packs
-    // to *some* bf16 NaN that the PV MFMA turns into an fp32 NaN regardless of bit pattern.
-    // The output pack (epilogue) then canonicalizes that to 0x7FFF. Guarding
-    // here too would just cost a cmp+cndmask per element with no effect on the final result.
+    const float p0 = fast_exp2(fmaf(scores[kv_sub][0], scale_log2e, neg_max));
+    const float p1 = fast_exp2(fmaf(scores[kv_sub][1], scale_log2e, neg_max));
+    const float p2 = fast_exp2(fmaf(scores[kv_sub][2], scale_log2e, neg_max));
+    const float p3 = fast_exp2(fmaf(scores[kv_sub][3], scale_log2e, neg_max));
+    sub_sum[kv_sub] = (p0 + p1) + (p2 + p3);
+    // No NaN guard (hot path): exp2 → [0,1] or NaN (never Inf); NaN packs to bf16 NaN → PV MFMA → fp32 NaN → epilogue
+    // pack canonicalizes to 0x7FFF. Guarding = cmp+cndmask/elem for no effect.
     probs[kv_sub] = pack4_bf16</*MaybeNaN=*/false>(p0, p1, p2, p3);
   }
-  const float bsum = vadd_f32(vadd_f32(bs[0], bs[1]), vadd_f32(bs[2], bs[3]));
-  row_l = vfma_f32(row_l, rescale, bsum);
+  const float block_sum = vadd_f32(vadd_f32(sub_sum[0], sub_sum[1]), vadd_f32(sub_sum[2], sub_sum[3]));
+  row_l = vfma_f32(row_l, rescale, block_sum);
 }
-
-// ─── Tail KV-split (dense only) ─────────────────────────────────────────────
-// The grid tiles into 384-row q-blocks run in rounds of NumCUs. A fractional last round strands CUs:
-// its q-blocks still walk the FULL kv stream while the other CUs sit idle. We recover that wasted
-// round by splitting each stranded q-block's kv work `split_ways` (= G) ways across all the CUs —
-// part p of a q-block processes every G-th kv block starting at offset p (a strided KV-split). Each
-// part writes its fp32 (o, m, l) partial to a scratch workspace; merge_parts then recombines a
-// q-block's G partials with the online-softmax rule and writes the final bf16 output.
-constexpr int NumCUs = 304;           // MI300X compute units (= one occupancy-1 CTA each)
-constexpr int MaxParts = 2 * NumCUs;  // upper bound on total parts (the planner caps the split at ≤2 CU rounds)
-constexpr int PartRows = QTilesPerWG * QTileRows;  // 384 q-rows owned by one part (== one q-block)
-constexpr int PartOFloats = PartRows * HeadDim;    // fp32 `o` values per part (384·128)
-constexpr int PartMlFloats = PartRows * 2;         // fp32 (m,l) pair per row, per part (384·2)
-// The scratch workspace is one flat float buffer split into an `o` region then an `(m,l)` region.
-// Both are addressed by compile-time-strided opus layouts (offset = Σ coordᵢ·strideᵢ):
-constexpr auto PartO = opus::make_layout(Shape3, strides<PartOFloats, HeadDim, 1>());  // (part, row, hd) → o
-constexpr auto PartMl = opus::make_layout(Shape2, strides<PartMlFloats, 2>());         // (part, row) → m; +1 → l
-struct TailScratch {
-  float* o;   // [MaxParts][PartRows][HeadDim] fp32 output partials, indexed by PartO(part, row, hd)
-  float* ml;  // [MaxParts][PartRows][2]       fp32 (row max, row sum), indexed by PartMl(part, row){+1}
-  __device__ __host__ explicit TailScratch(float* ws) : o(ws), ml(ws + (long long)MaxParts * PartOFloats) {}
-};
-
-// Host-uploaded schedule, two regions of int4 (read on device by the split + merge kernels):
-//   tail_sched[0 .. parts)            one entry PER PART      = (q_block, bh, _, _)
-//   tail_sched[MaxParts .. +tail)     one entry PER Q-BLOCK   = (q_block, bh, part_base, n_parts=G)
-__device__ int4 tail_sched[2 * MaxParts];
 
 template <bool kBSHD, bool isLite = false, bool Split = false>
 __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
@@ -515,9 +476,16 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     const int* __restrict__ lpt_order = nullptr  // lpt_order[grid slot] = work-group to run here (longest-first)
 ) {
   static_assert(!(isLite && Split), "lite has no tail KV-split; Split is dense-only");
-  // MFMA 16x16x16 lane split: col = q-col / kv-row in tile, quad = which 4 of 64.
-  // Tile dims walked by the loops: kv_sub (kv-subtile), d_pair (d-tile pair), d_tile (hd-tile),
-  // q_group (q-group). 8 waves → 2 groups of 4 for warp-spec.
+  // ROADMAP (one CTA = one 384-row q-block of one (batch,head)):
+  //   1. Thread/lane setup + per-(B,H) HBM base offsets for Q/K/V_t/Out.
+  //   2. Prologue — Q→VGPR/LDS, first K-block→LDS, zero accumulators.
+  //   3. Main loop over K-blocks — 8-wave warp-spec: 2 groups swap MFMA-vs-memory across a mid-iter barrier (qk/pv
+  //   overlap softmax+K/V loads).
+  //   4. Epilogue — finish last block; Split: raw fp32 partials to tail scratch, else normalize by denom + store bf16
+  //   to Out.
+  // Dense/lite(skip)/split share this body; `if constexpr` selects per template.
+  //
+  // MFMA 16x16x16 lane split: col = q-col/kv-row in tile, quad = which 4 of 64. 8 waves → 2 groups of 4 for warp-spec.
   const int tid = threadIdx.x;
   const int wave_id = tid >> 6;
   const int lane = tid & 63;
@@ -526,36 +494,31 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   const bool group_a = (wave_id < LoadWaves);
   const int wave_in_group = group_a ? wave_id : (wave_id - LoadWaves);
 
-  // K-LDS XOR swizzle (stride-64, bank-conflict-free) — matches direct_lds_k's HBM-source
-  // swizzle. Read-offset fields are bit-disjoint so the per-(d_pair,kv_sub,k_buf) address is
-  // an OR (≡ add): col=kv_row [8-11] | kv_sub [12-13] | k_buf [14] | (quad 8-byte unit ^
-  // col_lo) [3-4] | (d_pair ^ col_hi) [5-6]; the d-tile-high (+4) rides ds_read2 offset1=16.
+  // K-LDS XOR swizzle (stride-64, bank-conflict-free), matches direct_lds_k's HBM-source swizzle. Read-offset fields
+  // are bit-disjoint (OR≡add): col[8-11] | kv_sub[12-13] | k_buf[14] | (quad^col_lo)[3-4] | (d_pair^col_hi)[5-6];
+  // d-tile-high rides offset1=16.
   const uint32_t col_lo = (uint32_t)(col & 3);
   const uint32_t col_hi = (uint32_t)(col >> 2);
+  // worked example col=5,quad=2: col_lo=1 → (5<<8) | ((2^1)<<3) = 0x500 | 0x18 = 0x518.
   const uint32_t qk_swz_base = (uint32_t)(((unsigned)col << 8) | (((unsigned)quad ^ col_lo) << 3));
 
-  // Grid: x = #q-blocks (384-row blocks = ceil(seq_len/384)), y = batch·heads.
-  // One workgroup (CTA) per (q-block, batch·head).
+  // Grid: x = #q-blocks (384-row = ceil(seq_len/384)), y = batch·heads. One CTA per (q-block, bh).
   const int num_q_blocks = gridDim.x;
   const int num_bh = gridDim.y;
   const int wg_id_raw = blockIdx.y * num_q_blocks + blockIdx.x;
   const int num_wgs = num_q_blocks * num_bh;
-  // Block selection. Split: this part's (q_block, bh) come from tail_sched. Prefix/split run a 1-D
-  // grid (grid_nqb = real #q-blocks, bh-major, tail rounds stripped → no swizzle). 2-D full grid
-  // (grid_nqb==0): lite uses identity — per-head-uneven sparsity makes the chiplet swizzle HARMFUL
-  // (dense heads' XCDs saturate while sparse idle: 0.83x); identity spreads a head's q-tiles across
-  // all 8 XCDs. Dense full uses the head-first chiplet swizzle (co-locates a (B,H)'s q-blocks on one
-  // XCD's L2, ~+1.4% @ moderate S).
+  // Block selection. Split: (q_block,bh) from tail_sched. 2-D full grid (grid_nqb==0): lite uses identity (chiplet
+  // swizzle HARMFUL under uneven sparsity: 0.83x); dense uses head-first chiplet swizzle (co-locate on one XCD's L2,
+  // ~+1.4%).
   int q_block, bh_index;
   if constexpr (Split) {
-    // One CTA per part: its (q_block, bh) come straight from the uploaded per-part schedule entry.
+    // One CTA per part: its (q_block,bh) come from the uploaded per-part schedule entry.
     const int4 sched_entry = tail_sched[blockIdx.x];
     q_block = sched_entry.x;
     bh_index = sched_entry.y;
   } else if (grid_nqb) {
-    // 1-D grid (grid_nqb = real #q-blocks). lite passes lpt_order to run the heaviest q-blocks first
-    // (LPT work balance); null = identity. Pure reorder of the grid-slot→work-group map: every
-    // q-block still reads/writes its own rows, so the output is bit-identical.
+    // 1-D grid. lite's lpt_order runs heaviest q-blocks first (null=identity); pure grid-slot→WG reorder →
+    // bit-identical. Radix is grid_nqb (TRUE #q-blocks), not gridDim.x (prefix/split's x-dim is #parts).
     const int wg = lpt_order ? lpt_order[wg_id_raw] : wg_id_raw;
     q_block = wg % grid_nqb;
     bh_index = wg / grid_nqb;
@@ -565,11 +528,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     bh_index = wg_id / num_q_blocks;
   }
 
-  // Q-tile ownership: each wave owns QTilesPerWave (=3) 16-row q-tiles. For each,
-  // q_tile_start_row is the absolute seq-row where that tile begins — a per-tile
-  // origin used for addressing; lane `col` later reads/writes row (start + col).
-  // Parallel arrays valid/q_tile_start_row/q_frag/o_acc/scores are all indexed by
-  // q_group; valid[] masks a tile that runs past the sequence end.
+  // Q-tile ownership: each wave owns QTilesPerWave(=3) 16-row q-tiles. q_tile_start_row = tile's origin seq-row, lane
+  // `col` reads/writes row (start+col). Parallel arrays indexed by q_group; valid[] masks past-seq-end.
   const int num_q_tiles = (seq_len + QTileRows - 1) / QTileRows;  // ceil
   bool valid[QTilesPerWave];
   int q_tile_start_row[QTilesPerWave];
@@ -583,20 +543,14 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // ceil block count; last_kv_rows ∈ [1,64] = valid rows in the last (partial) K/V block.
   const int num_kv_blocks = (seq_len_kv + KvBlockRows - 1) / KvBlockRows;
   const int last_kv_rows = seq_len_kv - (num_kv_blocks - 1) * KvBlockRows;
-  // KV stride/offset over the [0, num_kv_blocks) stream. A dense Split part walks every split_ways-th
-  // block from its own offset (the strided KV-split); everyone else — including all of lite — walks
-  // every block (stride 1, offset 0). The same stride drives the dense arithmetic walk and the lite
-  // cursor uniformly; since Split is dense-only (static_assert), lite always gets stride 1.
+  // KV stride/offset over [0,num_kv_blocks). Dense Split part walks every split_ways-th block from its offset; everyone
+  // else (incl all lite) walks every block (stride 1, off 0).
   const int kv_stride = Split ? split_ways : 1;
   const int kv_offset = Split ? (blockIdx.x % split_ways) : 0;
 
-  // Cross-attention offsets. Q/K/Out keep the TRUE seq lens with their SRD bounded to the valid
-  // byte extent: a partial last q-tile / K block (rows past the true seq len) then reads 0 /
-  // drops its store IN HARDWARE — zero-VGPR OOB handling, no caller padding, no per-row gates.
-  // V_t is per-head padded to num_kv_blocks·64 rows by v_transpose (tail zeroed) → in-bounds.
-  // Aligned → bounds = exact extent (no-op) → byte-identical (BHSD).
-  // Only the HBM addressing of Q/K/Out depends on the layout (masking + the LDS/V_t hot loop
-  // don't). Shadow the (seq,hd)→offset opus layouts with the layout's seq-row stride; head base below.
+  // Cross-attention offsets. Q/K/Out keep TRUE seq lens, SRD bounded to valid byte extent: partial last q-tile/K-block
+  // reads 0 / drops store IN HARDWARE (zero-VGPR OOB). V_t padded to num_kv_blocks·64 rows (tail zeroed). Only Q/K/Out
+  // addressing is layout-dependent.
   const auto QOLayout = seq_layout<kBSHD, HeadDim>(heads);      // Q/Out (seq, head-dim elems)
   const auto KHbmDword = seq_layout<kBSHD, KRowDwords>(heads);  // K     (seq, dwords)
   const int k_row_dwords = kBSHD ? heads * KRowDwords : KRowDwords;
@@ -610,12 +564,11 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     bh_offset_kv = (long long)bh_index * seq_len_kv * HeadDim;
   }
   const long long bh_offset_v = (long long)bh_index * num_kv_blocks * KvBlockRows * HeadDim;
-  // BHSD: per-head contiguous (seq·HeadDim·2). BSHD: rows interleaved → ×heads addressable span.
+  // BHSD: per-head contiguous (seq·HeadDim·2). BSHD: rows interleaved → ×heads span.
   const uint32_t q_bytes = (uint32_t)((long long)seq_len * (kBSHD ? heads : 1) * HeadDim * 2);
   const uint32_t kv_bytes = (uint32_t)((long long)seq_len_kv * (kBSHD ? heads : 1) * HeadDim * 2);
-  // V_t is the kernel's per-head-contiguous layout (v_transpose output, padded to num_kv_blocks·64
-  // rows) regardless of input layout. Bound the SRD to that span so a stray pv offset CLAMPS to 0
-  // instead of faulting into unmapped memory (Q/K/Out are bounded too; V must be as well).
+  // V_t per-head-contiguous (padded to num_kv_blocks·64 rows). Bound SRD to that span so a stray pv offset CLAMPS to 0,
+  // not faults.
   const uint32_t v_bytes = (uint32_t)((long long)num_kv_blocks * KvBlockRows * HeadDim * 2);
   const auto q_buffer = make_buffer(Q + bh_offset_q, q_bytes);
   const auto k_buffer = make_buffer(K + bh_offset_kv, kv_bytes);
@@ -624,28 +577,22 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
 
   constexpr int KLdsBufDwords = KvBlockRows * KLdsStrideDwords;  // 4096 dwords/buffer (64 rows × 64)
   __shared__ uint32_t lds_k[2][KLdsBufDwords];                   // 32 KB (2-buf, stride 64)
-  // V LDS staging removed — V_t is consumed directly from L1 via load_u32x4.
-  // Single-group Q-park: q-groups 0,1 stay fully in VGPR (clean, no LDS reads); the ENTIRE
-  // q-group 2 (all 8 d-tiles) is parked in one 32 KB LDS array (Q2Lds, d-tile t at slot t). qk
-  // reads the lo MFMA operand from d-tile d_pair, the hi operand from d-tile d_pair+Q2HalfTiles.
-  // 32 KB K + 32 KB qg2 = exactly 64 KB LDS. qg2 reads (lgkmcnt) overlap pv's V loads (vmcnt).
+  // V_t consumed directly from L1 (no LDS staging). Q-park: qg0,1 in VGPR; qg2 (all 8 d-tiles) in one 32 KB LDS array
+  // (Q2Lds, d-tile t @ slot t). 32 KB K + 32 KB qg2 = exactly 64 KB LDS; qg2 reads (lgkmcnt) overlap pv's V loads
+  // (vmcnt).
   __shared__ uint32_t lds_q2[Q2LdsDwords];      // 32 KB (entire qg2, d-tiles 0..7; lite: 0..6)
   auto load_q2 = [&](int d_tile) -> bf16x4_t {  // d-tile d_tile of qg2 for this lane (d_tile < last for lite)
     return *reinterpret_cast<const bf16x4_t*>(&lds_q2[Q2Lds(wave_id, d_tile, lane)]);
   };
-  // LITE skip-vote ring, reusing the lds_q2 slot of the evicted last d-tile (unused for Q in lite).
-  // Each wave's votes live in its own d-tile-(last) region → no cross-wave write contention; the
-  // record() AND-of-8 reads one dword per wave. Stored as a dword (0/1) to avoid sub-dword RMW.
+  // LITE skip-vote ring, reusing the evicted last-d-tile lds_q2 slot. Per-wave region → no cross-wave contention; dword
+  // (0/1) avoids sub-dword RMW.
   auto sverdict = [&](int w, int r) -> uint32_t& { return lds_q2[Q2Lds(w, HeadDimTiles - 1, 0) + r]; };
 
-  // K[kv_block] HBM→LDS into double-buffer half `k_buf` (group B). Wave w owns rows
-  // [w·16, +16); for each, its 64 lanes stream one full K row. The XOR swizzle is realized
-  // on the HBM SOURCE: lane L fetches the dword of swizzled 8-byte unit (L>>1)^c keeping
-  // the in-unit dword (L&1); c = kv_row & 0xF. LDS dest is hardware-contiguous (stride 64),
-  // so LDS unit p ends up holding HBM unit (p^c) — matching qk_phase's swizzled read.
+  // K[kv_block] HBM→LDS into double-buffer half `k_buf` (group B). Wave w owns rows [w·16,+16). XOR swizzle on the HBM
+  // SOURCE: lane L fetches dword of swizzled 8B unit (L>>1)^c, in-unit dword L&1, c=kv_row&0xF. LDS contiguous → unit p
+  // holds HBM (p^c), matches qk read.
   constexpr uint32_t KRowBytes = (uint32_t)(KLdsStrideDwords * 4);
-  // K block stride (bytes) = KvBlockRows seq-rows × the seq-row byte stride. BHSD folds to the
-  // contiguous block size KvBlockRows·HeadDim·2 = 16384; BSHD is ×heads (rows interleaved).
+  // K block stride (bytes) = KvBlockRows × seq-row stride. BHSD folds to 16384; BSHD is ×heads (rows interleaved).
   const uint32_t KBlockBytes = (uint32_t)(KvBlockRows * k_row_dwords * 4);
   const int wave_row0 = KLoadRow(wave_in_group, 0);           // first kv-row this load-wave owns
   const uint32_t k_row_bytes = (uint32_t)(k_row_dwords * 4);  // per-seq-row HBM byte stride
@@ -653,28 +600,25 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     const uint32_t lds_row0 = to_scalar(lds_addr(&lds_k[k_buf][KLdsDword(wave_row0, 0)]));
     const uint32_t hbm_block = to_scalar((uint32_t)((uint64_t)kv_block * KBlockBytes));
     if constexpr (kBSHD) {
-      // BSHD seq-row stride is a runtime heads·KRowDwords MULTIPLY → if the full per-lane byte
-      // offset (kv_row·stride + swz_lane)·4 is the offen VGPR, LLVM can't rematerialize it (the
-      // multiply) so it pins all 16 per-c values live across the main loop and spills 4 (reloaded
-      // EVERY iter). Split the address into a SCALAR soffset and a cheap per-lane offen VGPR,
-      // mirroring how BHSD's static stride already compiles (offen = base XOR const):
-      //   soffset = hbm_block + (wave_row0+c)·stride·4  — wave-uniform; carried as a scalar that
-      //             accumulates +stride·4 per c (s_add chain, like BHSD's m0 +0x100), never a VGPR.
-      //   offen   = swz_lane·4 = (lane·4) XOR (c·8) — one `lane·4` base, const XOR per c → 0 spill.
+      // BSHD seq-row stride is a runtime heads·KRowDwords MULTIPLY → per-lane offen VGPR can't be remat → LLVM pins all
+      // 16 per-c values and spills 4 EVERY iter. Fix: scalar soffset = hbm_block + (wave_row0+c)·stride·4
+      // (wave-uniform) + cheap per-lane offen = swz_lane·4 = (lane·4) XOR (c·8) → 0 spill.
       const uint32_t lane_x4 = (uint32_t)(lane << 2);  // per-lane base
       const uint32_t base_soff = to_scalar(hbm_block + (uint32_t)wave_row0 * k_row_bytes);
 #pragma unroll
       for (int c = 0; c < KRowsPerLoadWave; ++c) {
         const uint32_t soff = to_scalar(base_soff + (uint32_t)c * k_row_bytes);
-        const uint32_t off = lane_x4 ^ (uint32_t)(c << 3);  // swz_lane·4 = (lane^(c<<1))·4
+        // == (lane^(c<<1))<<2: XOR distributes through <<2, and (c<<1)<<2 = c<<3, so this is swz_lane·4.
+        const uint32_t off = lane_x4 ^ (uint32_t)(c << 3);
         buffer_load_b32_to_lds(k_buffer, lds_row0 + c * KRowBytes, off, soff);
       }
     } else {
-// BHSD: static stride → kv_row·stride·4 folds to a shift LLVM rematerializes for free
-// (0 persistent regs, 0 spill). Keep the original single-VGPR-offset form byte-identical.
+// BHSD: static stride → kv_row·stride·4 folds to a shift LLVM remats for free (0 spill). Keep single-VGPR-offset form
+// byte-identical.
 #pragma unroll
       for (int c = 0; c < KRowsPerLoadWave; ++c) {
         const int kv_row = KLoadRow(wave_in_group, c);
+        // 8B-unit = (lane>>1)^c, in-unit dword = lane&1. e.g. lane=5,c=2: unit=(2^2)=0, dword=1.
         const uint32_t swz_lane = (uint32_t)((((lane >> 1) ^ c) << 1) | (lane & 1));
         const uint32_t hbm_byte = (uint32_t)((KHbmDword(kv_row, 0) + swz_lane) * 4);
         buffer_load_b32_to_lds(k_buffer, lds_row0 + c * KRowBytes, hbm_byte, hbm_block);
@@ -682,21 +626,20 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     }
   };
 
-  // ── LITE read-list setup (RLE keep-list, one row per CTA) ────────────────────
-  // The skip-list is row-major [bh, q_block, num_k_blocks] in HBM; lbase is this CTA's row
-  // origin. read_list[lbase] = RLE length; the ranges follow. lstep is the reverse-list
-  // direction (skip_list.h: phase 1 ascends, phase 0 descends). rl() reads the cursor through
-  // to_scalar so it stays in SGPRs, off the MFMA loop's VGPR budget.
+  // ── LiteAttention skip machinery (lite only; compiled away for dense) ─────────
+  // [&]-lambdas over locals: a read-list cursor (which K-blocks this step computes) + a write-list emitter (next-step
+  // RLE + MustDoList force-compute). ── Read-list cursor: which K-blocks this step computes ──────────────────────
+  // Skip-list row-major [bh,q_block,num_k_blocks]; lbase = CTA's row origin. read_list[lbase]=RLE length then ranges.
+  // lstep = reverse-list dir (phase 1 asc, 0 desc). rl() reads via to_scalar → cursor stays in SGPRs, off the MFMA VGPR
+  // budget.
   const int lstep = phase ? 1 : -1;
   long long lbase = 0;
   int list_len = 0;
   auto rl = [&](int idx) -> int { return to_scalar((int)read_list[lbase + idx]); };
 
-  // Lite cursor over the read-list's kept blocks. range_block = current block; range_end = the
-  // range's exclusive walk-end; rle_idx = next marker pair. range_cont tracks whether the last step
-  // stayed inside its range (drives record()'s range-end marker). The cursor honors kv_stride /
-  // kv_offset for uniformity with the dense walk, but lite is never a Split, so here that is always
-  // stride 1 / offset 0 (it visits every kept block).
+  // Cursor state: range_block=current kept block; range_end=exclusive walk-end; rle_idx=next marker pair;
+  // range_cont=last step stayed in range (drives record()'s range-end marker). Honors kv_stride/kv_offset, but lite is
+  // never Split → stride 1.
   int rle_idx = 0, range_block = 0, range_end = 0;
   bool range_cont = false;
   auto open_range = [&]() {  // load the next range at rle_idx (always non-empty)
@@ -705,11 +648,11 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     rle_idx -= 2;
   };
   auto next_kept = [&](int cur) -> int {  // next kept block after `cur` (one step), -1 if done
-    const int nb = cur + lstep;
-    if ((lstep > 0) ? (nb < range_end) : (nb > range_end)) {
-      range_block = nb;
+    const int next_blk = cur + lstep;
+    if ((lstep > 0) ? (next_blk < range_end) : (next_blk > range_end)) {
+      range_block = next_blk;
       range_cont = true;
-      return nb;
+      return next_blk;
     }
     range_cont = false;
     if (rle_idx >= 1) {
@@ -724,10 +667,58 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     return cur;
   };
 
-  // Prologue: first processed K-block → LDS (group B only; group A idle until iter 1). Dense starts
-  // at kv_offset; lite advances the cursor kv_offset KEPT blocks in.
+  // ── Write-list emitter: next-step skip list (tid 0 only) ─────────────────────
+
+  int write_idx = 1;       // output cursor (slot 0 holds the final length)
+  bool skip_state = true;  // running skip/compute state, for transition detection
+  bool prev_ended_range = false;
+
+  // MustDoList: global force-compute RLE [len,s0,e0,…] of [start,end) K-blocks pinned "compute" (vote can't drop them,
+  // e.g. sinks). Walked monotonically in lstep order; nullptr/len-0 ⇒ dormant (byte-identical to plain skip).
+  const bool have_md = isLite && (must_do_list != nullptr) && ((int)must_do_list[0] > 0);
+  const int md_nr = have_md ? ((int)must_do_list[0] >> 1) : 0;       // # of [s,e) ranges
+  int md_ri = (lstep > 0) ? 0 : (md_nr - 1);                         // range cursor (walks in lstep dir)
+  auto md_lo = [&](int r) { return (int)must_do_list[1 + 2 * r]; };  // range r start (inclusive)
+  auto md_hi = [&](int r) { return (int)must_do_list[2 + 2 * r]; };  // range r end   (exclusive)
+  auto md_in_cur = [&](int b) { return md_ri >= 0 && md_ri < md_nr && b >= md_lo(md_ri) && b < md_hi(md_ri); };
+  // Is `block` forced-compute? Advance the monotonic cursor past ranges we've walked off, then test.
+  auto md_force = [&](int block) -> bool {
+    if (!have_md) return false;
+    if (lstep > 0)
+      while (md_ri < md_nr && block >= md_hi(md_ri))
+        ++md_ri;  // ascending: drop ranges behind us
+    else
+      while (md_ri >= 0 && block < md_lo(md_ri))
+        --md_ri;  // descending
+    return md_in_cur(block);
+  };
+  // block's completed vote: AND the 8 wave votes (skip iff all voted skip); MustDoList pins → compute.
+  auto vote = [&](int block, int verdict_step) -> bool {
+    int sk = 1;
+#pragma unroll
+    for (int w = 0; w < NumWaves; ++w)
+      sk &= (int)sverdict(w, verdict_step & (VerdictRing - 1));
+    bool skip = (sk != 0);
+    if (md_force(block)) skip = false;  // MustDoList: pin as compute
+    return skip;
+  };
+  // RLE-encode the vote inline: a marker on each skip<->compute flip, plus a range-end marker when a kept range closes.
+  auto record = [&](int block, int verdict_step, bool is_range_end) {
+    bool skip = vote(block, verdict_step);
+    if (skip != skip_state) {
+      write_list[lbase + write_idx++] = (int16_t)block;
+      skip_state = skip;
+    }
+    if (is_range_end) {
+      skip_state = true;
+      if (!skip) write_list[lbase + write_idx++] = (int16_t)(block + lstep);
+    }
+  };
+
+  // Prologue: first processed K-block → LDS (group B only; A idle until iter 1). Dense starts at kv_offset; lite
+  // advances the cursor kv_offset KEPT blocks in.
   int first_blk = kv_offset;
-  bool any = (kv_offset < num_kv_blocks);
+  bool has_any_block = (kv_offset < num_kv_blocks);
   if constexpr (isLite) {
     const int num_k_blocks = num_kv_blocks + 2;               // RLE row width: [len, markers…]
     const int nqb_list = grid_nqb ? grid_nqb : num_q_blocks;  // 1-D grids: gridDim.x ≠ #q-blocks
@@ -738,30 +729,27 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       open_range();
       first_blk = advance(range_block, kv_offset);
     }
-    any = (first_blk >= 0);
+    has_any_block = (first_blk >= 0);
   }
-  if (!group_a && any) direct_lds_k(first_blk, /*k_buf=*/0);  // step starts at 0 → slot 0
+  if (!group_a && has_any_block) direct_lds_k(first_blk, /*k_buf=*/0);  // step starts at 0 → slot 0
 
-  // Persistent VGPR Q (no reload across K-blocks). Lane (q_tile_start_row+col) owns one
-  // q-row; each load_bf16x4 grabs 4 head-dims of d-tile d (quad picks which 4 of 16).
-  // Single-group park: q-groups 0,1 fully in VGPR; q-group 2 entirely in lds_q2 (d-tile t @ slot t).
+  // Persistent VGPR Q (no reload across K-blocks). Lane (q_tile_start_row+col) owns one q-row; each load_bf16x4 grabs
+  // 4 head-dims of d-tile d (quad picks which 4 of 16). qg0,1 in VGPR; qg2 in lds_q2 (d-tile t @ slot t).
   bf16x4_t q_frag[2][HeadDimTiles];
   auto load_q = [&](int q_group, int d) -> bf16x4_t {
     return valid[q_group] ? load_bf16x4(q_buffer, QOLayout(q_tile_start_row[q_group] + col, HdFrag(d, quad)) * 2)
                           : bf16x4_t{0, 0, 0, 0};
   };
-// NOTE: keep qg0 and qg1 as SEPARATE prologue load loops — collapsing them into one
-// `for (g)` loop re-introduces a VGPR spill (allocator coloring is sensitive to the
-// load structure here). The qk-phase qg0/qg1 collapse is safe; this prologue one is not.
+// NOTE: keep qg0/qg1 as SEPARATE prologue load loops — collapsing into one `for (g)` loop re-introduces a VGPR spill
+// (allocator coloring is load-structure-sensitive). The qk-phase qg0/qg1 collapse is safe; this prologue one is not.
 #pragma unroll
   for (int d = 0; d < HeadDimTiles; ++d)
     q_frag[0][d] = load_q(0, d);
 #pragma unroll
   for (int d = 0; d < HeadDimTiles; ++d)
     q_frag[1][d] = load_q(1, d);
-  // q_group=2: all 8 d-tiles → lds_q2 (d-tile d at slot d). HBM→VGPR temp→LDS.
-  // LITE: the LAST d-tile stays in a VGPR (q2_last) instead of LDS, freeing its 4 KB slot for
-  // the cross-wave skip-vote ring. dense parks all 8 (lds_q2 unchanged → byte-exact).
+  // qg2: all 8 d-tiles → lds_q2 (d-tile d @ slot d), HBM→VGPR→LDS. LITE: LAST d-tile stays in VGPR (q2_last), freeing
+  // its 4 KB slot for the skip-vote ring; dense parks all 8.
   bf16x4_t q2_last{0, 0, 0, 0};
 #pragma unroll
   for (int d = 0; d < HeadDimTiles; ++d) {
@@ -793,12 +781,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     row_sum[q_group] = 0.f;
   }
 
-  // Per-wave state, loop-carried across K-blocks: scores written by qk_phase before softmax
-  // reads it, probs by softmax_update before pv_phase reads it (true on every path, including
-  // masked q-tiles whose qk operands are zero). The values themselves are never read before
-  // written, so this zero-init is logically dead — but it is LOAD-BEARING for register
-  // allocation: it gives the allocator a single clean def point for these loop-carried arrays.
-  // Dropping it respills 64 VGPR (verified). Keep it.
+  // Loop-carried per-wave state: scores written by qk_phase before softmax reads, probs by softmax_update before pv.
+  // Zero-init is logically dead but LOAD-BEARING: one clean def point for the allocator; dropping it respills 64 VGPR.
   fp32x4_t scores[QTilesPerWave][KvSubtiles];
   bf16x4_t probs[QTilesPerWave][KvSubtiles];
 #pragma unroll
@@ -809,17 +793,20 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       probs[q_group][kv_sub] = bf16x4_t{0, 0, 0, 0};
     }
 
-  auto qk_phase = [&](int kbuf, fp32x4_t scores[QTilesPerWave][KvSubtiles]) {
-    // Swizzled LDS read address (OR of disjoint bit fields, see qk_swz_base): d_pair^col_hi
-    // is a cheap per-read xor+shift; kv_sub and k_buf complete the address.
-    const uint32_t lane_off = (uint32_t)kbuf << 14;
+  auto qk_phase = [&](int k_buf, fp32x4_t scores[QTilesPerWave][KvSubtiles]) {
+    // Swizzled LDS read addr = OR of disjoint bit-fields (OR≡add): qk_swz_base[11:3] | (d_pair^col_hi)<<5 (bank
+    // swizzle) | kv_sub<<12 | k_buf<<14 (which of 2 K LDS halves). d_pair^col_hi is the only per-read compute.
+    const uint32_t lane_off = (uint32_t)k_buf << 14;
     auto k_addr = [&](int kv_sub, int d_pair) -> uint32_t {
       return qk_swz_base | (((uint32_t)d_pair ^ col_hi) << 5) | ((uint32_t)kv_sub << 12) | lane_off;
     };
 
-    constexpr int TotalReads = KvSubtiles * 4;
-    constexpr int Depth = 3;    // K-tile prefetch ring depth
-    constexpr int Q2Depth = 2;  // qg2-from-LDS ping-pong depth
+    // Loop i in [0,TotalReads) splits 3 ways: kv_sub=i%KvSubtiles (scores tile), d_pair=i/KvSubtiles (head-dim
+    // col-pair, K+Q frag), slot=i%Depth (ring reg s0/s1/s2). e.g. i=5 → kv_sub=1,d_pair=1,slot=2. Depth(3) coprime with
+    // KvSubtiles(4) so the ring rotates independently.
+    constexpr int TotalReads = KvSubtiles * 4;  // 16 ds_read2 = 4 kv-subtiles × 4 d-pairs
+    constexpr int Depth = 3;                    // K-tile prefetch ring depth
+    constexpr int Q2Depth = 2;                  // qg2-from-LDS ping-pong depth
     mfma_prio_hi();
     sched_fence();
 
@@ -828,14 +815,24 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     u32x4_t s1 = ds_read2_b64_imm<0, 16>(k_addr(1, 0));
     u32x4_t s2 = ds_read2_b64_imm<0, 16>(k_addr(2, 0));
 
-    // qg2 is the only LDS-resident q-group: one depth-2 ping-pong per head-dim half h
-    // (h=0 → lo d-tiles 0..3, h=1 → hi d-tiles 4..7). q2[h][slot] = d-tile slot+h·Q2HalfTiles.
+    // qg2 (only LDS-resident q-group): depth-2 ping-pong per head-dim half h (h=0→d-tiles 0..3, h=1→4..7). q2[h][slot]
+    // = d-tile slot+h·Q2HalfTiles.
     bf16x4_t q2[2][Q2Depth];
 #pragma unroll
     for (int p = 0; p < Q2Depth; ++p)
 #pragma unroll
       for (int h = 0; h < 2; ++h)
         q2[h][p] = load_q2(p + h * Q2HalfTiles);
+
+    // Q fragment for one qk MFMA (g, half h, col-pair d_pair): qg0/qg1 in VGPR (q_frag); qg2 streams LDS ping-pong
+    // (q2[h][slot]) — except lite-only qg2 last d-tile, evicted to VGPR (q2_last) so its LDS slot holds the skip-vote
+    // ring.
+    auto q_fragment = [&](int g, int h, int d_pair, int q2_slot) -> bf16x4_t {
+      if (g < 2) return q_frag[g][d_pair + h * Q2HalfTiles];
+      if constexpr (isLite)
+        if (h == 1 && d_pair == Q2HalfTiles - 1) return q2_last;
+      return q2[h][q2_slot];
+    };
 
 #pragma unroll
     for (int i = 0; i < TotalReads; ++i) {
@@ -847,23 +844,17 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
         wait_lgkm<0>(cur);
       else
         wait_lgkm<Depth - 1>(cur);
-      // Contract the d-tile pair {lo=d_pair, hi=d_pair+Q2HalfTiles} into every q-group's
-      // scores: K from this ring slot, Q from q_frag (qg0,1 in VGPR) or q2 (qg2 in LDS).
+      // Contract d-tile pair {lo=d_pair, hi=d_pair+Q2HalfTiles} into every q-group's scores: K from this ring slot, Q
+      // from q_frag (qg0,1) or q2 (qg2).
       const bf16x4_t k_pair[2] = {lo2(cur), hi2(cur)};
-      const int q2_slot = d_pair % Q2Depth;
+      const int q2_slot =
+          d_pair % Q2Depth;  // qg2 ping-pong slot keyed on d_pair (all 4 kv_sub of one d_pair reuse the same qg2 read)
 #pragma unroll
       for (int g = 0; g < QTilesPerWave; ++g)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          // qg0,1 from VGPR; qg2 from the LDS ping-pong — except (lite) its last d-tile
-          // (top d_pair, h=1), which was evicted to q2_last (VGPR).
-          bf16x4_t qf;
-          if constexpr (isLite)
-            qf = (g < 2)                                 ? q_frag[g][d_pair + h * Q2HalfTiles]
-                 : (h == 1 && d_pair == Q2HalfTiles - 1) ? q2_last
-                                                         : q2[h][q2_slot];
-          else
-            qf = (g < 2) ? q_frag[g][d_pair + h * Q2HalfTiles] : q2[h][q2_slot];
+          const bf16x4_t qf = q_fragment(g, h, d_pair, q2_slot);
+          // First MFMA into this scores tile inits from zero (no separate memset); later d_pair/h accumulate in place.
           if (d_pair == 0 && h == 0)
             scores[g][kv_sub] = asm_mfma_zero(k_pair[0], qf);
           else
@@ -876,33 +867,31 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       }
       // Prefetch the next qg2 d-tile pair (d_pair+Q2Depth) into its ping-pong slot.
       if (kv_sub == KvSubtiles - 1 && d_pair + Q2Depth < Q2HalfTiles) {
-        const int pf = d_pair + Q2Depth;  // d_pair being prefetched
+        const int pf_d_pair = d_pair + Q2Depth;  // d_pair being prefetched
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           // LITE: the last d-tile (h=1, top d_pair) lives in q2_last (VGPR), not LDS.
           if constexpr (isLite) {
-            if (h == 1 && pf == Q2HalfTiles - 1) continue;
+            if (h == 1 && pf_d_pair == Q2HalfTiles - 1) continue;
           }
-          q2[h][q2_slot] = load_q2(pf + h * Q2HalfTiles);
+          q2[h][q2_slot] = load_q2(pf_d_pair + h * Q2HalfTiles);
         }
       }
     }
     mfma_prio_lo();
   };
 
-  // ─── PV: O += V·Pᵀ via mfma(A=V_t, B=P). 16 super-chunks/iter, each lane
-  // load_u32x4s its pre-packed bf16x8 from V_t (VtLayout). Depth-4 prefetch ring.
-  // chunk → hd-tile d_tile=chunk/2, kv-subtile pair {kv_sub0,kv_sub1}; all q-groups
-  // share the V operand. ──────────────────────────────────────────────────────
+  // ─── PV: O += V·Pᵀ via mfma(A=V_t, B=P). 16 super-chunks/iter, each lane load_u32x4s its
+  // pre-packed bf16x8 from V_t (VtLayout). Depth-4 prefetch ring. chunk → hd-tile chunk/2 +
+  // kv-subtile pair; all q-groups share the V operand. ────────────────────────
   auto chunk_byte_off = [&](int kv_iter, int chunk) -> uint32_t {
     return (uint32_t)(VtLayout(kv_iter, chunk, lane) * 2);  // bf16 elems → bytes
   };
 
-  // verdict_step = the processing step of the block being pv'd (its verdict-ring slot;
-  // ignored when !isLite). Part B soft block-skip: a wave whose vote for this block is "skip"
-  // does NO pv — its probs were zeroed in softmax, so the result is unchanged; this just drops
-  // the 0-adding MFMAs + V_t loads. The vote is in LDS from this wave's own softmax (group A:
-  // prev iter P2; group B: this iter P1), visible across the same barriers record() relies on.
+  // verdict_step = processing step of the block being pv'd (verdict-ring slot; ignored !isLite). Part B soft
+  // block-skip: a "skip" wave does NO pv (its probs were zeroed in softmax → result unchanged), dropping 0-adding MFMAs
+  // + V_t loads. Vote is in LDS from this wave's softmax (A: prev iter P2; B: this iter P1), visible across record()'s
+  // barriers.
   auto pv_phase = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles], int verdict_step) {
     if constexpr (isLite) {
       if (sverdict(wave_id, verdict_step & (VerdictRing - 1))) return;
@@ -916,15 +905,16 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       v_ring[p] = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, p));
 #pragma unroll
     for (int chunk = 0; chunk < VtChunks; ++chunk) {
-      const int d_tile = chunk >> 1;        // hd-tile 0..7
-      const int kv_sub0 = (chunk & 1) * 2;  // this chunk's kv-subtile pair base ({0,1} or {2,3})
+      // chunk in [0,16): d_tile=chunk/2 (hd-tile 0..7); kv_sub0=(chunk&1)*2 (kv-subtile pair base, even→{0,1}
+      // odd→{2,3}). e.g. chunk=5 → d_tile=2, kv_sub0=2.
+      const int d_tile = chunk >> 1;
+      const int kv_sub0 = (chunk & 1) * 2;
       u32x4_t& cur = v_ring[chunk % PvDepth];
       // one b128 V load = a kv-subtile pair; v_pair[h] is the operand for kv-subtile kv_sub0+h.
       const bf16x4_t v_pair[2] = {lo2(cur), hi2(cur)};
       // Issue the next ring V-load BEFORE this chunk's MFMAs (latency lead).
       if (chunk + PvDepth < VtChunks) cur = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, chunk + PvDepth));
-// v_pair[h] feeds all q-groups back-to-back (each dies in one mfma) before the next
-// half — shorter V-reg lifetime than q-group-outer ordering.
+// v_pair[h] feeds all q-groups back-to-back before the next half — shorter V-reg lifetime than q-group-outer ordering.
 #pragma unroll
       for (int h = 0; h < 2; ++h)
 #pragma unroll
@@ -935,18 +925,17 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     mfma_prio_lo();
   };
 
-  // L1 prefetcher for V_t[kv_iter_next], fired from Group A's softmax-only P2.
-  // vmcnt is per-wave so this is independent of any consumer's pending load_u32x4.
-  // Wave-split: each of 4 waves takes 4 unique super-chunks → 16 unique cache
-  // line requests hit all L1 sets in parallel. The dest v[140:143] is a discard
-  // sink: this is the LAST op before the end-of-iter wait_vmcnt0, so the async
-  // write lands and is drained before any reuse.
+  // L1 prefetcher for V_t[kv_iter_next], fired from Group A's softmax-only P2 (vmcnt per-wave → independent of
+  // consumers' load_u32x4). Wave-split 4×4 = 16 unique cache-line requests hit all L1 sets. Dest v[140:143] = discard
+  // sink, LAST op before end-of-iter wait_vmcnt0.
   auto prefetch_v_t_l1 = [&](int kv_iter_next) {
     if (kv_iter_next < 0) return;
 #pragma unroll
     for (int i = 0; i < VtChunks / LoadWaves; ++i) {
       const int chunk = VtPrefetch(wave_in_group, i);
       const uint32_t chunk_off = (uint32_t)(VtLayout(kv_iter_next, chunk, lane) * 2);
+      // v[140:143] = discard sink (L1-fill side effect only; data never read). A fixed GPR keeps it out of the
+      // allocator's live set.
       asm volatile("buffer_load_dwordx4 v[140:143], %0, %1, 0 offen"
                    :
                    : "v"(chunk_off), "s"(v_buffer)
@@ -958,12 +947,10 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
                      bf16x4_t probs[QTilesPerWave][KvSubtiles],
                      int step,
                      int kv_block) {
-    // Per-q-group block max — local: written below before every read, not loop-carried.
+    // Per-q-group block max — local, not loop-carried.
     float bmax_local[QTilesPerWave];
-    // Partial last K/V block (seq_len_kv%64≠0): K-OOB rows read 0 (SRD-bounded) → score 0,
-    // which would pollute the denominator. Force kv-rows ≥ last_kv_rows to -inf (exp2→0).
-    // Bound is q_group-independent (computed once, applied to all 3 — compiler CSEs). `step`
-    // = block index; partial block is last. No-op for aligned (last_kv_rows==64).
+    // Partial last K/V block (seq_len_kv%64≠0): K-OOB rows read 0 → score 0, polluting denom. Force kv-rows ≥
+    // last_kv_rows to -inf (exp2→0). No-op if aligned.
     if (last_kv_rows < KvBlockRows && kv_block == num_kv_blocks - 1) {
       const int row0 = quad * 4;
 #pragma unroll
@@ -976,8 +963,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
             scores[2][kv_sub][i] = -FLT_MAX;
           }
     }
-// Per-lane bmax fold runs HERE (not in qk_phase). Softmax runs in P2
-// when the other group is in pv+qk (MFMA-heavy) — the v_max3 VALU
+// Per-lane bmax fold runs HERE (not qk_phase). Softmax runs in P2 while the other group is in pv+qk → the v_max3 VALU
 // chain hides under their MFMA writeback.
 #pragma unroll
     for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
@@ -992,20 +978,22 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       }
       bmax_local[q_group] = bm;
     }
-    // LITE skip vote: keep the block iff some valid q-row's block-max is within thr (log2) of
-    // its running max. A skipping wave zeros its probs (the block then adds nothing to o_acc/
-    // row_sum); record() ANDs the 8 wave votes next phase.
+    // LITE skip vote: keep iff some valid q-row's block-max is within thr (log2) of its running max. A skipping wave
+    // zeros its probs; record() ANDs the 8 votes.
     if constexpr (isLite) {
       bool any_keep = false;
 #pragma unroll
-      for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
-        any_keep = any_keep || (valid[q_group] && ((bmax_local[q_group] * scale_log2e - row_max[q_group]) > thr));
-      bool skip_wave = (__any(any_keep) == 0);
-      if (step == 0) skip_wave = false;  // never skip the first processed block
+      for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
+        const float block_max_log2 = bmax_local[q_group] * scale_log2e;     // raw block-max → log2 units
+        const bool within_thr = (block_max_log2 - row_max[q_group]) > thr;  // thr<0: gap above |thr| ⇒ keep
+        any_keep = any_keep || (valid[q_group] && within_thr);
+      }
+      bool skip_wave = !__any(any_keep);  // skip only if NO lane in the wave voted keep
+      if (step == 0) skip_wave = false;   // never skip the first processed block
       if (lane == 0) sverdict(wave_id, step & (VerdictRing - 1)) = skip_wave ? 1u : 0u;
       if (skip_wave) {
-// Zero probs so the skipped pv adds nothing; the keep predicate guarantees this block
-// never raises the running max, so row_max/row_sum/o_acc stay correct.
+// Zero probs so the skipped pv adds nothing; the keep predicate guarantees this block never raises the running max →
+// state stays correct.
 #pragma unroll
         for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
 #pragma unroll
@@ -1030,72 +1018,19 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // ─── Main loop ─────────────────────────────────────────────────────────
   //   Group A  P1: pv(V_t[N-1]) + qk(K[N])      P2: softmax + V_t prefetch
   //   Group B  P1: K[N+1] HBM→LDS + softmax     P2: pv(V_t[N-1]) + qk(K[N])
-  // V_t prefetch lives in Group A's softmax-only P2 — bursts in the pv loop
-  // regress perf by stalling consumer issue on vmcnt pressure.
   wait_vmcnt0();
   lds_barrier();
   // ─── Pipeline over K-blocks (forward 0..num_kv_blocks-1) ────────────────────
-  // `step` = processing-step counter (drives K double-buffer parity); `kv_block`/
-  // `prev_block` are the blocks being qk'd / pv'd; `next_block` is what group B streams
-  // into LDS. Two-phase warp-spec: each iter A and B swap roles across the mid-barrier.
-  // Dense and lite share ONE warp-spec body; only how each step's block is produced differs.
-  // Dense: kv_block follows the arithmetic stride — every block (non-split), or every split_ways-th
-  // from this part's offset (dense Split). Lite: the cursor (set up above) walks the read list's kept
-  // blocks (stride 1) and tid 0 records the next-step write list. Lite constructs `if constexpr` out.
-  int write_idx = 1;       // write-list output cursor (slot 0 holds the final length)
-  bool skip_state = true;  // running skip/compute state, for transition detection
-  bool prev_ended_range = false;
-
-  // MustDoList: a global force-compute RLE [len, s0,e0, …] of [start,end) K-blocks pinned as
-  // "compute" (the 8-wave vote can't drop them — e.g. attention sinks). Walked monotonically
-  // in lstep order, tid 0 only; nullptr/len-0 ⇒ dormant (byte-identical to plain skip).
-  const bool have_md = isLite && (must_do_list != nullptr) && ((int)must_do_list[0] > 0);
-  const int md_nr = have_md ? ((int)must_do_list[0] >> 1) : 0;  // # of [s,e) ranges
-  int md_ri = (lstep > 0) ? 0 : (md_nr - 1);                    // range cursor (walk dir = lstep)
-  auto md_force = [&](int block) -> bool {                      // is `block` forced-compute? advances the cursor
-    if (!have_md) return false;
-    if (lstep > 0) {
-      while (md_ri < md_nr && block >= (int)must_do_list[2 + 2 * md_ri])
-        ++md_ri;
-      return md_ri < md_nr && block >= (int)must_do_list[1 + 2 * md_ri] && block < (int)must_do_list[2 + 2 * md_ri];
-    } else {
-      while (md_ri >= 0 && block < (int)must_do_list[1 + 2 * md_ri])
-        --md_ri;
-      return md_ri >= 0 && block >= (int)must_do_list[1 + 2 * md_ri] && block < (int)must_do_list[2 + 2 * md_ri];
-    }
-  };
-  // block's completed vote: AND the 8 wave votes (skip iff every wave voted skip), with
-  // MustDoList pins forced to compute.
-  auto vote = [&](int block, int verdict_step) -> bool {
-    int sk = 1;
-#pragma unroll
-    for (int w = 0; w < NumWaves; ++w)
-      sk &= (int)sverdict(w, verdict_step & (VerdictRing - 1));
-    bool skip = (sk != 0);
-    if (md_force(block)) skip = false;  // MustDoList: pin as compute
-    return skip;
-  };
-  // RLE-encode the vote inline: emit a marker on each skip<->compute flip, plus a range-end
-  // marker when a kept range closes.
-  auto record = [&](int block, int verdict_step, bool is_range_end) {
-    bool skip = vote(block, verdict_step);
-    if (skip != skip_state) {
-      write_list[lbase + write_idx++] = (int16_t)block;
-      skip_state = skip;
-    }
-    if (is_range_end) {
-      skip_state = true;
-      if (!skip) write_list[lbase + write_idx++] = (int16_t)(block + lstep);
-    }
-  };
-
+  // `step` = step counter (K double-buffer parity); kv_block/prev_block qk'd/pv'd; next_block streamed by B. Dense+lite
+  // share ONE body: dense kv_block follows the arithmetic stride; lite's cursor walks kept blocks (stride 1) + tid 0
+  // records the write list (`if constexpr`'d out for dense).
   int prev_block = -1, step = 0;  // step counts PROCESSED blocks (drives K double-buffer parity)
   int kv_block = first_blk;       // current processed block
-  bool have = any;
+  bool has_work = has_any_block;
 
-  while (have) {
-    // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense arithmetic stride.
-    // cur_ended (from the cursor's last step) = "kv_block ended its RLE range" → record's flush.
+  while (has_work) {
+    // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
+    // ended its RLE range" → record's flush.
     int next_block;
     bool has_next;
     if constexpr (isLite) {
@@ -1105,7 +1040,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       next_block = kv_block + kv_stride;
       has_next = (next_block < num_kv_blocks);
     }
-    const bool cur_ended = isLite ? !range_cont : false;
+    const bool block_closed_range = isLite ? !range_cont : false;
     const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
     const bool first = (step == 0);
     if (group_a) {  // P1
@@ -1118,7 +1053,9 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     __builtin_amdgcn_s_barrier();
     if (group_a) {  // P2
       softmax(scores, probs, step, kv_block);
-      if constexpr (isLite) {  // tid 0 RLE-records prev_block's vote (after its softmax)
+      // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
+      // (VerdictRing depth 2 keeps it live).
+      if constexpr (isLite) {
         if (tid == 0 && !first) record(prev_block, step - 1, prev_ended_range);
       }
       if (has_next) prefetch_v_t_l1(kv_block);
@@ -1126,18 +1063,18 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       if (!first) pv_phase(prev_block, probs, step - 1);
       qk_phase(k_buf_cur, scores);
     }
-    // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is
-    // VMCNT-tracked, not LGKMCNT) so the next iter's qk_phase can't read stale K;
-    // lds_barrier covers the LGKMCNT side.
+    // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
+    // qk can't read stale K; lds_barrier covers LGKMCNT.
     wait_vmcnt0();
     lds_barrier();
     prev_block = kv_block;
     ++step;
-    prev_ended_range = cur_ended;
+    prev_ended_range = block_closed_range;
     kv_block = next_block;
-    have = has_next;
+    has_work = has_next;
   }
-  // Epilogue: last block's softmax + pv, then (lite) flush its always-range-end vote + count.
+  // Epilogue. The loop defers each block's pv (and B's softmax) by one iter, so prev_block is still pending: B owes a
+  // softmax (A did its at P2), both owe the final pv. Lite then flushes the last block's range-end vote + RLE length.
   if (!group_a && step > 0) softmax(scores, probs, step - 1, prev_block);
   if (step > 0) pv_phase(prev_block, probs, step - 1);
   if constexpr (isLite) {
@@ -1149,14 +1086,14 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   }
 
 // ─── Output ────────────────────────────────────────────────────────────
-// row_sum is summed across the 4 quad-lanes once here (math-equiv since
-// rescale is global to the row). inv_sum=0 when row_sum==0 prevents 0×inf=NaN.
+// row_sum summed across the 4 quad-lanes once here (math-equiv, rescale is row-global). inv_sum=0 when row_sum==0
+// prevents 0×inf=NaN.
 #pragma unroll
   for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
     row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
   if constexpr (Split) {
-    // A split part exports its raw fp32 partial (o, and the row's softmax max `m` and sum `l`),
-    // UNSCALED — the o/l division and bf16 packing are merge_parts' job. One CTA == one part.
+    // A split part exports raw fp32 partials (o, plus row max `m` and sum `l`), UNSCALED — o/l division + bf16 pack are
+    // merge_parts' job. One CTA == one part.
     TailScratch parts(part_buf);
     const int part = blockIdx.x;
 #pragma unroll
@@ -1177,8 +1114,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
     if (!valid[q_group]) continue;
     const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
-// No PV mfma follows so a packed v_pk_mul_f32 is safe here. MaybeNaN
-// pack4 scrubs any residual NaN/Inf in o_acc from pathological inputs.
+// No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from pathological
+// inputs.
 #pragma unroll
     for (int t = 0; t < HeadDimTiles; ++t) {
       o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
@@ -1188,74 +1125,12 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     }
   }
 }
-
-// ─── Tail-part merge ────────────────────────────────────────────────────────
-constexpr int MergeThreads = 256;                                // threads per merge CTA
-constexpr int MergeWGs = PartRows * HeadDim / 4 / MergeThreads;  // 48 CTAs cover one q-block's 384×128 output
-
-// Per-(B,H) base element offset + SRD byte span of the [seq, (heads,) HeadDim] output tensor for
-// head-row `bh`. BHSD: heads contiguous. BSHD: heads interleaved → a head's rows span ×heads and
-// start at h·HeadDim. (Mirrors the main kernel's bh_offset_q / q_bytes, scoped to the merge.)
-template <bool kBSHD>
-__device__ __forceinline__ long long head_base_offset(int bh, int seq, int heads) {
-  if constexpr (kBSHD)
-    return (long long)(bh / heads) * seq * heads * HeadDim + (long long)(bh % heads) * HeadDim;
-  else
-    return (long long)bh * seq * HeadDim;
-}
-template <bool kBSHD>
-__device__ __forceinline__ uint32_t head_span_bytes(int seq, int heads) {
-  return (uint32_t)((long long)seq * (kBSHD ? heads : 1) * HeadDim * sizeof(bf16_t));
-}
-
-// Recombine a tail q-block's `n_parts` (=G) strided KV partials into the final output. MergeWGs CTAs
-// serve one q-block; each of a CTA's MergeThreads threads owns ONE output cell = 4 contiguous
-// head-dims of one of the 384 rows. Online-softmax merge across the parts: with run_max = maxₚ mₚ and
-// weight wₚ = exp2(mₚ − run_max),   out = (Σₚ wₚ·oₚ) / (Σₚ wₚ·lₚ),  then bf16-packed.
-template <bool kBSHD>
-__global__ __launch_bounds__(MergeThreads, 4) void merge_parts(
-    bf16_t* __restrict__ Out, int seq_len, int heads, const float* __restrict__ part_buf) {
-  // Per-q-block meta: target (q_block, bh) + the [part_base, part_base+n_parts) slice of parts to merge.
-  const int4 meta = tail_sched[MaxParts + blockIdx.x / MergeWGs];
-  const int part_base = meta.z, n_parts = meta.w;
-  // This thread's output cell within the q-block: a (row, hd) with hd 4-aligned.
-  const int cell = ((blockIdx.x % MergeWGs) * MergeThreads + threadIdx.x) * 4;
-  const int row = cell / HeadDim, hd = cell % HeadDim;
-  const TailScratch parts(const_cast<float*>(part_buf));
-
-  // Pass 1: run_max = max of the parts' softmax maxima (each part's m is a lower bound on the true max).
-  float run_max = -FLT_MAX;
-  for (int p = 0; p < n_parts; ++p)
-    run_max = fmaxf(run_max, parts.ml[PartMl(part_base + p, row)]);
-  // Pass 2: weighted sums — numerators of this cell's 4 head-dims (out0..out3) + the shared denom l_sum.
-  float out0 = 0, out1 = 0, out2 = 0, out3 = 0, l_sum = 0;
-  for (int p = 0; p < n_parts; ++p) {
-    const float* ml = &parts.ml[PartMl(part_base + p, row)];   // ml[0] = m_p, ml[1] = l_p
-    const float* o = &parts.o[PartO(part_base + p, row, hd)];  // o_p[hd .. hd+3]
-    const float weight = fast_exp2(ml[0] - run_max);
-    out0 = fmaf(weight, o[0], out0);
-    out1 = fmaf(weight, o[1], out1);
-    out2 = fmaf(weight, o[2], out2);
-    l_sum = fmaf(weight, ml[1], l_sum);
-    out3 = fmaf(weight, o[3], out3);
-  }
-  const float inv_l = (l_sum == 0.0f) ? 0.0f : fast_rcp(l_sum);
-
-  // Scatter the normalized bf16x4 to Out at this (q-block row, hd).
-  const auto OutLayout = seq_layout<kBSHD, HeadDim>(heads);
-  const auto out_buffer =
-      make_buffer(Out + head_base_offset<kBSHD>(meta.y, seq_len, heads), head_span_bytes<kBSHD>(seq_len, heads));
-  store_bf16x4(
-      out_buffer,
-      OutLayout(meta.x * PartRows + row, hd) * 2,
-      pack4_bf16</*MaybeNaN=*/true>(out0 * inv_l, out1 * inv_l, out2 * inv_l, out3 * inv_l));
-}
+// ===== V TRANSPOSE: V → V_t pre-transpose for the PV mfma
 
 // ─── V transpose for 16x16x16 mfma ─────────────────────────────────────────────
-// Pre-packs V[seq,128] into V_t so pv_phase reads each lane's MFMA A-fragment with
-// one contiguous load_u32x4. Phase 1: V block HBM→LDS (coalesced). Phase 2: re-read in
-// fragment order → V_t (VtLayout, shared with pv_phase). super-chunk = d_tile*2 +
-// kv_sub_pair; lane l's 16 bytes are two A-operands (kv-subtiles kv_sub0 then kv_sub1):
+// Pre-packs V[seq,128] into V_t for pv_phase's one contiguous load_u32x4/lane. Phase 1: V block HBM→LDS coalesced;
+// phase 2: re-read in fragment order → V_t (VtLayout). super-chunk = d_tile*2 + kv_sub_pair = 64 A-frags; lane l's 16 B
+// = 2 A-operands. l=frag_lane 0..63, i=0..3 = bf16 in operand:
 //   bytes [l*16 .. l*16+7]   = V[k=kv_sub0*16 + (l/16)*4 + i, hd=d_tile*16 + l%16]
 //   bytes [l*16+8 .. l*16+15] = V[k=kv_sub1*16 + (l/16)*4 + i, hd=d_tile*16 + l%16]
 
@@ -1273,7 +1148,7 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
   const int head = blockIdx.x / num_kv_blocks;
   const int kv_iter = blockIdx.x % num_kv_blocks;
   const int tid = threadIdx.x;
-  // head = bh index over B·H; for BSHD split into b=head/heads, h=head%heads.
+  // head = bh index over B·H; BSHD splits it into b=head/heads, h=head%heads.
   long long src_block_base;
   if constexpr (kBSHD) {
     const long long b = head / heads, h = head % heads;
@@ -1288,16 +1163,15 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
   __shared__ uint32_t stage_dw[KvBlockRows * (HeadDim / 2)];  // 64 rows × 64 dw = 16 KB
   const auto v_buffer = make_buffer(V);
 
-  // ── Phase 1: V[block] HBM → LDS, coalesced; rows ≥ seq_len_per_head are zero (padded tail).
-  // Shadow QOLayout with the source-V seq-row stride (scoped to phase 1; phase 2 reads the
-  // contiguous LDS stage via the global static QOLayout).
+  // ── Phase 1: V[block] HBM → LDS, coalesced; rows ≥ seq_len_per_head zero (padded tail). Shadow QOLayout with the
+  // source-V seq-row stride (phase-1 only; phase 2 reads the contiguous LDS stage via global QOLayout).
   {
     const auto QOLayout = seq_layout<kBSHD, HeadDim>(heads);
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       const int elem_idx = k * XposeThreadsPerWG + tid;
       const int row = elem_idx >> 4;    // 0..63 kv-row in this block
-      const int octet = elem_idx & 15;  // 0..15 head-dim octet (×8 bf16)
+      const int octet = elem_idx & 15;  // 0..15: which b128 load-unit (8 bf16 = 16 B) along the 128 head-dim
       const bool row_valid = (kv_iter * KvBlockRows + row) < seq_len_per_head;
       u32x4_t v_oct = row_valid ? __builtin_amdgcn_raw_buffer_load_b128(
                                       v_buffer, (uint32_t)((src_block_base + QOLayout(row, octet * 8)) * 2), 0, 0)
@@ -1319,7 +1193,7 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
 // ── Phase 2: gather each (super-chunk, lane)'s two A-fragments from LDS → V_t. ──
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
-    const int frag_idx = tid * 4 + k;     // 0..1023
+    const int frag_idx = tid * 4 + k;     // 0..1023 = VtChunks(16) super-chunks × 64 lanes (256 threads × 4)
     const int chunk = frag_idx >> 6;      // super-chunk 0..15
     const int frag_lane = frag_idx & 63;  // lane 0..63
     const int d_tile = chunk >> 1;        // hd-tile 0..7
@@ -1327,7 +1201,7 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
     const int kv_sub0 = kv_sub_pair * 2;
     const int kv_sub1 = kv_sub0 + 1;
     const int hd = d_tile * 16 + (frag_lane & 15);  // head-dim element 0..127
-    const int kv_row0 = (frag_lane >> 4) * 4;       // first of this lane's 4 kv-rows
+    const int kv_row0 = (frag_lane >> 4) * 4;       // hi 2 bits of lane pick a row-quad: owns kv-rows kv_row0..+3
 
     bf16_t packed[8];
 #pragma unroll
@@ -1342,10 +1216,73 @@ __global__ __launch_bounds__(XposeThreadsPerWG, 4) void v_transpose_kernel_16x16
   }
 }
 
+// ===== DISPATCH: tail-part merge kernel + planners + launch glue
+
+// ─── Tail-part merge kernel ──────────────────────────────────────────────────
+constexpr int MergeThreads = 256;                                // threads per merge CTA
+constexpr int MergeWGs = PartRows * HeadDim / 4 / MergeThreads;  // 48 CTAs per q-block's 384×128 output
+
+// Per-(B,H) base elem offset + SRD byte span of [seq,(heads,)HeadDim] output for head-row `bh`. BHSD: heads contiguous;
+// BSHD: interleaved → ×heads span, start at h·HeadDim.
+template <bool kBSHD>
+__device__ __forceinline__ long long head_base_offset(int bh, int seq, int heads) {
+  if constexpr (kBSHD)
+    return (long long)(bh / heads) * seq * heads * HeadDim + (long long)(bh % heads) * HeadDim;
+  else
+    return (long long)bh * seq * HeadDim;
+}
+template <bool kBSHD>
+__device__ __forceinline__ uint32_t head_span_bytes(int seq, int heads) {
+  return (uint32_t)((long long)seq * (kBSHD ? heads : 1) * HeadDim * sizeof(bf16_t));
+}
+
+// Recombine a tail q-block's `n_parts`(=G) strided KV partials. Each thread owns ONE output cell = 4 head-dims of one
+// row. Online-softmax merge: run_max = maxₚ mₚ, weight wₚ = exp2(mₚ−run_max), out = (Σₚ wₚ·oₚ)/(Σₚ wₚ·lₚ), bf16-packed.
+template <bool kBSHD>
+__global__ __launch_bounds__(MergeThreads, 4) void merge_parts(
+    bf16_t* __restrict__ Out, int seq_len, int heads, const float* __restrict__ part_buf) {
+  // tail_sched (see plan_tail_split): [0,MaxParts) per-part records, [MaxParts,+tail) per-q-block meta = {q_block=.x,
+  // bh=.y, part_base=.z, n_parts=.w}.
+  const int4 meta = tail_sched[MaxParts + blockIdx.x / MergeWGs];
+  const int part_base = meta.z, n_parts = meta.w;
+  // This thread's output cell: (row, hd), hd 4-aligned.
+  const int cell = ((blockIdx.x % MergeWGs) * MergeThreads + threadIdx.x) * 4;
+  const int row = cell / HeadDim, hd = cell % HeadDim;
+  const TailScratch parts(const_cast<float*>(part_buf));
+
+  // Pass 1: run_max = max of the parts' softmax maxima (each m is a lower bound on the true max).
+  float run_max = -FLT_MAX;
+  for (int p = 0; p < n_parts; ++p)
+    run_max = fmaxf(run_max, parts.ml[PartMl(part_base + p, row)]);
+  // Pass 2: weighted numerators (out0..out3) + shared denom l_sum.
+  float out0 = 0, out1 = 0, out2 = 0, out3 = 0, l_sum = 0;
+  for (int p = 0; p < n_parts; ++p) {
+    const float* ml = &parts.ml[PartMl(part_base + p, row)];   // ml[0] = m_p, ml[1] = l_p
+    const float* o = &parts.o[PartO(part_base + p, row, hd)];  // o_p[hd .. hd+3]
+    const float weight = fast_exp2(ml[0] - run_max);
+    out0 = fmaf(weight, o[0], out0);
+    out1 = fmaf(weight, o[1], out1);
+    out2 = fmaf(weight, o[2], out2);
+    l_sum = fmaf(weight, ml[1], l_sum);  // denom interleaved between out2/out3 deliberately:
+    out3 = fmaf(weight, o[3], out3);     // splits the 4-wide FMA dependency chain for the scheduler.
+  }
+  const float inv_l = (l_sum == 0.0f) ? 0.0f : fast_rcp(l_sum);
+
+  // Scatter normalized bf16x4 to Out at (q-block row, hd).
+  const auto OutLayout = seq_layout<kBSHD, HeadDim>(heads);
+  const auto out_buffer =
+      make_buffer(Out + head_base_offset<kBSHD>(meta.y, seq_len, heads), head_span_bytes<kBSHD>(seq_len, heads));
+  store_bf16x4(
+      out_buffer,
+      OutLayout(meta.x * PartRows + row, hd) * 2,
+      pack4_bf16</*MaybeNaN=*/true>(out0 * inv_l, out1 * inv_l, out2 * inv_l, out3 * inv_l));
+}
+
+// ─── Planners ────────────────────────────────────────────────────────────────
 // ─── Tail KV-split planner (dense) ───────────────────────────────────────────
-// Decide whether/how to recover the stranded fractional CU-round, and if so upload the schedule.
-// Returns "no split" (tail==0, split_ways==1: the whole grid runs as the ordinary prefix) when
-// recovery isn't worth the merge; parts<0 signals a schedule-upload failure.
+// Recover the stranded fractional CU-round by KV-splitting it, uploading a schedule if it pays off. "No split"
+// (tail==0, split_ways==1: whole grid runs as ordinary prefix) when not worth the merge; parts<0 signals a
+// schedule-upload failure.
 struct TailPlan {
   int prefix_wgs;  // CTAs run as the ordinary full-stream prefix (wgs − tail; 0 ⇒ none)
   int tail;        // stranded q-blocks recovered by the split (0 ⇒ no split at all)
@@ -1357,16 +1294,10 @@ constexpr int MinBlocksPerPart = 4;     // floor on kv blocks/part — finer spl
 constexpr int MergeCostBlocks = 3;      // merge kernel's modelled cost, in kv-block-time units
 
 // ─── LiteAttention LPT (longest-processing-time) work-balance order ───────────
-// Lite work is non-uniform: each q-block keeps a different number of K-blocks. The grid is
-// occupancy-1, so the hardware runs one CTA per CU and greedily picks the next CTA in grid order as
-// CUs free up — that dynamic dispatch already balances the bulk of the work, leaving only a ramp-down
-// loss (a heavy q-block dispatched late finishes after everyone else). LPT removes it by running the
-// heaviest q-blocks first so the light ones backfill the tail → makespan ≈ total_work / NumCUs.
-//
-// We don't run the LPT assignment ourselves: the hardware's dynamic dispatch IS the "give the next
-// job to the freest CU" step. We only choose the ORDER — a counting sort of the work-groups by their
-// kept-block count, descending. lpt_order[slot] = the work-group the CTA at grid slot `slot` runs.
-// Output is unchanged (each work-group still owns its own rows) → bit-identical, no split/merge.
+// Lite is work-bound: each q-block keeps a different # of K-blocks; the occ-1 grid's dynamic dispatch balances the
+// bulk, leaving only ramp-down loss when a heavy q-block dispatches late. LPT runs heaviest q-blocks first → makespan ≈
+// total_work/NumCUs. We only choose the ORDER (counting sort by kept-count, desc); HW dispatch IS the assignment.
+// lpt_order[slot] = WG the CTA at grid slot `slot` runs. Each WG owns its own rows → bit-identical, no split/merge.
 constexpr int kWorkBuckets = 256;  // kept-count buckets for the counting sort (coarse order is fine)
 __global__ __launch_bounds__(256, 1) void plan_lite_order(
     const int16_t* __restrict__ read_list,
@@ -1383,7 +1314,8 @@ __global__ __launch_bounds__(256, 1) void plan_lite_order(
     bucket_count[b] = 0;
   __syncthreads();
 
-  // Map a work-group to its work bucket: count kept K-blocks from its skip-list RLE row, bucketize.
+  // Count kept K-blocks from the WG's skip-list RLE row [len, hi0,lo0, …] (len int16s of (hi,lo) pairs), bucketize by
+  // count. +lstep rebases endpoints into phase; kept/pair=|hi-lo|. e.g. (lstep=+1) row=[4,9,5,20,18] → 4+2 = kept 6.
   auto work_bucket = [&](int wg) -> int {
     const int q_block = wg % num_q_blocks, bh = wg / num_q_blocks;
     const long long row = ((long long)bh * num_q_blocks + q_block) * (num_kv_blocks + 2);
@@ -1394,8 +1326,8 @@ __global__ __launch_bounds__(256, 1) void plan_lite_order(
       const int hi = (int)read_list[row + i - 1] + lstep;
       kept += (lstep > 0) ? (hi - lo) : (lo - hi);
     }
-    const int b = kept * kWorkBuckets / (num_kv_blocks + 1);
-    return b < kWorkBuckets ? b : kWorkBuckets - 1;
+    const int bucket = kept * kWorkBuckets / (num_kv_blocks + 1);
+    return bucket < kWorkBuckets ? bucket : kWorkBuckets - 1;  // clamp the top bucket
   };
 
   for (int wg = threadIdx.x; wg < num_wgs; wg += blockDim.x)
@@ -1417,13 +1349,16 @@ __global__ __launch_bounds__(256, 1) void plan_lite_order(
 TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t stream) {
   const int wgs = nqb * num_bh;
   const TailPlan no_split{wgs, 0, 1, 0};
-  const int tail = enable ? (wgs % NumCUs) : 0;
-  // Bail to a single ordinary launch when the grid tiles evenly, the last round is ≥95% full (too
-  // little to recover), or kv is too short for the merge to pay for itself.
-  if (!tail || tail > NumCUs * 19 / 20 || nkb < MinKvBlocksToSplit) return no_split;
+  const int tail = enable ? (wgs % NumCUs) : 0;  // CTAs left over after full CU-rounds = the stranded round
+  // Single ordinary launch (no split) when: grid tiles evenly, last round ≥95% full (too little idle), or kv too short
+  // for the merge to pay off.
+  const bool grid_tiles_evenly = !tail;
+  const bool last_round_nearly_full = tail > NumCUs * 19 / 20;
+  const bool kv_too_short = nkb < MinKvBlocksToSplit;
+  if (grid_tiles_evenly || last_round_nearly_full || kv_too_short) return no_split;
 
-  // Choose G minimizing the split's wall-time span = (CU-rounds the parts take) × (kv blocks per part)
-  // + merge cost. G=1 is the baseline of just running the full stranded round (span = nkb).
+  // Choose G minimizing span = ceil(tail·G/NumCUs) rounds × ceil(nkb/G) blocks/part + merge cost (G=1 = whole nkb).
+  // e.g. tail=40,nkb=192,NumCUs=304: G=1 → 192+3=195; G=4 → 160 parts (1 round)×48 = 48+3=51 (wins).
   int G = 1;
   long long best_span = (long long)nkb + MergeCostBlocks;
   for (int g = 2; g <= MaxParts / tail && nkb / g >= MinBlocksPerPart; ++g) {
@@ -1437,9 +1372,9 @@ TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t 
   }
   if (G == 1) return no_split;  // no split factor beats running the full stranded round
 
-  // Build the schedule: per stranded q-block, G strided parts + one per-q-block merge-meta entry.
-  // NOTE: `sched` is reused across calls; correctness relies on the single-stream contract and the
-  // pageable H2D copy staging before the next plan overwrites it (stream-ordered; multi-stream is UB).
+  // Per stranded q-block: G strided parts + one merge-meta entry. NOTE: static `sched` reused across calls —
+  // correctness relies on the single-stream contract (stream-ordered H2D before the next plan overwrites it;
+  // multi-stream is UB).
   static int4 sched[2 * MaxParts];
   int parts = 0;
   for (int t = 0; t < tail; ++t) {
@@ -1457,10 +1392,8 @@ TailPlan plan_tail_split(int nqb, int num_bh, int nkb, bool enable, hipStream_t 
   return TailPlan{wgs - tail, tail, G, parts};
 }
 
-// Single launch site for the forward kernel. Resolves the runtime `bshd` flag to the kBSHD template
-// and forwards every argument (defaulted to the kernel's own defaults), so each caller spells out only
-// the params that differ. Collapses the otherwise-identical <<<>>> argument lists (prefix / split /
-// lite-ordered / dense-full / lite-full) to one readable call each. Pure host glue — kernel unchanged.
+// ─── Launch glue ─────────────────────────────────────────────────────────────
+// Single launch site for the forward kernel: resolves runtime `bshd` to the kBSHD template + forwards defaulted args.
 template <bool isLite, bool Split>
 void fwd_launch(
     bool bshd,
@@ -1483,10 +1416,10 @@ void fwd_launch(
     int grid_nqb = 0,
     int split_ways = 0,
     const int* lpt_order = nullptr) {
-#define FWD_ARGS                                                                                  \
-  (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv,        \
-      scale_log2e, heads, (const int16_t*)read_list, (int16_t*)write_list,                        \
-      (const int16_t*)must_do_list, thr, phase, part_buf, grid_nqb, split_ways, lpt_order
+#define FWD_ARGS                                                                                                     \
+  (const bf16_t*)q, (const bf16_t*)k, (const bf16_t*)v, (bf16_t*)out, seq_len, seq_len_kv, scale_log2e, heads,       \
+      (const int16_t*)read_list, (int16_t*)write_list, (const int16_t*)must_do_list, thr, phase, part_buf, grid_nqb, \
+      split_ways, lpt_order
   if (bshd)
     attention_forward<true, isLite, Split><<<grid, dim3(BlockSize), 0, stream>>>(FWD_ARGS);
   else
@@ -1494,8 +1427,7 @@ void fwd_launch(
 #undef FWD_ARGS
 }
 
-// Launch the dense tail KV-split: ordinary prefix (if non-empty) → split parts → merge, all
-// stream-ordered. All of the forward kernel's lite/threshold/must-do params are unused here.
+// Dense tail KV-split: prefix (if non-empty) → split parts → merge, all stream-ordered.
 void launch_tail_split(
     bool bshd,
     const void* q,
@@ -1510,16 +1442,48 @@ void launch_tail_split(
     void* workspace,
     const TailPlan& tp,
     hipStream_t stream) {
-  // Prefix: the full-stream waves as one ordinary 1-D bh-major launch (grid_nqb=nqb strips the tail).
-  // Empty when the entire grid is the stranded round.
+  // Prefix: full-stream waves as one 1-D bh-major launch (grid_nqb=nqb strips the tail); empty when the whole grid is
+  // the stranded round.
   if (tp.prefix_wgs)
     fwd_launch</*isLite=*/false, /*Split=*/false>(
-        bshd, dim3(tp.prefix_wgs), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads,
-        nullptr, nullptr, nullptr, 0.f, 0, /*part_buf=*/nullptr, /*grid_nqb=*/nqb);
-  // Split: one CTA per part; each walks every G-th kv block of its q-block and writes an fp32 partial.
+        bshd,
+        dim3(tp.prefix_wgs),
+        stream,
+        q,
+        k,
+        v,
+        out,
+        seq_len,
+        seq_len_kv,
+        scale_log2e,
+        heads,
+        nullptr,
+        nullptr,
+        nullptr,
+        0.f,
+        0,
+        /*part_buf=*/nullptr,
+        /*grid_nqb=*/nqb);
+  // Split: one CTA per part, each walking every G-th kv block of its q-block into an fp32 partial.
   fwd_launch</*isLite=*/false, /*Split=*/true>(
-      bshd, dim3(tp.parts), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads, nullptr,
-      nullptr, nullptr, 0.f, 0, /*part_buf=*/(float*)workspace, /*grid_nqb=*/nqb,
+      bshd,
+      dim3(tp.parts),
+      stream,
+      q,
+      k,
+      v,
+      out,
+      seq_len,
+      seq_len_kv,
+      scale_log2e,
+      heads,
+      nullptr,
+      nullptr,
+      nullptr,
+      0.f,
+      0,
+      /*part_buf=*/(float*)workspace,
+      /*grid_nqb=*/nqb,
       /*split_ways=*/tp.split_ways);
   // Merge: recombine each stranded q-block's parts into the final bf16 output.
   if (bshd)
@@ -1530,10 +1494,8 @@ void launch_tail_split(
         (bf16_t*)out, seq_len, heads, (const float*)workspace);
 }
 
-// Lite full-grid launch with LPT work-balance reordering: build the longest-first order, then run one
-// 1-D grid where grid slot i processes lpt_order[i]. No split/merge — a pure reorder of the
-// grid-slot→work-group map, so the output is bit-identical to the plain full grid, just with a tighter
-// (work-balanced) makespan. `order_buf` holds num_wgs ints (the permutation).
+// Lite full-grid launch with LPT reordering: grid slot i processes lpt_order[i]. Pure grid-slot→WG reorder →
+// bit-identical, tighter makespan. `order_buf` = num_wgs ints (the permutation).
 void launch_lite_ordered(
     bool bshd,
     const void* q,
@@ -1557,23 +1519,38 @@ void launch_lite_ordered(
   int* lpt_order = (int*)order_buf;
   plan_lite_order<<<1, dim3(256), 0, stream>>>((const int16_t*)read_list, lpt_order, nqb, nkb, bh, phase);
   fwd_launch</*isLite=*/true, /*Split=*/false>(
-      bshd, dim3(nqb * bh), stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads, read_list,
-      write_list, must_do_list, threshold, phase, /*part_buf=*/nullptr, /*grid_nqb=*/nqb,
-      /*split_ways=*/0, lpt_order);
+      bshd,
+      dim3(nqb * bh),
+      stream,
+      q,
+      k,
+      v,
+      out,
+      seq_len,
+      seq_len_kv,
+      scale_log2e,
+      heads,
+      read_list,
+      write_list,
+      must_do_list,
+      threshold,
+      phase,
+      /*part_buf=*/nullptr,
+      /*grid_nqb=*/nqb,
+      /*split_ways=*/0,
+      lpt_order);
 }
 
 }  // namespace
 
 extern "C" {
-// IMPORTANT: V here must point to pre-transposed V_t. Call launch_v_transpose
-// first to produce V_t from raw V. V_t and V have identical total byte size.
-// Tail KV-split workspace (dense only): fp32 o + (m,l) for MaxParts parts. workspace==nullptr ⇒ no split.
+// IMPORTANT: V here must point to pre-transposed V_t (call launch_v_transpose first; V_t and V have identical byte
+// size). Tail KV-split workspace (dense only): fp32 o + (m,l) for MaxParts parts. workspace==nullptr ⇒ no split.
 size_t tail_workspace_bytes(void) {
   return (size_t)MaxParts * (PartOFloats + PartMlFloats) * sizeof(float);
 }
 
-// Lite LPT order buffer: one int per work-group (q-block × batch·head). workspace==nullptr ⇒ plain
-// full-grid lite (no reorder).
+// Lite LPT order buffer: one int per work-group (q-block × batch·head). workspace==nullptr ⇒ plain full-grid lite.
 size_t lite_workspace_bytes(int batch, int heads, int seq_len) {
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
   const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG;
@@ -1602,31 +1579,28 @@ int launch_attention_forward(
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
   const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG, nkb = (seq_len_kv + 63) / 64;
   const dim3 grid(nqb, bh);
-  const float sl2e = Log2e / sqrtf((float)HeadDim);
+  const float scale_log2e = Log2e / sqrtf((float)HeadDim);
   // layout: 0 = BHSD ([B,H,S,D]); 1 = BSHD ([B,S,H,D], read natively, no transpose).
 
-  // Tail KV-split: recover the stranded fractional round (when a workspace is given). Prefix runs
-  // the full waves as one ordinary launch; the split parts + merge run the stranded round.
+  // Tail KV-split: recover the stranded fractional round (when a workspace is given). Prefix = full waves as one
+  // ordinary launch; split parts + merge run the stranded round.
   const TailPlan tp = plan_tail_split(nqb, bh, nkb, workspace != nullptr, (hipStream_t)stream);
   if (tp.parts < 0) return 6;
   if (tp.tail) {
-    launch_tail_split(layout, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, workspace, tp, (hipStream_t)stream);
+    launch_tail_split(
+        layout, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads, nqb, workspace, tp, (hipStream_t)stream);
     return (int)hipGetLastError();
   }
   fwd_launch</*isLite=*/false, /*Split=*/false>(
-      layout, grid, (hipStream_t)stream, q, k, v, out, seq_len, seq_len_kv, sl2e, heads);
+      layout, grid, (hipStream_t)stream, q, k, v, out, seq_len, seq_len_kv, scale_log2e, heads);
   return (int)hipGetLastError();
 }
 
-// LiteAttention forward (Part A cross-timestep block-skip + Part B per-wave soft-skip).
-// read_list / write_list are int16 RLE keep-lists, [B,H,num_q_blocks,num_kv_blocks+2] slices
-// (read = skip_list[phase], write = skip_list[1-phase]); tile = (QTilesPerWG·QTileRows q-rows,
-// 64 kv). must_do_list is an optional global force-compute RLE [len,s0,e0,…] (nullable).
-// threshold is log2 (~ -10); phase selects the reverse-list direction. V must be pre-transposed.
-// (Verdict ring reuses the evicted qg2 d-tile's LDS slot → no dynamic LDS; total LDS == dense's.)
-// One full-grid launch; each CTA writes its own next-step RLE inline. With a workspace (the LPT order
-// buffer), the q-blocks run heaviest-first for a work-balanced makespan (bit-identical output);
-// workspace==nullptr runs the plain identity-order grid.
+// LiteAttention forward (Part A cross-timestep block-skip + Part B per-wave soft-skip). read/write_list = int16 RLE
+// keep-lists [B,H,nqb,nkb+2] (read=skip_list[phase], write=[1-phase]); must_do_list = optional force-compute RLE
+// (nullable); threshold log2 (~-10), phase = reverse dir, V pre-transposed. Verdict ring reuses evicted qg2 LDS slot →
+// total LDS == dense's. Full-grid launch, each CTA writes its RLE inline; workspace (LPT buffer) runs q-blocks
+// heaviest-first (bit-identical), else plain identity-order.
 int launch_attention_forward_lite(
     const void* q,
     const void* k,
@@ -1655,28 +1629,59 @@ int launch_attention_forward_lite(
   const int qt = (seq_len + QTileRows - 1) / QTileRows;
   const int nqb = (qt + QTilesPerWG - 1) / QTilesPerWG, nkb = (seq_len_kv + 63) / 64;
   const dim3 grid(nqb, bh);
-  const float sl2e = Log2e / sqrtf((float)HeadDim);
+  const float scale_log2e = Log2e / sqrtf((float)HeadDim);
 
-  // LPT work-balance reorder (default when a workspace is given and kv is long enough to amortize the
-  // ~few-µs sort kernel): run the heaviest q-blocks first so the hardware's dynamic dispatch finishes
-  // near the work-bound floor. Pure reorder → bit-identical to the plain grid below.
+  // LPT work-balance reorder (default when a workspace is given and kv is long enough to amortize the ~few-µs sort):
+  // run heaviest q-blocks first so HW dynamic dispatch finishes near the work-bound floor. Pure reorder →
+  // bit-identical.
   if (workspace && nkb >= MinKvBlocksToSplit) {
     launch_lite_ordered(
-        layout, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, nqb, bh, nkb, read_list, write_list,
-        must_do_list, threshold, phase, workspace, (hipStream_t)stream);
+        layout,
+        q,
+        k,
+        v,
+        out,
+        seq_len,
+        seq_len_kv,
+        scale_log2e,
+        heads,
+        nqb,
+        bh,
+        nkb,
+        read_list,
+        write_list,
+        must_do_list,
+        threshold,
+        phase,
+        workspace,
+        (hipStream_t)stream);
     return (int)hipGetLastError();
   }
 
-  // Lite runs the full grid as one launch (no tail KV-split — its stranded round is sparse); each CTA
-  // walks its read list's kept blocks and RLE-encodes the next-step write list inline.
+  // Lite runs the full grid as one launch (no tail KV-split — stranded round is sparse); each CTA walks its kept blocks
+  // and RLE-encodes the write list inline.
   fwd_launch</*isLite=*/true, /*Split=*/false>(
-      layout, grid, (hipStream_t)stream, q, k, v, out, seq_len, seq_len_kv, sl2e, heads, read_list,
-      write_list, must_do_list, threshold, phase);
+      layout,
+      grid,
+      (hipStream_t)stream,
+      q,
+      k,
+      v,
+      out,
+      seq_len,
+      seq_len_kv,
+      scale_log2e,
+      heads,
+      read_list,
+      write_list,
+      must_do_list,
+      threshold,
+      phase);
   return (int)hipGetLastError();
 }
 
-// V transpose: V[seq_len, 128] (bf16) → V_t in pv_phase's consumed layout.
-// Caller allocates V_t with same byte size as V. n_rows = batch*heads*seq_len.
+// V transpose: V[seq_len,128] (bf16) → V_t in pv_phase's layout. Caller allocates V_t same byte size as V; n_rows =
+// batch*heads*seq_len.
 int launch_v_transpose(
     const void* v, void* v_t, int n_rows, int seq_len_per_head, int heads, int layout, void* stream) {
   if (n_rows <= 0 || seq_len_per_head <= 0 || (n_rows % seq_len_per_head)) return 2;
