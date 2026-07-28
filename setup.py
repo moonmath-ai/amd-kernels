@@ -35,6 +35,9 @@ _compile_names = [
     "attention_rtna.hip",
     "attention_rtne.hip",
     "attention_rtz.hip",
+    # ── MLA (DeepSeek-V3) — absorbed decode, bf16 Q / fp8 KV ──
+    "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 / _paged_dev / _plan_parts
+    "mla_decode_a16w8.hip",      # a16w8 absorbed decode: bf16 Q + fp8 KV, 8 waves (CONS=4/PROD=4), TileTok=64
 ]
 _include_names = ["attention_kernel.hip", "opus.hpp"]
 

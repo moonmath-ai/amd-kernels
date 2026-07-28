@@ -10,5 +10,15 @@
 
 from ._kernel import forward, forward_lite
 from .lite import LiteAttention
+from .mla import (
+    mla_decode_a16w8,
+    mla_decode_a16w8_paged_dev,
+    mla_decode_a16w8_plan_parts,
+    mla_decode_a16w8_plan_parts_capped,
+)
 
-__all__ = ["forward", "forward_lite", "LiteAttention"]
+__all__ = [
+    "forward", "forward_lite", "LiteAttention",
+    "mla_decode_a16w8", "mla_decode_a16w8_paged_dev",
+    "mla_decode_a16w8_plan_parts", "mla_decode_a16w8_plan_parts_capped",
+]
