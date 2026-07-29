@@ -433,6 +433,9 @@ at::Tensor forward_lite(
   return out;
 }
 
+// MLA (DeepSeek-V3) absorbed-decode op registration — defined in mla_decode_a16w8_api.cpp
+namespace moonmath_mla_a16w8 { void register_pybind(pybind11::module_& m); }
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "moonmath_attention: ROCm CDNA3 (MI300X) fused attention kernel";
 
@@ -462,4 +465,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("out") = py::none(),
       py::arg("round_mode") = "rtna",
       py::arg("layout") = "bhsd");
+
+  moonmath_mla_a16w8::register_pybind(m);  // a16w8 absorbed decode (bf16 Q + fp8 KV)
 }
