@@ -169,6 +169,7 @@ constexpr int    StepTok  = TileTok;
 constexpr int    PartHead = 4;                 // fp32 header slots (ABI-stable workspace sizing only)
 constexpr size_t MaxCTAs  = 2048 + 2 * NumCU;
 constexpr int    MaxHeads = 16;
+constexpr int    MaxQL    = 8;   // widest draft window
 // Partial workspace: bf16 [cta][head][512] payload slab + head-major (run_max,run_sum) header planes.
 constexpr size_t POElems  = MaxCTAs * (size_t)MaxHeads * LatDim;
 constexpr size_t HdrBase  = POElems / 2;
@@ -190,15 +191,30 @@ __global__ void __launch_bounds__(Threads, 1) mla_decode_a16w8_kernel(
     bf16* __restrict__ o_lat,         // [B, 16, 512] (parts==1)
     float* __restrict__ partials,     // fp32 split workspace (parts>1)
     int B, int H, int S_scalar, int parts, float scale_log2e, float kv_scale, float scale_p,
+    int q_len,                                     // draft window; 1 = plain decode
     const int* __restrict__ seq_lens = nullptr,    // [B] device (Paged)
     const int* __restrict__ rows = nullptr,        // [B] q/out row (Paged; null -> b)
     const int* __restrict__ kv_indices = nullptr,  // [sum seq] slots (Paged)
     const int* __restrict__ kv_indptr = nullptr) { // [B+1] slot offsets (Paged)
   constexpr int FusedDim = LatDim + RopeDim;       // 576
+  // Draft window at QLC=1: one draft position per CTA, so the PV accumulator and
+  //   q_frag budgets are exactly the q_len==1 ones and the register allocation is
+  //   untouched. The multiq kernel keeps up to DraftPerCta=4 positions resident, which it
+  //   can afford only because its fp8 q_frag is 36 VGPR instead of this kernel's 72.
+  //   The cost here is that the QGroups=q_len CTAs sharing a (batch, kv-part) each
+  //   re-read the KV stream; they are laid out FASTEST on the grid axis so those
+  //   duplicate reads are one tile apart and land in MALL/L2 rather than HBM.
   const int cta  = blockIdx.x;
-  const int part = cta % parts;
-  const int b    = cta / parts;
+  const int qpos = q_len > 1 ? cta % q_len : 0;
+  const int rest = q_len > 1 ? cta / q_len : cta;
+  const int part = rest % parts;
+  const int b    = rest / parts;
   const int S      = Paged ? seq_lens[b] : S_scalar;
+  // Causal inside the draft window: position qpos attends KV [0, S - (q_len-1-qpos)).
+  //   seq_lens INCLUDES the q_len draft tokens just written (verified against a
+  //   per-position q_len=1 reference), so excluding the window here would make every
+  //   query attend q_len tokens too few against stale KV.
+  const int tok_lim = S - (q_len - 1 - qpos);
   const int q_row  = (Paged && rows) ? rows[b] : b;
   const int slot0  = Paged ? kv_indptr[b] : 0;
   const bool single_part = (parts == 1);
@@ -243,7 +259,7 @@ __global__ void __launch_bounds__(Threads, 1) mla_decode_a16w8_kernel(
   const bool q_owner = is_cons && cwave == 0;
   if (q_owner) {
     const bool active = mrow < H;
-    const size_t qh = (size_t)(q_row * H + (active ? mrow : 0));
+    const size_t qh = (size_t)((q_row * q_len + qpos) * H + (active ? mrow : 0));
     const bf16* ql = q_lat + qh * LatDim;
     const bf16* qp = q_pe  + qh * RopeDim;
     auto qstep = [&](int step) -> bf16x4 {
@@ -422,7 +438,7 @@ __global__ void __launch_bounds__(Threads, 1) mla_decode_a16w8_kernel(
   // Online softmax for one tile: fold scores into (run_max, run_sum, o_acc), emit NPV bf16x8 prob operands.
   auto softmax_tile = [&](f32x4* sarr, int kv0, bf16x8* probs) {
     // Tail mask: zero out scores past the valid token count (only the last tile of a part is partial).
-    const int tc = kv_hi - kv0;
+    const int tc = min(kv_hi, tok_lim) - kv0;
     const bool full = (tc >= TileTok);
     float bmax = NegInf;
     if (__builtin_expect(!full, 0)) {
@@ -582,7 +598,7 @@ __global__ void __launch_bounds__(Threads, 1) mla_decode_a16w8_kernel(
     //   lift) fold into the normalization factor inv.
     if (single_part) {
       const float inv = (run_sum > 0.f) ? kv_scale / (run_sum * PLift) : 0.f;
-      store_o(o_lat + (size_t)(b * H + head) * LatDim, inv);
+      store_o(o_lat + (size_t)((b * q_len + qpos) * H + head) * LatDim, inv);
     } else {
       // parts>1: export un-normalized but fully dequantized O-partials (run_sum is in true units, so the
       //   payload must be too). The merge kernel reweights by w_p = exp2(max_p - max) and normalizes.
@@ -600,7 +616,8 @@ __global__ void __launch_bounds__(Threads, 1) mla_decode_a16w8_kernel(
 //   DPC=512/DimSplit slice of output dims. Sum association is fixed, hence deterministic.
 template <int DimSplit>
 __global__ void __launch_bounds__(256) mla_decode_a16w8_merge(
-    const float* __restrict__ partials, bf16* __restrict__ o_lat, int B, int H, int parts) {
+    const float* __restrict__ partials, bf16* __restrict__ o_lat, int B, int H, int parts,
+    int q_len) {
   constexpr int NT  = 256, NW = NT / WaveSize;
   constexpr int DPC = LatDim / DimSplit;
   constexpr int DPL = 8;
@@ -612,9 +629,14 @@ __global__ void __launch_bounds__(256) mla_decode_a16w8_merge(
   static_assert(LPR >= 1 && LPR * DPL == DPC && SUB * LPR == WaveSize);
 
   const int bh = blockIdx.x / DimSplit, dblk = blockIdx.x - bh * DimSplit;
-  const int b = bh / H, h = bh - b * H;
+  const int bq = bh / H, h = bh - bq * H;
+  const int qpos = q_len > 1 ? bq % q_len : 0;
+  const int b    = q_len > 1 ? bq / q_len : bq;
   const int tid = threadIdx.x, lane = tid & (WaveSize - 1), wv = tid / WaveSize;
-  const size_t cta0 = (size_t)b * parts;
+  // The kernel laid the q_len window out FASTEST on the CTA axis, so this
+  //   (b, qpos)'s parts are q_len CTAs apart, not adjacent.
+  const size_t cta0 = ((size_t)b * parts) * q_len + qpos;
+  const size_t cstr = (size_t)q_len;
   __shared__ float s_w[MaxParts];           // per-part softmax weight exp2(max_p - max)
   __shared__ float s_rm[NW], s_rs[NW];      // cross-wave folds of run_max / run_sum
   __shared__ float s_o[(NW - 1) * DPC];     // cross-wave fold of the accumulated O slice
@@ -626,8 +648,8 @@ __global__ void __launch_bounds__(256) mla_decode_a16w8_merge(
   #pragma unroll
   for (int k = 0; k < HPT; ++k) {           // each thread loads HPT header entries
     const int pp = tid + k * NT;
-    lm[k] = (pp < parts) ? hmax[pp] : NegInf;
-    ls[k] = (pp < parts) ? hsum[pp] : 0.f;
+    lm[k] = (pp < parts) ? hmax[(size_t)pp * cstr] : NegInf;
+    ls[k] = (pp < parts) ? hsum[(size_t)pp * cstr] : 0.f;
     lmax  = fmaxf(lmax, lm[k]);
   }
   // Reduce max across the wave, then across waves via LDS.
@@ -661,7 +683,7 @@ __global__ void __launch_bounds__(256) mla_decode_a16w8_merge(
   // ── Pass 2: accumulate sum_p w_p * O_p over this CTA's output-dim slice ──
   // Each thread owns DPL=8 dims of one partial row; waves stride over parts by GRP.
   const int sub = lane / LPR, dl = lane - sub * LPR;
-  const size_t rowStride = (size_t)MaxHeads * LatDim;
+  const size_t rowStride = (size_t)MaxHeads * LatDim * cstr;
   const bf16* __restrict__ src = (const bf16*)partials + (cta0 * MaxHeads + h) * LatDim
                                  + dblk * DPC + dl * DPL;
   float acc[DPL] = {};
@@ -708,7 +730,7 @@ __global__ void __launch_bounds__(256) mla_decode_a16w8_merge(
     const bf16x4 p0 = pack4(acc[0] * inv, acc[1] * inv, acc[2] * inv, acc[3] * inv);
     const bf16x4 p1 = pack4(acc[4] * inv, acc[5] * inv, acc[6] * inv, acc[7] * inv);
     bf16x8 out; __builtin_memcpy(&out, &p0, 8); __builtin_memcpy((char*)&out + 8, &p1, 8);
-    *(bf16x8*)(o_lat + (size_t)(b * H + h) * LatDim + dblk * DPC + lane * DPL) = out;
+    *(bf16x8*)(o_lat + (size_t)((b * q_len + qpos) * H + h) * LatDim + dblk * DPC + lane * DPL) = out;
   }
 }
 // Dim-split pick: raise DimSplit until the merge grid is ~2 CTAs per CU. Capped at 16 (DPC=32 = one cache line).
@@ -719,11 +741,11 @@ __host__ inline int merge_dsplit(int B, int H) {
   return ds;
 }
 __host__ inline void launch_merge(const float* partials, bf16* o_lat, int B, int H, int parts,
-                                  hipStream_t stream) {
-  const int ds = merge_dsplit(B, H);
+                                  hipStream_t stream, int q_len = 1) {
+  const int ds = merge_dsplit(B * q_len, H);
   #define A16W8_MERGE_CASE(D)                                                                       \
-    case D: mla_decode_a16w8_merge<D><<<dim3(B * H * (D)), dim3(256), 0, stream>>>(             \
-                partials, o_lat, B, H, parts); break;
+    case D: mla_decode_a16w8_merge<D><<<dim3(B * q_len * H * (D)), dim3(256), 0, stream>>>(    \
+                partials, o_lat, B, H, parts, q_len); break;
   switch (ds) {
     A16W8_MERGE_CASE(2) A16W8_MERGE_CASE(4) A16W8_MERGE_CASE(8) A16W8_MERGE_CASE(16)
     default: A16W8_MERGE_CASE(1)
@@ -737,17 +759,20 @@ constexpr size_t MallBytes    = 256ull << 20;        // MI300X MALL capacity
 __host__ inline bool want_nt(size_t kv_bytes) { return kv_bytes > MallBytes; }
 // Split planner: KV-splits (`parts`) per request. Occupancy is 1, so fill the machine once (parts = NumCU/B),
 //   floored by MinTilesPerPart (amortise the prologues) and the workspace CTA cap.
-__host__ inline int plan_parts(int B, int S) {
+__host__ inline int plan_parts(int B, int S, int qgroups = 1) {
   int tiles = (S + StepTok - 1) / StepTok;
   if (tiles < 1) tiles = 1;
-  const int bb = B > 0 ? B : 1;
+  if (qgroups < 1) qgroups = 1;
+  // At QLC=1 the window costs qgroups=q_len CTAs per (batch, kv-part), so the
+  //   KV split has that many fewer parts to spend before hitting the grid cap.
+  const int bb = (B > 0 ? B : 1) * qgroups;
   int p = NumCU / bb;
   if (p < 1) p = 1;
   constexpr int MinTilesPerPart = 1;
   if (p > tiles / MinTilesPerPart) p = tiles / MinTilesPerPart;
   if (p > tiles)     p = tiles;
   if (p > MaxParts)  p = MaxParts;
-  const int cap = (B > 0) ? (int)(MaxCTAs / (size_t)B) : 1;
+  const int cap = (B > 0) ? (int)(MaxCTAs / ((size_t)B * (size_t)qgroups)) : 1;
   if (p > cap) p = cap;
   if (p < 1)   p = 1;
   return p;
@@ -772,11 +797,13 @@ extern "C" __host__ int launch_mla_decode_a16w8(
   if (nt)
     mla_decode_a16w8_kernel</*Paged=*/false, /*NT=*/true><<<dim3(B * parts), dim3(Threads), 0, stream>>>(
         (const bf16*)q_lat, (const bf16*)q_pe, (const fp8_t*)c_kv, (const bf16*)k_pe,
-        (bf16*)o_lat, (float*)workspace, B, H, S, parts, scale_log2e, kv_scale, scale_p);
+        (bf16*)o_lat, (float*)workspace, B, H, S, parts, scale_log2e, kv_scale, scale_p,
+        /*q_len=*/1);
   else
     mla_decode_a16w8_kernel</*Paged=*/false, /*NT=*/false><<<dim3(B * parts), dim3(Threads), 0, stream>>>(
         (const bf16*)q_lat, (const bf16*)q_pe, (const fp8_t*)c_kv, (const bf16*)k_pe,
-        (bf16*)o_lat, (float*)workspace, B, H, S, parts, scale_log2e, kv_scale, scale_p);
+        (bf16*)o_lat, (float*)workspace, B, H, S, parts, scale_log2e, kv_scale, scale_p,
+        /*q_len=*/1);
   if (parts > 1) launch_merge((const float*)workspace, (bf16*)o_lat, B, H, parts, stream);
   return (int)hipGetLastError();
 }
@@ -787,14 +814,15 @@ extern "C" __host__ int launch_mla_decode_a16w8_paged_dev(
     const void* q_lat, const void* q_pe, const void* kv_pool, void* o_lat,
     const void* seq_lens, const void* rows, const void* kv_indices, const void* kv_indptr,
     int B, int H, int parts, int lat_dim, int rope_dim, float scale, float kv_scale, float scale_p,
-    void* workspace, void* stream_, size_t kv_bytes) {
+    void* workspace, void* stream_, size_t kv_bytes, int q_len) {
+  if (q_len < 1 || q_len > MaxQL) return -4;
   if (lat_dim != 512 || rope_dim != 64) return -2;
   if (H > 16) return -3;
   const auto stream = (hipStream_t)stream_;
   const float scale_log2e = 1.4426950408889634f * scale;
   int p = parts < 1 ? 1 : parts;
   {
-    const int grid_cap = (int)(MaxCTAs / (size_t)B);
+    const int grid_cap = (int)(MaxCTAs / ((size_t)B * (size_t)q_len));
     const int max_p = grid_cap < MaxParts ? grid_cap : MaxParts;
     if (p > max_p) p = max_p;
     if (p < 1) p = 1;
@@ -802,16 +830,16 @@ extern "C" __host__ int launch_mla_decode_a16w8_paged_dev(
   if (p > 1 && !workspace) p = 1;
   const bool nt = want_nt(kv_bytes);
   if (nt)
-    mla_decode_a16w8_kernel</*Paged=*/true, /*NT=*/true><<<dim3(B * p), dim3(Threads), 0, stream>>>(
+    mla_decode_a16w8_kernel</*Paged=*/true, /*NT=*/true><<<dim3(B * p * q_len), dim3(Threads), 0, stream>>>(
         (const bf16*)q_lat, (const bf16*)q_pe, (const fp8_t*)kv_pool, /*k_pe=*/nullptr,
         (bf16*)o_lat, (float*)workspace, B, H, /*S_scalar=*/0, p, scale_log2e, kv_scale, scale_p,
-        (const int*)seq_lens, (const int*)rows, (const int*)kv_indices, (const int*)kv_indptr);
+        q_len, (const int*)seq_lens, (const int*)rows, (const int*)kv_indices, (const int*)kv_indptr);
   else
-    mla_decode_a16w8_kernel</*Paged=*/true, /*NT=*/false><<<dim3(B * p), dim3(Threads), 0, stream>>>(
+    mla_decode_a16w8_kernel</*Paged=*/true, /*NT=*/false><<<dim3(B * p * q_len), dim3(Threads), 0, stream>>>(
         (const bf16*)q_lat, (const bf16*)q_pe, (const fp8_t*)kv_pool, /*k_pe=*/nullptr,
         (bf16*)o_lat, (float*)workspace, B, H, /*S_scalar=*/0, p, scale_log2e, kv_scale, scale_p,
-        (const int*)seq_lens, (const int*)rows, (const int*)kv_indices, (const int*)kv_indptr);
-  if (p > 1) launch_merge((const float*)workspace, (bf16*)o_lat, B, H, p, stream);
+        q_len, (const int*)seq_lens, (const int*)rows, (const int*)kv_indices, (const int*)kv_indptr);
+  if (p > 1) launch_merge((const float*)workspace, (bf16*)o_lat, B, H, p, stream, q_len);
   return (int)hipGetLastError();
 }
 
@@ -823,6 +851,20 @@ extern "C" __host__ int mla_decode_a16w8_plan_parts(int B, int H, int max_seq_le
 }
 
 extern "C" __host__ int mla_decode_a16w8_max_ctas() { return (int)MaxCTAs; }
+
+// q_len-aware fixed KV-split count for a graph captured at (B, max_seq_len, q_len).
+//   Prefer this over plan_parts_capped when q_len > 1: at QLC=1 every draft position
+//   is its own CTA, so the window multiplies the CTA count and the KV split has to
+//   give parts back to stay inside the grid cap. H is accepted for ABI symmetry with
+//   the entry point and ignored (H <= 16 is a single query tile).
+extern "C" __host__ int mla_decode_a16w8_plan_parts_q(int B, int max_seq_len, int q_len, int H) {
+  (void)H;
+  if (q_len < 1) q_len = 1;
+  if (q_len > MaxQL) return -4;
+  int parts = plan_parts(B, max_seq_len, q_len);
+  if (parts < 1) parts = 1;
+  return parts;
+}
 
 extern "C" __host__ int mla_decode_a16w8_plan_parts_capped(int B, int H, int max_seq_len, int lat_dim) {
   (void)H; (void)lat_dim;
