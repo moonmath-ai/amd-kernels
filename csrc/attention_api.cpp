@@ -468,6 +468,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("round_mode") = "rtna",
       py::arg("layout") = "bhsd");
 
-  moonmath_mla_a16w8::register_pybind(m);         // a16w8 absorbed decode (bf16 Q + fp8 KV), q_len 1
+  moonmath_mla_a16w8::register_pybind(m);         // a16w8 absorbed decode (bf16 Q + fp8 KV), q_len 1..8
   moonmath_mla_a16w8_multiq::register_pybind(m);  // … same, over a q_len 4..8 draft window
 }
