@@ -36,7 +36,7 @@ _compile_names = [
     "attention_rtne.hip",
     "attention_rtz.hip",
     # ── MLA (DeepSeek-V3) — absorbed decode, bf16 Q / fp8 KV ──
-    "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 / _paged_dev / _plan_parts
+    "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 / _paged_dev / _plan_parts / _plan_parts_q
     "mla_decode_a16w8.hip",      # a16w8 absorbed decode: bf16 Q + fp8 KV, 8 waves (CONS=4/PROD=4), TileTok=64
     "mla_decode_a16w8_multiq_api.cpp",  # binds _C.mla_decode_a16w8_multiq / _paged_dev / _plan_parts_q
     "mla_decode_a16w8_multiq.hip",      # a16w8 multi-query decode, q_len 4..8: 8 computing waves, TileTok=16

@@ -5,8 +5,9 @@ e4m3-fnuz, unpacked to bf16 for both QK and PV.
 
 Two CTA shapes are exposed, picked by op rather than by argument:
 
-- ``mla_decode_a16w8*`` — q_len 1, one query row per head. TileTok=64, 8-wave
-  warp-specialized (4 consumer / 4 producer waves).
+- ``mla_decode_a16w8*`` — one query row per head, H <= 16. TileTok=64, 8-wave
+  warp-specialized (4 consumer / 4 producer waves). q_len 1..8, one draft
+  position per CTA (QLC=1), so the register allocation is the q_len==1 one.
 - ``mla_decode_a16w8_multiq*`` — a q_len 4..8 draft window resident per CTA
   (speculative-decode verify), H <= 16, B <= 32. TileTok=16, all 8 waves compute
   and the fp8->bf16 unpack happens once per token on the LDS fill. Draft position
@@ -26,6 +27,7 @@ __all__ = [
     "mla_decode_a16w8_paged_dev",
     "mla_decode_a16w8_plan_parts",
     "mla_decode_a16w8_plan_parts_capped",
+    "mla_decode_a16w8_plan_parts_q",
     "mla_decode_a16w8_multiq",
     "mla_decode_a16w8_multiq_paged_dev",
     "mla_decode_a16w8_multiq_plan_parts_q",
@@ -75,12 +77,17 @@ def mla_decode_a16w8_paged_dev(
 ) -> None:
     """A16W8 absorbed-decode MLA, device-driven paged (cuda-graph capturable).
 
+    q_lat/q_pe: bf16 [B,H,*] (q_len=1) or [B,q_len,H,*] (draft window, q_len<=8).
+                Position t attends KV [0, S - q_len + t] (end-aligned causal), so
+                `seq_lens` INCLUDES the q_len draft tokens just written.
     kv_pool:    [num_slots, 1, 576] fp8 e4m3-fnuz — fused pool at per-tensor kv_scale.
     seq_lens:   [B] int32 device — per-request KV lengths.
     rows:       [B] int32 device or None — maps req_pool_index -> q/out batch row (None -> identity).
     kv_indices: [sum(seq_lens)] int32 device — flat per-token slots.
     kv_indptr:  [B+1] int32 device — per-request slot offsets.
-    parts:      fixed at graph capture (use mla_decode_a16w8_plan_parts_capped).
+    parts:      fixed at graph capture (mla_decode_a16w8_plan_parts_capped, or
+                _plan_parts_q when q_len > 1 -- the window costs q_len CTAs per
+                (batch, kv-part), so the KV split has to give parts back).
     """
     _C.mla_decode_a16w8_paged_dev(
         q_lat, q_pe, kv_pool, o_lat, seq_lens, rows, kv_indices, kv_indptr,
@@ -96,6 +103,17 @@ def mla_decode_a16w8_plan_parts(B: int, H: int, max_seq_len: int, lat_dim: int =
 def mla_decode_a16w8_plan_parts_capped(B: int, H: int, max_seq_len: int, lat_dim: int = 512) -> int:
     """As plan_parts, additionally clamped so B*parts <= MaxCTAs."""
     return int(_C.mla_decode_a16w8_plan_parts_capped(int(B), int(H), int(max_seq_len), int(lat_dim)))
+
+
+def mla_decode_a16w8_plan_parts_q(B: int, max_seq_len: int, q_len: int = 1, H: int = 16) -> int:
+    """q_len-aware fixed KV-split count for a graph captured at (B, max_seq_len, q_len).
+
+    Prefer this over plan_parts_capped when q_len > 1. This kernel runs the draft
+    window at one position per CTA (QLC=1), so a window of q_len multiplies the CTA
+    count by q_len and the KV split must give parts back to stay inside the grid cap.
+    H is accepted for ABI stability and ignored (H<=16 is a single query tile).
+    """
+    return int(_C.mla_decode_a16w8_plan_parts_q(int(B), int(max_seq_len), int(q_len), int(H)))
 
 
 # ---- multi-query: a q_len 4..8 draft window resident per CTA ----------------
