@@ -39,7 +39,9 @@ _compile_names = [
     "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 / _paged_dev / _plan_parts / _plan_parts_q
     "mla_decode_a16w8.hip",      # a16w8 absorbed decode: bf16 Q + fp8 KV, 8 waves (CONS=4/PROD=4), TileTok=64
     "mla_decode_a16w8_multiq_api.cpp",  # binds _C.mla_decode_a16w8_multiq / _paged_dev / _plan_parts_q
-    "mla_decode_a16w8_multiq.hip",      # a16w8 multi-query decode, q_len 4..8: 8 computing waves, TileTok=16
+    "mla_decode_a16w8_multiq.hip",      # a16w8 MULTI-QUERY decode, q_len 4..8: 8 computing waves, bf16 LDS
+                                        #   tile of 16 tokens, 4 resident draft positions (8 in one pass over
+                                        #   KV when the heads pack into 3 MFMA N-tiles at 9 <= H <= 12)
 ]
 _include_names = ["attention_kernel.hip", "opus.hpp"]
 

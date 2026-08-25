@@ -9,10 +9,15 @@ Two CTA shapes are exposed, picked by op rather than by argument:
   warp-specialized (4 consumer / 4 producer waves). q_len 1..8, one draft
   position per CTA (QLC=1), so the register allocation is the q_len==1 one.
 - ``mla_decode_a16w8_multiq*`` — a q_len 4..8 draft window resident per CTA
-  (speculative-decode verify), H <= 16, B <= 32. TileTok=16, all 8 waves compute
-  and the fp8->bf16 unpack happens once per token on the LDS fill. Draft position
-  t attends to KV [0, seq_len - q_len + t] inclusive (end-aligned causal), so the
-  last draft position sees the whole sequence.
+  (speculative-decode verify), H <= 16, B <= 32. TileTok=16, all 8 waves compute,
+  software-pipelined one tile deep, and the fp8->bf16 unpack happens once per
+  token on the LDS fill so the consumer does none. Draft position t attends to KV
+  [0, seq_len - q_len + t] inclusive (end-aligned causal), so the last draft
+  position sees the whole sequence. A CTA takes all 8 positions in ONE pass over
+  KV at q_len 8 with 9 <= H <= 12 (the heads pack into 3 MFMA N-tiles), and 4
+  positions per pass otherwise. The paged op also takes an optional q_lens[B]:
+  each request may use a SHORTER live window than the padded width, with the
+  tensors still rectangular and o_lat's padded rows untouched.
 
 Both take the same fused fp8 e4m3-fnuz 576-wide KV rows ([...,:512] latent,
 [512:576] rope) at one per-tensor kv_scale, either as a contiguous [B, S, 576]
@@ -158,6 +163,7 @@ def mla_decode_a16w8_multiq_paged_dev(
     scale: float,
     kv_scale: float,
     scale_p: float = 1.0,
+    q_lens: torch.Tensor | None = None,
 ) -> None:
     """A16W8 multi-query decode, device-driven paged (cuda-graph capturable). q_len 4..8.
 
@@ -169,18 +175,27 @@ def mla_decode_a16w8_multiq_paged_dev(
     kv_indices: [sum(seq_lens)] int32 device — flat per-token slots (MLA page_size=1).
     kv_indptr:  [B+1] int32 device — per-request slot offsets.
     parts:      fixed at graph capture (use mla_decode_a16w8_multiq_plan_parts_q).
+    q_lens:     [B] int32 device or None — RAGGED query window, indexed like seq_lens (by KV
+                request, NOT by rows[b]). The tensors stay RECTANGULAR at the padded q_len; only
+                positions [0, q_lens[b]) are live, so position p attends KV
+                [0, seq_lens[b] - (q_lens[b]-1-p)) and rows >= q_lens[b] of o_lat are left
+                untouched. q_lens[b] <= q_len is the caller's contract (the values cannot be read
+                without a device sync) and the kernel clamps a violation. None => the plain
+                rectangular batch, bit for bit.
     """
     _C.mla_decode_a16w8_multiq_paged_dev(
         q_lat, q_pe, kv_pool, o_lat, seq_lens, rows, kv_indices, kv_indptr,
-        int(parts), float(scale), float(kv_scale), float(scale_p),
+        int(parts), float(scale), float(kv_scale), float(scale_p), q_lens,
     )
 
 
 def mla_decode_a16w8_multiq_plan_parts_q(B: int, max_seq_len: int, q_len: int = 4, H: int = 16) -> int:
     """Fixed KV-split count for a multi-query graph captured at (B, max_seq_len, q_len, H).
 
-    Accounts for the q_len/4 CTAs that share one KV stream, so the launched grid stays inside
-    the workspace cap. H is accepted for ABI symmetry and does not shape the grid (H<=16 is one
-    query tile). Call at capture, reuse on replay.
+    Accounts for the CTAs that share one KV stream, so the launched grid stays inside the
+    workspace cap. H MATTERS: at q_len 8 with 9 <= H <= 12 the heads pack and one CTA takes the
+    whole draft window in a SINGLE pass over KV (1 group), otherwise two groups of 4 positions
+    each split it. Pass the H you will actually run; passing a larger one only costs grid width,
+    never correctness. Call at capture, reuse on replay.
     """
     return int(_C.mla_decode_a16w8_multiq_plan_parts_q(int(B), int(max_seq_len), int(q_len), int(H)))
