@@ -1,17 +1,35 @@
 # moonmath-attention
 
-Hand-tuned bf16 forward attention kernel for AMD CDNA3 (MI300X / gfx942).
+Hand-tuned attention kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward
+kernel, and a pair of MLA (DeepSeek-V3) absorbed-decode kernels.
 
-8-wave warp-specialized CTA: each wave owns 3 q-tiles (48 q-rows), two parked in
-registers, the third staged through LDS; K streams HBM→LDS by direct DMA and V is
-consumed pre-transposed straight from L1. Inputs are taken natively in either
-`[B, S, H, D]` (BSHD) or `[B, H, S, D]` (BHSD) layout — no transposes anywhere.
+**MHA forward** — 8-wave warp-specialized CTA: each wave owns 3 q-tiles (48 q-rows),
+two parked in registers, the third staged through LDS; K streams HBM→LDS by direct
+DMA and V is consumed pre-transposed straight from L1. Inputs are taken natively in
+either `[B, S, H, D]` (BSHD) or `[B, H, S, D]` (BHSD) layout — no transposes anywhere.
 
 A FlashDecoding-style **dense tail KV-split** recovers the stranded fractional
 CU-round: when the grid doesn't tile evenly across the 304 CUs, the last partial
 round's q-blocks are split along KV across the idle CUs and merged in fp32. It
 turns on automatically only when a cost model says it pays (otherwise a single
 launch), and is the main reason RTZ now beats AITER on every benchmarked shape.
+
+**MLA absorbed decode** — bf16 Q against fp8 e4m3-fnuz KV. One fused 576-wide KV row
+is BOTH K and V (`W_UK`/`W_UV` absorbed outside), so the KV stream is read once at fp8
+width and every MFMA is `v_mfma_f32_16x16x16bf16_1k`. Two CTA shapes, picked by op
+rather than by argument:
+
+- `mla_decode_a16w8*` — one draft position per CTA, `TileTok=64`, 8 waves split
+  4 consumer / 4 producer. Serves q_len 1..8.
+- `mla_decode_a16w8_multiq*` — a q_len 4..8 draft window resident per CTA
+  (speculative-decode verify), `TileTok=16`, all 8 waves compute and the fp8→bf16
+  unpack happens once per token on the LDS fill rather than per MFMA operand. At
+  q_len 8 with H ≤ 12 the heads pack into six MFMA N-tiles and one CTA takes the
+  whole window in a single pass over KV.
+
+Both serve a contiguous KV slab and a device-driven paged pool (`page_size = 1`)
+whose KV-split is fixed at capture, so the paged path is cuda-graph capturable with
+no host synchronization.
 
 ## Install
 
@@ -21,9 +39,12 @@ Requires ROCm with `hipcc` on PATH and a gfx942 device.
 pip install -e .
 ```
 
-That builds three `.so` variants (RTNA, RTNE and RTZ bf16 rounding) into the package.
+That compiles the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ)
+and both MLA decode kernels into the package's `_C` extension.
 
 ## Use
+
+### MHA forward
 
 ```python
 import torch
@@ -51,13 +72,75 @@ The kernel runs on the AMD GPU and is launched on the caller's current stream
 (no device synchronization, so it overlaps cleanly inside larger pipelines).
 CPU tensors are copied to the GPU and back under the hood.
 
+### MLA decode
+
+`q_lat` / `q_pe` are the absorbed latent and RoPE queries; `kv` holds ONE fused fp8
+row per token (`[..., :512]` latent, `[..., 512:576]` rope) at a single per-tensor
+`kv_scale`. The output is written into `o_lat` in place.
+
+```python
+import torch
+import moonmath_attention as ma
+
+B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
+scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
+kv = (torch.randn(B, S, LAT + ROPE, device="cuda") / kv_scale).to(torch.float8_e4m3fnuz)
+
+# q_len = 1 — plain decode.
+q_lat = torch.randn(B, H, LAT, dtype=torch.bfloat16, device="cuda")
+q_pe = torch.randn(B, H, ROPE, dtype=torch.bfloat16, device="cuda")
+o_lat = torch.empty_like(q_lat)
+ma.mla_decode_a16w8(q_lat, q_pe, kv, o_lat, scale, kv_scale)
+
+# q_len = 4 — a speculative-decode draft window, resident per CTA. Draft position t
+# attends KV [0, S - q_len + t] inclusive, so the last position sees the whole sequence.
+q_len = 4
+q_lat = torch.randn(B, q_len, H, LAT, dtype=torch.bfloat16, device="cuda")
+q_pe = torch.randn(B, q_len, H, ROPE, dtype=torch.bfloat16, device="cuda")
+o_lat = torch.empty_like(q_lat)
+ma.mla_decode_a16w8_multiq(q_lat, q_pe, kv, o_lat, scale, kv_scale)
+```
+
+The paged ops take a `[num_slots, 1, 576]` pool plus device `seq_lens` / `kv_indices`
+/ `kv_indptr`, and a `parts` KV-split count fixed once at graph capture:
+
+```python
+parts = ma.mla_decode_a16w8_multiq_plan_parts_q(B, max_seq_len, q_len, H)
+ma.mla_decode_a16w8_multiq_paged_dev(
+    q_lat, q_pe, pool, o_lat, seq_lens, None, kv_indices, kv_indptr,
+    parts, scale, kv_scale,
+)
+```
+
+Passing `q_lens=` (a `[B]` int32 device tensor) gives each request a shorter live
+window inside the padded, still rectangular tensors — a ragged speculative batch.
+Rows past each request's window are left untouched in `o_lat`.
+
 ## Constraints
+
+### MHA forward
 
 - bf16 inputs / bf16 outputs.
 - `head_dim == 128`.
 - Any `seq_len ≥ 1` for Q and K/V independently (cross-attention supported);
   out-of-range rows are handled by hardware buffer bounds, not padding.
 - No causal mask, no GQA, no varlen batching.
+- gfx942 / MI300X only (CDNA3).
+
+### MLA decode
+
+- bf16 Q (`q_lat` `[.., H, 512]`, `q_pe` `[.., H, 64]`) against fp8 e4m3-fnuz KV;
+  bf16 output. `kv_lora_rank = 512`, `qk_rope_head_dim = 64`.
+- Fused 576-wide KV rows at ONE per-tensor `kv_scale` — latent and rope share it.
+- `H ≤ 16`.
+- `mla_decode_a16w8`: q_len 1..8. The contiguous entry point is q_len 1; the draft
+  window is paged-only.
+- `mla_decode_a16w8_multiq`: q_len 4..8, capped at `B * groups ≤ 152`, where `groups`
+  is the CTAs one draft window costs — 1 at q_len 4, or at q_len 8 with H ≤ 12 where
+  the whole window fits one CTA, and 2 otherwise. `B ≤ 32` is the tuned range.
+  Below q_len 4, use `mla_decode_a16w8`.
+- Paged pools are `page_size = 1`, so `kv_indices` is a flat per-token slot list and
+  any permutation or subset of it is legal.
 - gfx942 / MI300X only (CDNA3).
 
 ## Numerics
@@ -67,13 +150,26 @@ handling is bit- and position-identical with AITER for every rounding mode
 (canonical `0x7FFF` NaN output), and every finite output element is within
 1 bf16 ULP of AITER's. Outputs are deterministic run-to-run.
 
+The MLA decode kernels are deterministic too: the KV-split is fixed at capture and
+the fp32 partial merge sums in a fixed association. Against an fp32 reference over
+the same dequantized KV (B=2, S=8192, H=16, q_len 4) they land at **2.6e-3**
+relative error, against AITER's own a16w8 asm kernel at 6.3e-3 on those same inputs.
+`benchmark/bench_mla.py` prints both before it times anything.
+
 ## Layout / build internals
 
-- `csrc/attention_kernel.hip` — the kernel (attention + V pre-transpose).
+- `csrc/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
+- `csrc/mla_decode_a16w8.hip` — MLA absorbed decode, one draft position per CTA.
+- `csrc/mla_decode_a16w8_multiq.hip` — MLA absorbed decode, q_len 4..8 window.
+- `csrc/*_api.cpp` — the torch bindings for each.
 - `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
 - `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
+- `benchmark/bench_mla.py` — MLA decode vs AITER's a16w8 ASM kernel, CUDA-graph timed.
+- `tests/test_mla_decode.py` — the MLA ops against an fp32 reference built from the
+  same dequantized KV: both CTA shapes, contiguous and paged, the end-aligned causal
+  window, the `rows` remap, the ragged `q_lens` window and the domain rejections.
 
 ## Bench
 
@@ -84,7 +180,7 @@ identical BSHD inputs across all three rounding modes. If the
 `max.nn.kernels.flash_attention_gpu`; MAX is loaded and timed only after the
 HIP/AITER timings complete so its runtime cannot perturb them.
 
-### Results — MI300X, bf16, head\_dim = 128
+### Results — MHA forward, MI300X, bf16, head\_dim = 128
 
 Median of 5 independent timing passes (30 iters each) per shape, **with the dense
 tail KV-split enabled**. Speedups are `other_ms / ours_ms`, so >1× means we win.
@@ -172,5 +268,47 @@ conda recipe above takes care of it.
 If `max` isn't installed (or you pass `--no-max`), runner skips the MAX row
 and prints a one-line "skipped" notice. MAX is initialized only after the
 HIP and AITER timing loops have finished, so its runtime cannot perturb them.
+
+### Results — MLA decode, MI300X, bf16 Q / fp8 KV, H = 16, q\_len = 4
+
+`mla_decode_a16w8_multiq` against AITER's `a16w8` MLA decode ASM kernel — the only
+AITER cell with our dtypes. Both sides run in one process on one shared paged fp8 KV
+pool, same Q, same softmax scale, same end-aligned causal mask, same `page_size = 1`
+shuffled slot permutation (a kernel that assumed contiguous slots would fail the
+validation step). Timed as CUDA-graph replays — AITER's python op wrappers cost
+~78 µs/call, which would otherwise swamp the kernel below S ≈ 64K — with
+`num_kv_splits` swept per shape and only validated configs kept, and each candidate
+timed once per round in alternating order, median over rounds. Speedups are
+`aiter_µs / ours_µs`, so >1× means we win.
+
+| Shape (B, S) | KV (MB) | Ours (µs) | AITER a16w8 (µs) | Speedup | Ours (TB/s) | AITER (TB/s) |
+|---|---|---|---|---|---|---|
+| (1, 150000) | 86 | **87.6** | 134.9 | 1.54× | 0.99 | 0.64 |
+| (2, 150000) | 173 | **124.2** | 164.1 | 1.32× | 1.39 | 1.05 |
+| (8, 8192) | 38 | **53.0** | 59.0 | 1.11× | 0.71 | 0.64 |
+| (8, 32768) | 151 | **113.7** | 131.9 | 1.16× | 1.33 | 1.14 |
+| (8, 65536) | 302 | **208.5** | 246.4 | 1.18× | 1.45 | 1.23 |
+| (8, 150000) | 691 | **444.0** | 524.9 | 1.18× | 1.56 | 1.32 |
+| (16, 150000) | 1382 | **868.4** | 1027.9 | 1.18× | 1.59 | 1.34 |
+| (32, 8192) | 151 | **117.4** | 137.6 | 1.17× | 1.29 | 1.10 |
+
+AITER's `a16w8` kernel asserts `nhead == 16`, and rejects q_len > 4 on fp8 KV, so
+H = 12 (a DSV3 TP8 shard) and q_len 8 have no like-for-like AITER cell at all. That is
+why the script pins H and q_len rather than sweeping them.
+
+Reproduce with:
+
+```sh
+# Needs AITER importable with its gfx942 MLA kernels built (hsa/gfx942/mla/*.co).
+# Point AITER_PATH at a checkout if it isn't already on sys.path.
+python benchmark/bench_mla.py
+
+python benchmark/bench_mla.py --shapes 8:150000,16:150000   # pick shapes
+python benchmark/bench_mla.py -v                            # show the num_kv_splits sweep
+```
+
+The script validates both kernels against a chunked fp32 streaming-softmax reference
+over the same dequantized KV before timing anything, and refuses to rank a config that
+produced NaN.
 
 See `examples/basic.py` for a small correctness check using a fp32 reference.
