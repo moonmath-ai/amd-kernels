@@ -6,7 +6,8 @@ Queries are peaked (x QPEAK) so the softmax is far from uniform and a wrong
 causal limit or a wrong query row cannot hide behind a near-average output.
 
 Covers the q_len=1 ops (mla_decode_a16w8*) and the multi-query ops
-(mla_decode_a16w8_multiq*), contiguous and device-driven paged.
+(mla_decode_a16w8_multiq*), contiguous and device-driven paged, including the
+multi-query ragged draft window (paged, optional q_lens[B]).
 """
 
 from itertools import accumulate
@@ -218,3 +219,82 @@ def test_multiq_rejects_q_len_1_rank(device):
     q_lat, q_pe, o_lat = _rand_q(B, None, H, device, seed=79)
     with pytest.raises(ValueError, match=r"\[B,q_len,H,512\]"):
         ma.mla_decode_a16w8_multiq(q_lat, q_pe, kv, o_lat, SCALE, KV_SCALE)
+
+
+# ---- multi-query, ragged draft window --------------------------------------
+
+
+def _reference_ragged(q_lat, q_pe, kv, seq_lens, q_lens):
+    """fp32 reference for a RAGGED window: request b uses only rows [0, q_lens[b]).
+
+    Position p of request b attends kv[b, : seq_lens[b] - (q_lens[b]-1-p)], i.e. the
+    same end-aligned causal rule with the request's own live length in place of the
+    padded one. Padded rows are returned as NaN so a caller that compares them fails.
+    """
+    B, q_len, H, _ = q_lat.shape
+    out = torch.full((B, q_len, H, LAT), float("nan"), dtype=torch.float32, device=q_lat.device)
+    for b in range(B):
+        k = kv[b].float() * KV_SCALE
+        k_lat, k_pe = k[:, :LAT], k[:, LAT:]
+        for p in range(q_lens[b]):
+            end = seq_lens[b] - (q_lens[b] - 1 - p)
+            score = (
+                q_lat[b, p].float() @ k_lat[:end].T + q_pe[b, p].float() @ k_pe[:end].T
+            ) * SCALE
+            out[b, p] = torch.softmax(score, dim=-1) @ k_lat[:end]
+    return out
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("q_len", [4, 8])
+def test_multiq_paged_ragged_q_lens(device, q_len):
+    """Each request runs a shorter live window inside the padded, still rectangular tensors."""
+    B, H = 3, 16
+    seq_lens = [2048, 2064, 1024]
+    q_lens = [q_len, q_len - 2, 1]
+    S = max(seq_lens)
+    kv = _rand_kv(B, S, device, seed=83)
+    q_lat, q_pe, o_lat = _rand_q(B, q_len, H, device, seed=83)
+    pool, kv_indices, kv_indptr = _paged_pool(kv, seq_lens, device, seed=83)
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    qlens = torch.tensor(q_lens, dtype=torch.int32, device=device)
+
+    o_lat.fill_(-7.0)  # sentinel: the padded rows must survive untouched
+    parts = ma.mla_decode_a16w8_multiq_plan_parts_q(B, S, q_len, H)
+    ma.mla_decode_a16w8_multiq_paged_dev(
+        q_lat, q_pe, pool, o_lat, lens, None, kv_indices, kv_indptr, parts,
+        SCALE, KV_SCALE, q_lens=qlens,
+    )
+
+    ref = _reference_ragged(q_lat, q_pe, kv, seq_lens, q_lens)
+    for b in range(B):
+        live = slice(0, q_lens[b])
+        assert _rel_l2(o_lat[b, live], ref[b, live]) < REL_L2, f"request {b} live rows"
+        pad = o_lat[b, q_lens[b] :]
+        assert torch.equal(pad, torch.full_like(pad, -7.0)), f"request {b} padded rows were written"
+
+
+@pytest.mark.gpu
+def test_multiq_paged_full_q_lens_matches_none(device):
+    """q_lens == the padded width is the plain rectangular batch, bit for bit."""
+    B, H, q_len = 3, 16, 4
+    seq_lens = [2048, 2064, 1024]
+    S = max(seq_lens)
+    kv = _rand_kv(B, S, device, seed=89)
+    q_lat, q_pe, o_lat = _rand_q(B, q_len, H, device, seed=89)
+    pool, kv_indices, kv_indptr = _paged_pool(kv, seq_lens, device, seed=89)
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    parts = ma.mla_decode_a16w8_multiq_plan_parts_q(B, S, q_len, H)
+
+    ma.mla_decode_a16w8_multiq_paged_dev(
+        q_lat, q_pe, pool, o_lat, lens, None, kv_indices, kv_indptr, parts, SCALE, KV_SCALE
+    )
+    rect = o_lat.clone()
+
+    qlens = torch.full((B,), q_len, dtype=torch.int32, device=device)
+    o_ragged = torch.zeros_like(o_lat)
+    ma.mla_decode_a16w8_multiq_paged_dev(
+        q_lat, q_pe, pool, o_ragged, lens, None, kv_indices, kv_indptr, parts,
+        SCALE, KV_SCALE, q_lens=qlens,
+    )
+    assert torch.equal(o_ragged, rect)

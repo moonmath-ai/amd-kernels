@@ -1,11 +1,15 @@
 // Torch binding for the A16W8 multi-query absorbed-decode MLA kernel (mla_decode_a16w8_multiq.hip:
-// 8 computing waves, a bf16 LDS tile of 16 KV tokens, the fp8->bf16 unpack on the fill, 4 draft
-// positions per CTA, one barrier per tile).
+// 8 computing waves, a bf16 LDS tile of 16 KV tokens, the fp8->bf16 unpack on the fill, one barrier
+// per tile). A CTA owns 8 draft positions -- ONE pass over KV -- at q_len 8 with H 9..12, and 4
+// otherwise; the ops derive that from the tensors, so the workspace they size always matches.
 //
 // SUPPORTED DOMAIN, matching the kernel's own contract: H 1..16, q_len 4..8, B 1..32 (more
 // precisely B*ceil(q_len/4) <= 152), S >= 2048 for the tuned range. These ops reject H and q_len
 // out of range here, with a message; the launchers reject B and re-check the rest by error code.
-// q_len 1 is a DIFFERENT CTA shape and lives behind separate ops (mla_decode_a16w8.hip).
+// q_len below 4 is a DIFFERENT CTA shape and lives behind separate ops (mla_decode_a16w8.hip, which
+// serves q_len 1..8 at one draft position per CTA).
+// A RAGGED query window (paged, optional q_lens[B]) keeps that domain: every check, the grid and
+// the workspace key on the PADDED q_len.
 //
 // TENSOR ABI, shared with the mla_decode_a16w8 ops: fused fp8 e4m3-fnuz 576-wide KV rows
 // ([...,:512] latent, [512:576] rope) at one per-tensor kv_scale, a contiguous [B,S,576] slab or a
@@ -26,11 +30,11 @@ int launch_mla_decode_a16w8_multiq(
     const void* q_lat, const void* q_pe, const void* c_kv, void* o_lat,
     int B, int H, int S, int q_len, int lat_dim, int rope_dim, float scale, float kv_scale,
     void* workspace, void* stream);
-int launch_mla_decode_a16w8_multiq_paged_dev(
+int launch_mla_decode_a16w8_multiq_paged_dev_ql(
     const void* q_lat, const void* q_pe, const void* kv_pool, void* o_lat,
     const void* seq_lens, const void* rows, const void* kv_indices, const void* kv_indptr,
     int B, int H, int parts, int q_len, int lat_dim, int rope_dim, float scale, float kv_scale,
-    void* workspace, void* stream, size_t kv_bytes);
+    void* workspace, void* stream, size_t kv_bytes, const void* q_lens);
 }
 
 namespace moonmath_mla_a16w8_multiq {
@@ -38,8 +42,11 @@ namespace {
 
 constexpr int64_t kLat = 512, kRope = 64, kQK = kLat + kRope;   // 576
 
-// Query layout: [B,q_len,H,*], q_len in [4,8]. Returns q_len.
-int check_q(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& o_lat, const char* who) {
+// Query layout: [B,q_len,H,*], q_len in [4,8] -- RECTANGULAR at the PADDED width even for a ragged window.
+// Returns q_len. Optional `q_lens` is checked for SHAPE/dtype/device only: reading its VALUES would need a
+// device sync, so `q_lens[b] <= q_len` stays the caller's contract and the kernel clamps a violation.
+int check_q(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& o_lat, const char* who,
+            const c10::optional<at::Tensor>& q_lens = c10::nullopt) {
   if (q_lat.dim() != 4)
     throw std::invalid_argument(std::string(who) + ": q_lat must be [B,q_len,H,512] (q_len 4..8)");
   if (q_pe.dim() != 4 || o_lat.dim() != 4)
@@ -58,6 +65,14 @@ int check_q(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& o
     throw std::invalid_argument(std::string(who) + ": q_len must be in [4,8]");
   if (!q_lat.is_contiguous() || !q_pe.is_contiguous() || !o_lat.is_contiguous())
     throw std::invalid_argument(std::string(who) + ": q_lat/q_pe/o_lat must be contiguous");
+  if (q_lens.has_value() && q_lens->defined()) {
+    if (q_lens->scalar_type() != at::kInt)
+      throw std::invalid_argument(std::string(who) + ": q_lens must be int32");
+    if (q_lens->numel() < q_lat.size(0) || !q_lens->is_contiguous())
+      throw std::invalid_argument(std::string(who) + ": q_lens must be contiguous with >= B entries");
+    if (!q_lens->device().is_cuda())
+      throw std::invalid_argument(std::string(who) + ": q_lens must be on the device");
+  }
   return q_len;
 }
 
@@ -103,13 +118,18 @@ void mla_decode_a16w8_multiq_op(const at::Tensor& q_lat, const at::Tensor& q_pe,
 //   batch row.  `parts` is FIXED by the caller at capture (mla_decode_a16w8_multiq_plan_parts_q).  No host
 //   read and no data-dependent grid => safe inside a cuda-graph capture; update the device tensors in
 //   place on replay.  kv_scale = the model's per-tensor fp8 KV descale (layer.k_scale).
+//   RAGGED QUERY WINDOW: the tensors stay RECTANGULAR at the padded q_len, and the optional q_lens[B]
+//   int32 device tensor -- indexed like seq_lens, by KV request, NOT by rows[b] -- leaves only positions
+//   [0, q_lens[b]) live, so position p attends KV [0, seq_lens[b] - (q_lens[b]-1-p)) and rows past the
+//   window are left untouched in o_lat. None => the plain rectangular batch, bit for bit.
 void mla_decode_a16w8_multiq_paged_dev_op(const at::Tensor& q_lat, const at::Tensor& q_pe,
                                       const at::Tensor& kv_pool, at::Tensor& o_lat,
                                       const at::Tensor& seq_lens, const c10::optional<at::Tensor>& rows,
                                       const at::Tensor& kv_indices, const at::Tensor& kv_indptr,
-                                      int64_t parts, double scale, double kv_scale, double scale_p) {
+                                      int64_t parts, double scale, double kv_scale, double scale_p,
+                                      const c10::optional<at::Tensor>& q_lens) {
   (void)scale_p;
-  const int q_len = check_q(q_lat, q_pe, o_lat, "mla_decode_a16w8_multiq_paged_dev");
+  const int q_len = check_q(q_lat, q_pe, o_lat, "mla_decode_a16w8_multiq_paged_dev", q_lens);
   if (kv_pool.scalar_type() != at::kFloat8_e4m3fnuz)
     throw std::invalid_argument("mla_decode_a16w8_multiq_paged_dev: kv_pool must be float8_e4m3fnuz");
   if (kv_pool.size(-1) != kQK)
@@ -153,14 +173,15 @@ void mla_decode_a16w8_multiq_paged_dev_op(const at::Tensor& q_lat, const at::Ten
   auto ws = at::empty({(int64_t)mla_decode_a16w8_multiq_workspace_for(B, H, (int)parts, q_len)},
                       q_lat.options().dtype(at::kByte));
   const void* rows_p = (rows.has_value() && rows->defined()) ? rows->data_ptr() : nullptr;
-  const int rc = launch_mla_decode_a16w8_multiq_paged_dev(
+  const void* qlens_p = (q_lens.has_value() && q_lens->defined()) ? q_lens->data_ptr() : nullptr;
+  const int rc = launch_mla_decode_a16w8_multiq_paged_dev_ql(
       q_lat.data_ptr(), q_pe.data_ptr(), kv_pool.data_ptr(), o_lat.data_ptr(),
       seq_lens.data_ptr(), rows_p, kv_indices.data_ptr(), kv_indptr.data_ptr(),
       B, H, (int)parts, q_len, (int)kLat, (int)kRope, (float)scale, (float)kv_scale,
       ws.data_ptr(), stream,
       // KV working set: one 576-B row per slot. numel() == sum(seq_lens) at page_size=1, so this is
       //   the true footprint including ragged batches, and it comes from metadata (capture safe).
-      (size_t)kv_indices.numel() * 576ull);
+      (size_t)kv_indices.numel() * 576ull, qlens_p);
   if (rc != 0)
     throw std::runtime_error("launch_mla_decode_a16w8_multiq_paged_dev returned error code " +
                              std::to_string(rc));
@@ -179,16 +200,20 @@ void register_pybind(pybind11::module_& m) {
   m.def("mla_decode_a16w8_multiq", &mla_decode_a16w8_multiq_op,
         "CDNA3 A16W8 multi-query absorbed-decode MLA, q_len 4..8 (bf16 Q against fp8 KV). ONE fused fp8 "
         "e4m3-fnuz kv[B,S,576] ([...,:512]=latent, [512:576]=rope) at a single per-tensor kv_scale. "
-        "q_len 1 is a different CTA shape and is not served here. Current-stream, no host sync.",
+        "q_len below 4 is a different CTA shape and is not served here (mla_decode_a16w8). "
+        "Current-stream, no host sync.",
         py::arg("q_lat"), py::arg("q_pe"), py::arg("kv"), py::arg("o_lat"),
         py::arg("scale"), py::arg("kv_scale"), py::arg("scale_p"));
   m.def("mla_decode_a16w8_multiq_paged_dev", &mla_decode_a16w8_multiq_paged_dev_op,
         "CDNA3 A16W8 (bf16 Q / fp8 KV) multi-query absorbed-decode MLA, q_len 4..8, DEVICE-DRIVEN "
         "PAGED. Fused fp8 [num_slots,1,576] pool + flat "
-        "kv_indices/kv_indptr + device seq_lens + FIXED parts; cuda-graph capturable.",
+        "kv_indices/kv_indptr + device seq_lens + FIXED parts; cuda-graph capturable. Optional "
+        "q_lens[B] int32 device leaves each request a shorter live window [0,q_lens[b]) inside the "
+        "padded, still RECTANGULAR [B,q_len,H,*]; rows past it are untouched in o_lat.",
         py::arg("q_lat"), py::arg("q_pe"), py::arg("kv_pool"), py::arg("o_lat"),
         py::arg("seq_lens"), py::arg("rows"), py::arg("kv_indices"), py::arg("kv_indptr"),
-        py::arg("parts"), py::arg("scale"), py::arg("kv_scale"), py::arg("scale_p"));
+        py::arg("parts"), py::arg("scale"), py::arg("kv_scale"), py::arg("scale_p"),
+        py::arg("q_lens") = c10::optional<at::Tensor>());
   m.def("mla_decode_a16w8_multiq_plan_parts_q", &plan_parts_q_op,
         "KV-split count for an a16w8 multi-query graph captured at (B, max_seq_len, q_len, H). Call "
         "at capture, reuse on replay.",
