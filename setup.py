@@ -1,4 +1,4 @@
-"""Build moonmath_attention._C extension via torch CUDAExtension (ROCm-only)."""
+"""Build moonmath_amd._C extension via torch CUDAExtension (ROCm-only)."""
 
 import os
 import shutil
@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 # Verify ROCm build (fail fast if someone tries to build on non-ROCm torch)
 if torch.version.hip is None:
     raise RuntimeError(
-        "moonmath_attention requires a ROCm build of PyTorch. "
+        "moonmath_amd requires a ROCm build of PyTorch. "
         "torch.version.hip is None, indicating this is not a ROCm installation. "
         "Install ROCm PyTorch and ensure hipcc is available on PATH."
     )
@@ -89,7 +89,7 @@ class DistBuild(_build):
 setup(
     ext_modules=[
         CUDAExtension(
-            name="moonmath_attention._C",
+            name="moonmath_amd._C",
             sources=sources,
             # include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,

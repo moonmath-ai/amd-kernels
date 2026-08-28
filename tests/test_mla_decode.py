@@ -15,7 +15,7 @@ from itertools import accumulate
 import pytest
 import torch
 
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 LAT, ROPE = 512, 64
 FUSED = LAT + ROPE  # 576

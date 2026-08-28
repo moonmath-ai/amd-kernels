@@ -8,7 +8,7 @@ cannot hide behind a matching bug in the reference.
 import pytest
 import torch
 
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 #  E2M1: sign bit plus a 3-bit magnitude index into these values.
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]

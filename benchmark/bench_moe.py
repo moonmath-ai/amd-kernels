@@ -30,7 +30,7 @@ import triton.language as tl
 
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 #  Kimi-K3: 896 routed experts of width 3072, top-16, over a 3584-wide latent.
 #  INTER is the tensor-parallel shard of the expert width, so it names the

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from aiter import flash_attn_func
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 AITER_RTNE = 0
 AITER_RTNA = 1

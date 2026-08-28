@@ -1,4 +1,4 @@
-# moonmath-attention
+# moonmath-amd
 
 Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward kernel, a
 pair of MLA (DeepSeek-V3) absorbed-decode kernels, and the grouped GEMMs of an
@@ -53,7 +53,7 @@ both MLA decode kernels and the MXFP4 MoE GEMMs into the package's `_C` extensio
 
 ```python
 import torch
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 # diffusion-style BSHD tensors, no transpose needed
 q = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
@@ -85,7 +85,7 @@ row per token (`[..., :512]` latent, `[..., 512:576]` rope) at a single per-tens
 
 ```python
 import torch
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
 scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
@@ -230,7 +230,7 @@ both kernels against a dense reference that never sees the repacked weights.
 - `csrc/mla_decode_a16w8_multiq.hip` — MLA absorbed decode, q_len 4..8 window.
 - `csrc/mxfp4_moe_gateup.hip`, `csrc/mxfp4_moe_down.hip` — the MoE GEMMs.
 - `csrc/*_api.cpp` — the torch bindings for each.
-- `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
+- `moonmath_amd/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
 - `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.

@@ -31,7 +31,7 @@ they cost nothing at run time and change no value the kernels can observe.
 Tile heights, column tiling and the down kernel's n-chunk width are chosen by
 the planners below.  Call them once per shape, not per layer::
 
-    import moonmath_attention as ma
+    import moonmath_amd as ma
 
     w13 = ma.repack_mxfp4(w13_raw)            # once, at load
     w13s = ma.repack_mxfp4_scales(w13s_raw)
@@ -46,7 +46,7 @@ Both ops run on the current stream and never sync with the host.
 """
 import torch
 
-import moonmath_attention._C as _C
+import moonmath_amd._C as _C
 
 __all__ = [
     "repack_mxfp4",

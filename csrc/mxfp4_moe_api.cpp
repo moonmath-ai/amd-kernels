@@ -6,7 +6,7 @@
 // expert and padded to a multiple of block_m.
 //
 // WEIGHT LAYOUT IS A PRECONDITION, NOT A CONVENTION. B and Bs must be the REPACKED layouts
-// produced by moonmath_attention.moe.repack_mxfp4 / repack_mxfp4_scales:
+// produced by moonmath_amd.moe.repack_mxfp4 / repack_mxfp4_scales:
 //
 //     B  : [E, K/32, N, 16] uint8   nibble-relabelled, n-minor
 //     Bs : [E, K/32, N]     uint8   E8M0, one byte per 32 k per column
@@ -210,7 +210,7 @@ void register_pybind(pybind11::module_& m) {
 
   m.def("mxfp4_moe_gateup", &gateup_op,
         "CDNA3 MXFP4 MoE gate/up GEMM. B/Bs must be the REPACKED [E,K/32,N,16] / [E,K/32,N] uint8 "
-        "layouts (moonmath_attention.moe.repack_mxfp4). epilogue=1 applies the Kimi-K3 SituGLU "
+        "layouts (moonmath_amd.moe.repack_mxfp4). epilogue=1 applies the Kimi-K3 SituGLU "
         "across paired wave halves, so B carries 2*N columns and C is N wide. Current stream, no "
         "host sync.",
         py::arg("A"), py::arg("B"), py::arg("Bs"), py::arg("C"),

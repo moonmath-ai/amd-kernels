@@ -1,7 +1,7 @@
-"""Hand-tuned bf16 forward attention kernel for AMD CDNA3 (MI300X / gfx942).
+"""Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942).
 
 >>> import torch
->>> import moonmath_attention as ma
+>>> import moonmath_amd as ma
 >>> q = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
 >>> k = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
 >>> v = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
