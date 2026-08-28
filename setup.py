@@ -42,8 +42,12 @@ _compile_names = [
     "mla_decode_a16w8_multiq.hip",      # a16w8 MULTI-QUERY decode, q_len 4..8: 8 computing waves, bf16 LDS
                                         #   tile of 16 tokens, 4 resident draft positions (8 in one pass over
                                         #   KV when the heads pack into 3 MFMA N-tiles at 9 <= H <= 12)
+    # ── MXFP4 MoE GEMM ──
+    "mxfp4_moe_api.cpp",         # binds _C.mxfp4_moe_gateup / _down and their planners
+    "mxfp4_moe_gateup.hip",      # gate/up projection, tiles 16/32/48, EPI_NONE or SituGLU
+    "mxfp4_moe_down.hip",        # down projection, LDS-staged A tile swept over n chunks
 ]
-_include_names = ["attention_kernel.hip", "opus.hpp"]
+_include_names = ["attention_kernel.hip", "opus.hpp", "mxfp4_moe_common.h"]
 
 sources = []
 for name in _compile_names + _include_names:
