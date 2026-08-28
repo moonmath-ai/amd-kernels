@@ -1,7 +1,8 @@
-# moonmath-attention
+# moonmath-amd
 
-Hand-tuned attention kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward
-kernel, and a pair of MLA (DeepSeek-V3) absorbed-decode kernels.
+Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward kernel, a
+pair of MLA (DeepSeek-V3) absorbed-decode kernels, and the grouped GEMMs of an
+MXFP4 mixture-of-experts layer.
 
 **MHA forward** — 8-wave warp-specialized CTA: each wave owns 3 q-tiles (48 q-rows),
 two parked in registers, the third staged through LDS; K streams HBM→LDS by direct
@@ -31,6 +32,10 @@ Both serve a contiguous KV slab and a device-driven paged pool (`page_size = 1`)
 whose KV-split is fixed at capture, so the paged path is cuda-graph capturable with
 no host synchronization.
 
+**MXFP4 MoE GEMMs** — `mxfp4_moe_gateup` and `mxfp4_moe_down`, the grouped GEMMs of
+an MXFP4 mixture-of-experts layer: E2M1 weight nibbles with one E8M0 scale per 32 k,
+bf16 activations. [Details below](#mxfp4-moe-gemms).
+
 ## Install
 
 Requires ROCm with `hipcc` on PATH and a gfx942 device.
@@ -39,8 +44,8 @@ Requires ROCm with `hipcc` on PATH and a gfx942 device.
 pip install -e .
 ```
 
-That compiles the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ)
-and both MLA decode kernels into the package's `_C` extension.
+That compiles the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ),
+both MLA decode kernels and the MXFP4 MoE GEMMs into the package's `_C` extension.
 
 ## Use
 
@@ -48,7 +53,7 @@ and both MLA decode kernels into the package's `_C` extension.
 
 ```python
 import torch
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 # diffusion-style BSHD tensors, no transpose needed
 q = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
@@ -80,7 +85,7 @@ row per token (`[..., :512]` latent, `[..., 512:576]` rope) at a single per-tens
 
 ```python
 import torch
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
 scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
@@ -156,20 +161,86 @@ the same dequantized KV (B=2, S=8192, H=16, q_len 4) they land at **2.6e-3**
 relative error, against AITER's own a16w8 asm kernel at 6.3e-3 on those same inputs.
 `benchmark/bench_mla.py` prints both before it times anything.
 
+## MXFP4 MoE GEMMs
+
+`mxfp4_moe_gateup` and `mxfp4_moe_down` are the grouped GEMMs of an MXFP4
+mixture-of-experts layer. Weights are E2M1 nibbles with one E8M0 scale per 32 k.
+Activations stay bf16 and are not quantized.
+
+Gate/up walks K in slabs and takes an optional fused SituGLU epilogue. Down stages
+its whole A tile in LDS and sweeps column chunks against it, which costs one barrier
+for the GEMM but needs a short K. Down serves K = 384/512/768, the tensor-parallel
+shards of the expert width; at any other K `mxfp4_moe_down_block_m` returns 0 and
+the down projection runs on the gate/up kernel with `EPI_NONE`.
+
+```python
+w13 = ma.repack_mxfp4(w13_raw)          # once, at weight load
+w13s = ma.repack_mxfp4_scales(w13s_raw)
+
+bm = ma.mxfp4_moe_gateup_block_m(rows, num_active_experts)
+sorted_ids, expert_ids, ntpp, nblk = moe_align_block_size(topk_ids, bm)
+ma.mxfp4_moe_gateup(hidden, w13, w13s, out, None, sorted_ids, expert_ids,
+                    ntpp, nblk, bm, rows, top_k, epilogue=ma.EPI_SITU)
+```
+
+### Results — Kimi-K3 at TP8, MI300X
+
+896 routed experts of width 3072, top-16, K = 3584 (K3's
+`routed_expert_hidden_size`, not the model's 7168 `hidden_size`). I = 384 is the TP8
+shard. Four shapes: decode at T = 8 and T = 32, which land on 123 and 394 of the 896
+experts, and chunked-prefill chunks of 8192 and 16384 tokens, which land on all 896.
+Each token draws 16 distinct experts, uniform.
+
+The baseline is a tuned AITER. There is no `gfx942-MOE-MX_FP4.json`, so the bench
+times twelve tile candidates at every shape and reports the fastest, aligning the
+metadata separately per tile so each pays its own padding. Median of 5 passes,
+`fused_moe_mxfp4` from a stock aiter.
+
+| Tokens | Rows | Projection | Ours (ms) | AITER best (ms) | Best tile | Speedup | Ours TFLOP/s |
+|---|---|---|---|---|---|---|---|
+| 8 | 128 | gate/up | **0.050** | 0.066 | 16x64_k2_e4 | 1.32× | 14 |
+| 8 | 128 | down | **0.028** | 0.052 | 16x64_w2_s1 | 1.89× | 13 |
+| 32 | 512 | gate/up | **0.172** | 0.240 | 16x64_k2_e4 | 1.39× | 16 |
+| 32 | 512 | down | **0.088** | 0.108 | 16x64_w2_s1 | 1.22× | 16 |
+| 8192 | 131072 | gate/up | **1.628** | 2.346 | 64x256_s1_k2_e2 | 1.44× | 443 |
+| 8192 | 131072 | down | **1.055** | 1.463 | 64x256_s1_k2_e2 | 1.39× | 342 |
+| 16384 | 262144 | gate/up | **2.989** | 4.022 | 64x256_s1_k2_e2 | 1.35× | 483 |
+| 16384 | 262144 | down | **1.796** | 2.551 | 64x256_s1_k2_e2 | 1.42× | 402 |
+
+Geomean 1.37× gate/up, 1.46× down. At decode, 512 rows over 394 experts is 1.3 rows
+per expert, so most of each tile is padding and only the 16-row tile is competitive.
+
+Reproduce with:
+
+```sh
+python benchmark/bench_moe.py --markdown            # the table above
+python benchmark/bench_moe.py --tokens 8 512 2048   # any other token counts
+python benchmark/bench_moe.py --layout ep8          # expert-parallel geometry
+python benchmark/bench_moe.py --show-tiles          # every AITER tile, not just the winner
+```
+
+The bench needs AITER on the path for the Triton baseline
+(`PYTHONPATH=/path/to/aiter`), and `python -m pytest tests/test_moe.py -q` checks
+both kernels against a dense reference that never sees the repacked weights.
+
 ## Layout / build internals
 
 - `csrc/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
 - `csrc/mla_decode_a16w8.hip` — MLA absorbed decode, one draft position per CTA.
 - `csrc/mla_decode_a16w8_multiq.hip` — MLA absorbed decode, q_len 4..8 window.
+- `csrc/mxfp4_moe_gateup.hip`, `csrc/mxfp4_moe_down.hip` — the MoE GEMMs.
 - `csrc/*_api.cpp` — the torch bindings for each.
-- `moonmath_attention/` — Python package (ctypes wrapper around the `.so`).
+- `moonmath_amd/` — Python package (ctypes wrapper around the `.so`).
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
 - `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
 - `benchmark/bench_mla.py` — MLA decode vs AITER's a16w8 ASM kernel, CUDA-graph timed.
+- `benchmark/bench_moe.py` — MXFP4 MoE GEMMs vs AITER's Triton MXFP4 kernel.
 - `tests/test_mla_decode.py` — the MLA ops against an fp32 reference built from the
   same dequantized KV: both CTA shapes, contiguous and paged, the end-aligned causal
   window, the `rows` remap, the ragged `q_lens` window and the domain rejections.
+- `tests/test_moe.py` — the MoE GEMMs against a dense reference built from the
+  dequantized stock weights, plus the repack, tile-shape and domain contracts.
 
 ## Bench
 

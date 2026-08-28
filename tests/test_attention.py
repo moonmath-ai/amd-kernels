@@ -1,4 +1,4 @@
-"""moonmath_attention vs SDPA (sanity).
+"""moonmath_amd vs SDPA (sanity).
 
 Shapes match runner.py (B=2, H=24, S=16384, D=128) and README cross-attn (KV=512).
 """
@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 LAYOUTS = ("bshd", "bhsd")
 

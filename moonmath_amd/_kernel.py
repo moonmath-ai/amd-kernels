@@ -3,10 +3,10 @@
 import torch
 
 try:
-    import moonmath_attention._C as _C
+    import moonmath_amd._C as _C
 except ImportError as e:
     raise ImportError(
-        "moonmath_attention: failed to import _C extension. "
+        "moonmath_amd: failed to import _C extension. "
         "Build with: pip install -e . --no-build-isolation (requires ROCm PyTorch + hipcc)"
     ) from e
 

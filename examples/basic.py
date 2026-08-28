@@ -1,7 +1,7 @@
 """Run the kernel on a small shape and verify against a fp32 reference."""
 
 import torch
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 B, H, S, D = 1, 4, 1024, 128
 torch.manual_seed(42)

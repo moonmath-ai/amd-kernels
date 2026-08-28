@@ -25,7 +25,7 @@ slab or as a [num_slots, 1, 576] paged pool, and both run on the caller's curren
 stream with no host synchronization.
 """
 import torch
-import moonmath_attention._C as _C
+import moonmath_amd._C as _C
 
 __all__ = [
     "mla_decode_a16w8",

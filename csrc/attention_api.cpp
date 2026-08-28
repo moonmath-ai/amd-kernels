@@ -1,4 +1,4 @@
-// Pybind11 API for moonmath_attention
+// Pybind11 API for moonmath_amd
 // ROCm-only CDNA3 (MI300X/gfx942) fused attention kernel
 
 #include <ATen/cuda/CUDAContext.h>
@@ -438,8 +438,11 @@ namespace moonmath_mla_a16w8 { void register_pybind(pybind11::module_& m); }
 // … and in mla_decode_a16w8_multiq_api.cpp
 namespace moonmath_mla_a16w8_multiq { void register_pybind(pybind11::module_& m); }
 
+// MXFP4 MoE GEMM op registration — defined in mxfp4_moe_api.cpp
+namespace moonmath_mxfp4_moe { void register_pybind(pybind11::module_& m); }
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "moonmath_attention: ROCm CDNA3 (MI300X) fused attention kernel";
+  m.doc() = "moonmath_amd: ROCm CDNA3 (MI300X) attention and MXFP4 MoE kernels";
 
   m.def(
       "forward",
@@ -470,4 +473,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   moonmath_mla_a16w8::register_pybind(m);         // a16w8 absorbed decode (bf16 Q + fp8 KV), q_len 1..8
   moonmath_mla_a16w8_multiq::register_pybind(m);  // … same, over a q_len 4..8 draft window
+  moonmath_mxfp4_moe::register_pybind(m);         // MXFP4 MoE gate/up + down GEMMs
 }

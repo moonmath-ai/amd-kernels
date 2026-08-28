@@ -17,7 +17,7 @@ step (compute-all seed) is exact full attention; later steps approximate
 (skipped blocks contribute ~0, which is what the threshold guarantees).
 
 Usage:
-    >>> import torch, moonmath_attention as ma
+    >>> import torch, moonmath_amd as ma
     >>> attn = ma.LiteAttention(threshold=-6.0)
     >>> for t in range(num_denoise_steps):
     ...     out = attn(q, k, v)          # same shape/dtype as q; skips grow over steps

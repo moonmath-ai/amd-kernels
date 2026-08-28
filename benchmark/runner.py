@@ -3,7 +3,7 @@
 optional Modular MAX `flash_attention_gpu` if `max` is installed.
 
 Requires ROCm-built torch, `amd-aiter` (`pip install -e '.[bench]'`), and
-`moonmath_attention` installed (`pip install -e .` builds the kernel .so).
+`moonmath_amd` installed (`pip install -e .` builds the kernel .so).
 TFLOP/s = 4*B*H*S^2*D / time (QK + PV matmuls only).
 """
 
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from aiter import flash_attn_func
-import moonmath_attention as ma
+import moonmath_amd as ma
 
 # AITER's how_v3_bf16_cvt: 0=RTNE, 1=RTNA (default), 2=RTZ.
 AITER_RTNE = 0
