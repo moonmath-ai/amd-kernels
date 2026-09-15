@@ -36,12 +36,10 @@ _compile_names = [
     "attention_rtne.hip",
     "attention_rtz.hip",
     # ── MLA (DeepSeek-V3) — absorbed decode, bf16 Q / fp8 KV ──
-    "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 / _paged_dev / _plan_parts / _plan_parts_q
-    "mla_decode_a16w8.hip",      # a16w8 absorbed decode: bf16 Q + fp8 KV, 8 waves (CONS=4/PROD=4), TileTok=64
-    "mla_decode_a16w8_multiq_api.cpp",  # binds _C.mla_decode_a16w8_multiq / _paged_dev / _plan_parts_q
-    "mla_decode_a16w8_multiq.hip",      # a16w8 MULTI-QUERY decode, q_len 4..8: 8 computing waves, bf16 LDS
-                                        #   tile of 16 tokens, 4 resident draft positions (8 in one pass over
-                                        #   KV when the heads pack into 3 MFMA N-tiles at 9 <= H <= 12)
+    "mla_decode_a16w8_api.cpp",  # binds _C.mla_decode_a16w8 and _C.mla_dcp_lse_merge_ranks
+    "mla_decode_a16w8.hip",      # a16w8 absorbed decode over a DENSE paged batch, any q_len, H 1..128,
+                                 #   optional DCP: (position, head) rows in query tiles of 16..96 rows
+                                 #   against a 16-token KV tile, with a first-class base-2 LSE
     # ── MXFP4 MoE GEMM ──
     "mxfp4_moe_api.cpp",         # binds _C.mxfp4_moe_gateup / _down and their planners
     "mxfp4_moe_gateup.hip",      # gate/up projection, tiles 16/32/48, EPI_NONE or SituGLU

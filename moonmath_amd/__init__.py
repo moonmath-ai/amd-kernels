@@ -11,14 +11,8 @@
 from ._kernel import forward, forward_lite
 from .lite import LiteAttention
 from .mla import (
+    mla_dcp_lse_merge_ranks,
     mla_decode_a16w8,
-    mla_decode_a16w8_multiq,
-    mla_decode_a16w8_multiq_paged_dev,
-    mla_decode_a16w8_multiq_plan_parts_q,
-    mla_decode_a16w8_paged_dev,
-    mla_decode_a16w8_plan_parts,
-    mla_decode_a16w8_plan_parts_capped,
-    mla_decode_a16w8_plan_parts_q,
 )
 from .moe import (
     EPI_NONE,
@@ -37,11 +31,7 @@ from .moe import (
 
 __all__ = [
     "forward", "forward_lite", "LiteAttention",
-    "mla_decode_a16w8", "mla_decode_a16w8_paged_dev",
-    "mla_decode_a16w8_plan_parts", "mla_decode_a16w8_plan_parts_capped",
-    "mla_decode_a16w8_plan_parts_q",
-    "mla_decode_a16w8_multiq", "mla_decode_a16w8_multiq_paged_dev",
-    "mla_decode_a16w8_multiq_plan_parts_q",
+    "mla_decode_a16w8", "mla_dcp_lse_merge_ranks",
     "repack_mxfp4", "repack_mxfp4_scales",
     "mxfp4_moe_gateup", "mxfp4_moe_down",
     "mxfp4_moe_gateup_block_m", "mxfp4_moe_gateup_supports_k",

@@ -435,8 +435,6 @@ at::Tensor forward_lite(
 
 // MLA (DeepSeek-V3) absorbed-decode op registration — defined in mla_decode_a16w8_api.cpp
 namespace moonmath_mla_a16w8 { void register_pybind(pybind11::module_& m); }
-// … and in mla_decode_a16w8_multiq_api.cpp
-namespace moonmath_mla_a16w8_multiq { void register_pybind(pybind11::module_& m); }
 
 // MXFP4 MoE GEMM op registration — defined in mxfp4_moe_api.cpp
 namespace moonmath_mxfp4_moe { void register_pybind(pybind11::module_& m); }
@@ -471,7 +469,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("round_mode") = "rtna",
       py::arg("layout") = "bhsd");
 
-  moonmath_mla_a16w8::register_pybind(m);         // a16w8 absorbed decode (bf16 Q + fp8 KV), q_len 1..8
-  moonmath_mla_a16w8_multiq::register_pybind(m);  // … same, over a q_len 4..8 draft window
-  moonmath_mxfp4_moe::register_pybind(m);         // MXFP4 MoE gate/up + down GEMMs
+  moonmath_mla_a16w8::register_pybind(m);   // a16w8 absorbed decode (bf16 Q + fp8 KV), any q_len, H <= 128, optional DCP
+  moonmath_mxfp4_moe::register_pybind(m);   // MXFP4 MoE gate/up + down GEMMs
 }

@@ -3,199 +3,90 @@
 A16W8: bf16 Q against fp8 KV. Q stays bf16 (no quantization error); KV is fp8
 e4m3-fnuz, unpacked to bf16 for both QK and PV.
 
-Two CTA shapes are exposed, picked by op rather than by argument:
+``mla_decode_a16w8`` is one op for plain decode, speculative-decode verify and
+decode context parallelism: a dense batch of any q_len, H 1..128, over a
+device-driven paged pool (page_size 1). It plans its query tile and KV split per
+launch from tensor shapes alone, so it is cuda-graph capturable with no host
+synchronization and nothing to plan at capture time.
 
-- ``mla_decode_a16w8*`` — one query row per head, H <= 16. TileTok=64, 8-wave
-  warp-specialized (4 consumer / 4 producer waves). q_len 1..8, one draft
-  position per CTA (QLC=1), so the register allocation is the q_len==1 one.
-- ``mla_decode_a16w8_multiq*`` — a q_len 4..8 draft window resident per CTA
-  (speculative-decode verify), H <= 16, B <= 32. TileTok=16, all 8 waves compute,
-  software-pipelined one tile deep, and the fp8->bf16 unpack happens once per
-  token on the LDS fill so the consumer does none. Draft position t attends to KV
-  [0, seq_len - q_len + t] inclusive (end-aligned causal), so the last draft
-  position sees the whole sequence. A CTA takes all 8 positions in ONE pass over
-  KV at q_len 8 with 9 <= H <= 12 (the heads pack into 3 MFMA N-tiles), and 4
-  positions per pass otherwise. The paged op also takes an optional q_lens[B]:
-  each request may use a SHORTER live window than the padded width, with the
-  tensors still rectangular and o_lat's padded rows untouched.
+Draft position t of a q_len window attends KV [0, seq_len - (q_len-1-t)) --
+end-aligned causal, so the last position sees the whole sequence and q_len 1 is
+ordinary decode.
 
-Both take the same fused fp8 e4m3-fnuz 576-wide KV rows ([...,:512] latent,
-[512:576] rope) at one per-tensor kv_scale, either as a contiguous [B, S, 576]
-slab or as a [num_slots, 1, 576] paged pool, and both run on the caller's current
-stream with no host synchronization.
+Under decode context parallelism (cp_world > 1) the pool is position-sharded:
+global position p lives on rank p % cp_world at pool row p // cp_world, and Q is
+head-replicated, so one rank runs all heads over its 1/N of the positions. The
+causal limit then comes from the global lengths (``glen``), the op returns a
+rank-local partial plus its base-2 LSE, and ``mla_dcp_lse_merge_ranks`` combines
+the ranks' (partial, lse) pairs after the DCP all-to-all.
 """
 import torch
 import moonmath_amd._C as _C
 
 __all__ = [
     "mla_decode_a16w8",
-    "mla_decode_a16w8_paged_dev",
-    "mla_decode_a16w8_plan_parts",
-    "mla_decode_a16w8_plan_parts_capped",
-    "mla_decode_a16w8_plan_parts_q",
-    "mla_decode_a16w8_multiq",
-    "mla_decode_a16w8_multiq_paged_dev",
-    "mla_decode_a16w8_multiq_plan_parts_q",
+    "mla_dcp_lse_merge_ranks",
 ]
-
-_LAT = 512
-_ROPE = 64
-_QK = _LAT + _ROPE  # 576
 
 
 def mla_decode_a16w8(
     q_lat: torch.Tensor,
     q_pe: torch.Tensor,
-    kv: torch.Tensor,
-    o_lat: torch.Tensor,
-    scale: float,
-    kv_scale: float,
-    scale_p: float = 1.0,
-) -> None:
-    """A16W8 absorbed-decode MLA (q_len=1, H<=16).
-
-    Args:
-        q_lat: [B, H, 512] bf16 — latent query.
-        q_pe:  [B, H, 64]  bf16 — RoPE query.
-        kv:    [B, S, 576] fp8 e4m3-fnuz — fused KV ([...,:512]=latent, [512:576]=rope).
-        o_lat: [B, H, 512] bf16 — output (written in-place).
-        scale:     softmax scale (1/sqrt(qk_head_dim) x YaRN mscale).
-        kv_scale:  per-tensor fp8 KV descale.
-        scale_p:   unused (ABI symmetry). Defaults to 1.0.
-    """
-    _C.mla_decode_a16w8(q_lat, q_pe, kv, o_lat, float(scale), float(kv_scale), float(scale_p))
-
-
-def mla_decode_a16w8_paged_dev(
-    q_lat: torch.Tensor,
-    q_pe: torch.Tensor,
     kv_pool: torch.Tensor,
     o_lat: torch.Tensor,
     seq_lens: torch.Tensor,
-    rows: torch.Tensor | None,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
-    parts: int,
     scale: float,
     kv_scale: float,
-    scale_p: float = 1.0,
+    lse: torch.Tensor | None = None,
+    glen: torch.Tensor | None = None,
+    cp_rank: int = 0,
+    cp_world: int = 1,
 ) -> None:
-    """A16W8 absorbed-decode MLA, device-driven paged (cuda-graph capturable).
+    """A16W8 absorbed-decode MLA over a dense batch, device-driven paged (graph capturable).
 
-    q_lat/q_pe: bf16 [B,H,*] (q_len=1) or [B,q_len,H,*] (draft window, q_len<=8).
-                Position t attends KV [0, S - q_len + t] (end-aligned causal), so
-                `seq_lens` INCLUDES the q_len draft tokens just written.
-    kv_pool:    [num_slots, 1, 576] fp8 e4m3-fnuz — fused pool at per-tensor kv_scale.
-    seq_lens:   [B] int32 device — per-request KV lengths.
-    rows:       [B] int32 device or None — maps req_pool_index -> q/out batch row (None -> identity).
-    kv_indices: [sum(seq_lens)] int32 device — flat per-token slots.
-    kv_indptr:  [B+1] int32 device — per-request slot offsets.
-    parts:      fixed at graph capture (mla_decode_a16w8_plan_parts_capped, or
-                _plan_parts_q when q_len > 1 -- the window costs q_len CTAs per
-                (batch, kv-part), so the KV split has to give parts back).
+    q_lat/q_pe: [B*q_len, H, 512] / [B*q_len, H, 64] bf16 — request b owns rows [b*q_len, (b+1)*q_len).
+                o_lat matches q_lat. B comes from kv_indptr, and q_len from the row count.
+    kv_pool:    [num_slots, 1, 576] fp8 e4m3-fnuz — fused rows ([..., :512] latent, [512:] rope) at
+                per-tensor kv_scale.
+    seq_lens:   [B] int32 device — KV counts, including the q_len draft tokens just written.
+    kv_indices: [sum(seq_lens)] int32 device — flat per-token pool slots (MLA page_size 1).
+    kv_indptr:  [B+1] int32 device — per-request slot offsets. Its length fixes B.
+    scale:      softmax scale (1/sqrt(qk_head_dim) x YaRN mscale).
+    kv_scale:   per-tensor fp8 KV descale.
+    lse:        [B*q_len, H] fp32 or None — base-2 log-sum-exp of each row's window, written in
+                place; -inf (and a zero o_lat row) where that window is empty.
+
+    Decode context parallelism, off by default:
+
+    glen:       [B] int32 device or None — global KV counts including the draft window. With it,
+                seq_lens are this rank's rank-local counts (~ glen / cp_world) and draft position t
+                may attend global positions [0, glen[b] - (q_len-1-t)). Required when cp_world > 1.
+    cp_rank:    this rank's index, 0 <= cp_rank < cp_world.
+    cp_world:   the DCP world size; 1 is plain decode.
     """
-    _C.mla_decode_a16w8_paged_dev(
-        q_lat, q_pe, kv_pool, o_lat, seq_lens, rows, kv_indices, kv_indptr,
-        int(parts), float(scale), float(kv_scale), float(scale_p),
+    _C.mla_decode_a16w8(
+        q_lat, q_pe, kv_pool, o_lat, seq_lens, kv_indices, kv_indptr,
+        float(scale), float(kv_scale), lse, glen, int(cp_rank), int(cp_world),
     )
 
 
-def mla_decode_a16w8_plan_parts(B: int, H: int, max_seq_len: int, lat_dim: int = 512) -> int:
-    """Fixed KV-split count for a graph captured at (B, H, max_seq_len). Call at capture, reuse on replay."""
-    return int(_C.mla_decode_a16w8_plan_parts(int(B), int(H), int(max_seq_len), int(lat_dim)))
-
-
-def mla_decode_a16w8_plan_parts_capped(B: int, H: int, max_seq_len: int, lat_dim: int = 512) -> int:
-    """As plan_parts, additionally clamped so B*parts <= MaxCTAs."""
-    return int(_C.mla_decode_a16w8_plan_parts_capped(int(B), int(H), int(max_seq_len), int(lat_dim)))
-
-
-def mla_decode_a16w8_plan_parts_q(B: int, max_seq_len: int, q_len: int = 1, H: int = 16) -> int:
-    """q_len-aware fixed KV-split count for a graph captured at (B, max_seq_len, q_len).
-
-    Prefer this over plan_parts_capped when q_len > 1. This kernel runs the draft
-    window at one position per CTA (QLC=1), so a window of q_len multiplies the CTA
-    count by q_len and the KV split must give parts back to stay inside the grid cap.
-    H is accepted for ABI stability and ignored (H<=16 is a single query tile).
-    """
-    return int(_C.mla_decode_a16w8_plan_parts_q(int(B), int(max_seq_len), int(q_len), int(H)))
-
-
-# ---- multi-query: a q_len 4..8 draft window resident per CTA ----------------
-
-
-def mla_decode_a16w8_multiq(
-    q_lat: torch.Tensor,
-    q_pe: torch.Tensor,
-    kv: torch.Tensor,
-    o_lat: torch.Tensor,
-    scale: float,
-    kv_scale: float,
-    scale_p: float = 1.0,
+def mla_dcp_lse_merge_ranks(
+    parts_in: torch.Tensor,
+    lse_in: torch.Tensor,
+    out: torch.Tensor,
+    lse_out: torch.Tensor | None = None,
 ) -> None:
-    """A16W8 multi-query absorbed-decode MLA (q_len 4..8, H<=16, B<=32).
+    """Cross-rank log-sum-exp merge, run after the DCP all-to-all.
 
-    Args:
-        q_lat: [B, q_len, H, 512] bf16 — latent query.
-        q_pe:  [B, q_len, H, 64]  bf16 — RoPE query.
-        kv:    [B, S, 576] fp8 e4m3-fnuz — fused KV ([...,:512]=latent, [512:576]=rope).
-        o_lat: [B, q_len, H, 512] bf16 — output (written in-place).
-        scale:     softmax scale (1/sqrt(qk_head_dim) x YaRN mscale).
-        kv_scale:  per-tensor fp8 KV descale.
-        scale_p:   unused (ABI symmetry with mla_decode_a16w8). Defaults to 1.0.
+    Combines the R ranks' (normalized partial, lse) pairs for the heads this rank owns:
+    w_r = exp2(lse_r - max_r lse_r), out = sum_r w_r * parts_in[r] / sum_r w_r, with an all-empty
+    (every lse -inf) row left at zero.
 
-    Draft position t attends to kv[:, : S - q_len + t + 1]. q_len 1 is a different
-    CTA shape and is served by mla_decode_a16w8.
+    parts_in: [R, T, HL, 512] bf16 — the ranks' normalized partials, stacked.
+    lse_in:   [R, T, HL] fp32 — their base-2 log-sum-exps, as the decode op emits them.
+    out:      [T, HL, 512] bf16 — merged output (written in-place).
+    lse_out:  [T, HL] fp32 or None — the merged base-2 log-sum-exp.
     """
-    _C.mla_decode_a16w8_multiq(q_lat, q_pe, kv, o_lat, float(scale), float(kv_scale), float(scale_p))
-
-
-def mla_decode_a16w8_multiq_paged_dev(
-    q_lat: torch.Tensor,
-    q_pe: torch.Tensor,
-    kv_pool: torch.Tensor,
-    o_lat: torch.Tensor,
-    seq_lens: torch.Tensor,
-    rows: torch.Tensor | None,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    parts: int,
-    scale: float,
-    kv_scale: float,
-    scale_p: float = 1.0,
-    q_lens: torch.Tensor | None = None,
-) -> None:
-    """A16W8 multi-query decode, device-driven paged (cuda-graph capturable). q_len 4..8.
-
-    q_lat/q_pe: [B, q_len, H, 512] / [B, q_len, H, 64] bf16; o_lat matches q_lat.
-    kv_pool:    [num_slots, 1, 576] fp8 e4m3-fnuz — fused pool at per-tensor kv_scale.
-    seq_lens:   [B] int32 device — per-request KV lengths; draft position t sees the first
-                seq_lens[b] - q_len + t + 1 of them.
-    rows:       [B] int32 device or None — maps req_pool_index -> q/out batch row (None -> identity).
-    kv_indices: [sum(seq_lens)] int32 device — flat per-token slots (MLA page_size=1).
-    kv_indptr:  [B+1] int32 device — per-request slot offsets.
-    parts:      fixed at graph capture (use mla_decode_a16w8_multiq_plan_parts_q).
-    q_lens:     [B] int32 device or None — RAGGED query window, indexed like seq_lens (by KV
-                request, NOT by rows[b]). The tensors stay RECTANGULAR at the padded q_len; only
-                positions [0, q_lens[b]) are live, so position p attends KV
-                [0, seq_lens[b] - (q_lens[b]-1-p)) and rows >= q_lens[b] of o_lat are left
-                untouched. q_lens[b] <= q_len is the caller's contract (the values cannot be read
-                without a device sync) and the kernel clamps a violation. None => the plain
-                rectangular batch, bit for bit.
-    """
-    _C.mla_decode_a16w8_multiq_paged_dev(
-        q_lat, q_pe, kv_pool, o_lat, seq_lens, rows, kv_indices, kv_indptr,
-        int(parts), float(scale), float(kv_scale), float(scale_p), q_lens,
-    )
-
-
-def mla_decode_a16w8_multiq_plan_parts_q(B: int, max_seq_len: int, q_len: int = 4, H: int = 16) -> int:
-    """Fixed KV-split count for a multi-query graph captured at (B, max_seq_len, q_len, H).
-
-    Accounts for the CTAs that share one KV stream, so the launched grid stays inside the
-    workspace cap. H MATTERS: at q_len 8 with 9 <= H <= 12 the heads pack and one CTA takes the
-    whole draft window in a SINGLE pass over KV (1 group), otherwise two groups of 4 positions
-    each split it. Pass the H you will actually run; passing a larger one only costs grid width,
-    never correctness. Call at capture, reuse on replay.
-    """
-    return int(_C.mla_decode_a16w8_multiq_plan_parts_q(int(B), int(max_seq_len), int(q_len), int(H)))
+    _C.mla_dcp_lse_merge_ranks(parts_in, lse_in, out, lse_out)

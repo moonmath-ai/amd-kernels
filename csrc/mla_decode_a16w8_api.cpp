@@ -1,13 +1,16 @@
-// Torch binding for the A16W8 16-QUERY-HEAD absorbed-decode MLA kernel
-// (mla_decode_a16w8.hip — 8-wave warp-spec, CONS=NSub=4/PROD=4, TileTok=64, s_barrier handshake).
-// bf16 activations against fp8 KV: Q stays bf16 (no quantization), KV is fp8 unpacked to bf16 for both
-// QK and PV (v_mfma_f32_16x16x16bf16_1k). Probabilities are carried in bf16 (exact v_exp_f32 softmax).
+// Torch binding for the A16W8 absorbed-decode MLA kernel (mla_decode_a16w8.hip).
 //
-// TENSOR ABI: fused fp8 e4m3-fnuz 576-wide rows
-// ([...,:512]=latent, [512:576]=rope) at one per-tensor kv_scale, same contiguous [B,S,576] slab and
-// same [num_slots,1,576] paged pool, same argument order.
+// Dense batch: every request decodes the same number of draft positions, so q_lat/q_pe/o_lat are
+// [B*q_len, H, *] and lse is [B*q_len, H], with request b owning rows [b*q_len, (b+1)*q_len).
+// q_len is inferred from the row count and B = kv_indptr.numel() - 1. q_len 1 is plain decode.
 //
-// Both paths are current-stream, no host sync, cuda-graph capturable (paged takes a FIXED `parts`).
+// DCP is optional. With cp_world > 1 the KV pool is position-sharded: global position p lives on
+// rank p % cp_world at pool row p // cp_world. Q is head-replicated, so this rank runs all H heads
+// over its share of the positions and returns a rank-local partial plus the base-2 LSE that weights
+// it; `mla_dcp_lse_merge_ranks` combines the ranks after the all-to-all.
+//
+// Domain: H 1..128, any q_len, B * ceil(q_len*H/96) <= 304 row slices. Graph-capture safe: the
+// launch is planned from tensor shapes, never from a host read of a device tensor. Paged only.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -17,134 +20,136 @@
 #include <string>
 
 extern "C" {
-size_t mla_decode_a16w8_workspace_bytes(void);
+size_t mla_decode_a16w8_workspace_for(int B, int q_len, int H);
 int launch_mla_decode_a16w8(
-    const void* q_lat, const void* q_pe, const void* c_kv, const void* k_pe, void* o_lat,
-    int B, int H, int S, int lat_dim, int rope_dim, float scale, float kv_scale, float scale_p,
-    void* workspace, void* stream);
-int launch_mla_decode_a16w8_paged_dev(
-    const void* q_lat, const void* q_pe, const void* kv_pool, void* o_lat,
-    const void* seq_lens, const void* rows, const void* kv_indices, const void* kv_indptr,
-    int B, int H, int parts, int lat_dim, int rope_dim, float scale, float kv_scale, float scale_p,
-    void* workspace, void* stream, size_t kv_bytes, int q_len);
-int mla_decode_a16w8_plan_parts(int B, int H, int max_seq_len, int lat_dim);
-int mla_decode_a16w8_plan_parts_q(int B, int max_seq_len, int q_len, int H);
-int mla_decode_a16w8_plan_parts_capped(int B, int H, int max_seq_len, int lat_dim);
+    const void* q_lat, const void* q_pe, const void* kv_pool, void* o_lat, void* lse,
+    const void* seq_lens, const void* kv_indices, const void* kv_indptr, const void* glen,
+    int cp_rank, int cp_world, int B, int q_len, int H, int lat_dim, int rope_dim,
+    float scale, float kv_scale, void* workspace, void* stream, size_t kv_bytes, int kv_len);
+int launch_mla_dcp_lse_merge_ranks(
+    const void* parts_in, const void* lse_in, void* out, void* lse_out,
+    int R, int T, int HL, void* stream);
 }
 
 namespace moonmath_mla_a16w8 {
 namespace {
 
-constexpr int64_t kLat = 512, kRope = 64, kQK = kLat + kRope;   // 576
+constexpr int64_t kLat = 512, kRope = 64, kFused = kLat + kRope;   // 576
+constexpr int64_t kMaxHeads = 128;
 
-// Query layout: [B,H,*] (q_len==1) or [B,q_len,H,*] (speculative/MTP draft, q_len<=8). Returns q_len.
-int check_q(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& o_lat, const char* who) {
-  const auto D = q_lat.dim();
-  if (D != 3 && D != 4)
-    throw std::invalid_argument(std::string(who) + ": q_lat must be [B,H,512] or [B,q_len,H,512]");
-  if (q_pe.dim() != D || o_lat.dim() != D)
-    throw std::invalid_argument(std::string(who) + ": q_lat/q_pe/o_lat must have the same rank");
+void check_i32dev(const at::Tensor& t, const char* who, const char* name, int64_t min_numel) {
+  if (t.scalar_type() != at::kInt || !t.is_contiguous() || t.numel() < min_numel ||
+      !t.device().is_cuda())
+    throw std::invalid_argument(std::string(who) + ": " + name +
+                                " must be a contiguous int32 device tensor with enough entries");
+}
+
+// q_lat [T,H,512], q_pe [T,H,64] and o_lat [T,H,512] bf16, all contiguous. Returns T.
+int64_t check_q(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& o_lat,
+                const char* who) {
+  if (q_lat.dim() != 3 || q_pe.dim() != 3 || o_lat.dim() != 3)
+    throw std::invalid_argument(std::string(who) + ": q_lat/q_pe/o_lat must be [T,H,*] rank 3");
   if (q_lat.scalar_type() != at::kBFloat16 || q_pe.scalar_type() != at::kBFloat16 ||
       o_lat.scalar_type() != at::kBFloat16)
     throw std::invalid_argument(std::string(who) + ": q_lat/q_pe/o_lat must be bfloat16");
   if (!q_lat.device().is_cuda())
     throw std::invalid_argument(std::string(who) + ": tensors must be on a CUDA/HIP device");
-  if (q_lat.size(D - 1) != kLat || q_pe.size(D - 1) != kRope || o_lat.size(D - 1) != kLat)
+  if (q_lat.size(2) != kLat || q_pe.size(2) != kRope || o_lat.size(2) != kLat)
     throw std::invalid_argument(std::string(who) + ": expected q_lat[...,512], q_pe[...,64], o_lat[...,512]");
-  if (q_lat.size(D - 2) < 1 || q_lat.size(D - 2) > 16)
-    throw std::invalid_argument(std::string(who) + ": H must be in [1,16] (dedicated 16-head kernel)");
-  const int q_len = (D == 4) ? (int)q_lat.size(1) : 1;
-  if (q_len < 1 || q_len > 8)
-    throw std::invalid_argument(std::string(who) + ": q_len must be in [1,8]");
+  if (q_lat.size(1) < 1 || q_lat.size(1) > kMaxHeads)
+    throw std::invalid_argument(std::string(who) + ": H must be in [1,128]");
+  if (q_pe.size(0) != q_lat.size(0) || q_pe.size(1) != q_lat.size(1) ||
+      o_lat.size(0) != q_lat.size(0) || o_lat.size(1) != q_lat.size(1))
+    throw std::invalid_argument(std::string(who) + ": q_pe/o_lat must share q_lat's [T,H] prefix");
   if (!q_lat.is_contiguous() || !q_pe.is_contiguous() || !o_lat.is_contiguous())
     throw std::invalid_argument(std::string(who) + ": q_lat/q_pe/o_lat must be contiguous");
-  return q_len;
+  return q_lat.size(0);
 }
 
-// ── CONTIGUOUS, FUSED-576 ──
-// q_lat [B,H,512] bf16, q_pe [B,H,64] bf16, kv [B,S,576] fp8 e4m3-fnuz, o_lat [B,H,512] bf16.
-//   kv[..., 0:512] = c_KV latent, kv[..., 512:576] = k_pe rope, BOTH fp8 at the SAME per-tensor kv_scale.
-//   scale = layer.scaling (1/sqrt(qk_head_dim) x YaRN mscale). scale_p is accepted for signature symmetry
-//   with the split-precision op and is unused (the probability lift is a compile-time constant here).
-void mla_decode_a16w8_op(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& kv,
-                            at::Tensor& o_lat, double scale, double kv_scale, double scale_p) {
-  // The contiguous path has no window: only the paged launcher takes q_len.
-  if (check_q(q_lat, q_pe, o_lat, "mla_decode_a16w8") != 1)
-    throw std::invalid_argument("mla_decode_a16w8: the contiguous entry point is q_len==1 only; "
-                                "use mla_decode_a16w8_paged_dev for a draft window");
-  if (kv.scalar_type() != at::kFloat8_e4m3fnuz)
-    throw std::invalid_argument("mla_decode_a16w8: kv must be float8_e4m3fnuz");
-  if (kv.dim() != 3 || kv.size(2) != kQK)
-    throw std::invalid_argument("mla_decode_a16w8: kv must be the FUSED [B,S,576] slab "
-                                "([...,:512]=latent, [512:576]=rope), not the split c_kv/k_pe pair");
-  if (kv.size(0) != q_lat.size(0))
-    throw std::invalid_argument("mla_decode_a16w8: kv batch must match q_lat batch");
-  if (!kv.is_contiguous())
-    throw std::invalid_argument("mla_decode_a16w8: kv must be contiguous");
-  const int B = (int)q_lat.size(0);
-  const int H = (int)q_lat.size(1);
-  const int S = (int)kv.size(1);
+// Decode: kv_pool is the fused [num_slots, 1, 576] fp8-e4m3fnuz pool. Without DCP, seq_lens [B]
+// are the KV counts including the draft window. Under DCP they are the rank-local counts and glen
+// [B] the global ones that fix the causal limit. Writes normalized o_lat, plus the base-2 LSE when
+// given one.
+void mla_decode_a16w8_op(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& kv_pool,
+                         at::Tensor& o_lat, const at::Tensor& seq_lens, const at::Tensor& kv_indices,
+                         const at::Tensor& kv_indptr, double scale, double kv_scale,
+                         const c10::optional<at::Tensor>& lse, const c10::optional<at::Tensor>& glen,
+                         int64_t cp_rank, int64_t cp_world) {
+  const char* who = "mla_decode_a16w8";
+  const int64_t T = check_q(q_lat, q_pe, o_lat, who), H = q_lat.size(1);
+
+  if (kv_pool.scalar_type() != at::kFloat8_e4m3fnuz || !kv_pool.is_contiguous() ||
+      kv_pool.size(-1) != kFused)
+    throw std::invalid_argument(std::string(who) + ": kv_pool must be contiguous fp8-e4m3fnuz [.., 576]");
+  check_i32dev(kv_indptr, who, "kv_indptr", 2);
+  const int64_t B = kv_indptr.numel() - 1;
+  if (B < 1 || T % B != 0)
+    throw std::invalid_argument(std::string(who) + ": T must be B*q_len with B = kv_indptr.numel()-1");
+  const int64_t q_len = T / B;
+  check_i32dev(seq_lens, who, "seq_lens", B);
+  check_i32dev(kv_indices, who, "kv_indices", 1);
+  if (cp_world < 1 || cp_rank < 0 || cp_rank >= cp_world)
+    throw std::invalid_argument(std::string(who) + ": need 0 <= cp_rank < cp_world");
+  if (glen.has_value())
+    check_i32dev(*glen, who, "glen", B);
+  else if (cp_world > 1)
+    throw std::invalid_argument(std::string(who) + ": glen (the GLOBAL lengths) is required when cp_world > 1");
+  if (lse.has_value() &&
+      (lse->dim() != 2 || lse->scalar_type() != at::kFloat || !lse->is_contiguous() ||
+       !lse->device().is_cuda() || lse->size(0) != T || lse->size(1) != H))
+    throw std::invalid_argument(std::string(who) + ": lse must be a contiguous fp32 device tensor [T,H]");
+
   const c10::cuda::CUDAGuard g(q_lat.device());
   const auto stream = (void*)at::cuda::getCurrentCUDAStream(q_lat.device().index()).stream();
-  auto ws = at::empty({(int64_t)mla_decode_a16w8_workspace_bytes()}, q_lat.options().dtype(at::kByte));
+  const size_t ws_bytes = mla_decode_a16w8_workspace_for((int)B, (int)q_len, (int)H);
+  auto ws = at::empty({(int64_t)ws_bytes}, q_lat.options().dtype(at::kByte));
+  // The kernel always writes an LSE; a caller that does not want one gets a scratch buffer.
+  auto lse_buf = lse.has_value() ? *lse : at::empty({T, H}, q_lat.options().dtype(at::kFloat));
+
+  // kv_indices is [sum(seq_lens)], so its shape gives the mean KV length per request. That is
+  // host-side metadata, not a device read, so passing it to the planner keeps the launch graph-safe.
   const int rc = launch_mla_decode_a16w8(
-      q_lat.data_ptr(), q_pe.data_ptr(), kv.data_ptr(), /*k_pe=*/nullptr, o_lat.data_ptr(),
-      B, H, S, (int)kLat, (int)kRope, (float)scale, (float)kv_scale, (float)scale_p,
-      ws.data_ptr(), stream);
+      q_lat.data_ptr(), q_pe.data_ptr(), kv_pool.data_ptr(), o_lat.data_ptr(), lse_buf.data_ptr(),
+      seq_lens.data_ptr(), kv_indices.data_ptr(), kv_indptr.data_ptr(),
+      glen.has_value() ? glen->data_ptr() : nullptr,
+      (int)cp_rank, (int)cp_world, (int)B, (int)q_len, (int)H, (int)kLat, (int)kRope,
+      (float)scale, (float)kv_scale, ws.data_ptr(), stream, kv_pool.nbytes(),
+      (int)(kv_indices.numel() / B));
   if (rc != 0)
-    throw std::runtime_error("launch_mla_decode_a16w8 returned error code " + std::to_string(rc));
+    throw std::runtime_error(std::string(who) + " returned error code " + std::to_string(rc));
 }
 
-// ── GRAPH-SAFE DEVICE-DRIVEN PAGED ──
-// kv_pool: the layer's FUSED [num_slots, 1, 576] float8_e4m3fnuz slab at the model's per-tensor scale
-//   ([...,:512]=c_KV, [512:576]=k_pe).  Request b owns the FLAT per-token slots
-//   kv_indices[kv_indptr[b] : kv_indptr[b]+seq_lens[b]] (MLA page_size=1).  seq_lens[B]/kv_indices[total]/
-//   kv_indptr[B+1] are int32 DEVICE tensors; rows[B] int32 device or None maps req_pool_index -> q/out batch
-//   row.  `parts` is FIXED by the caller at capture (mla_decode_a16w8_plan_parts_capped).  No host read
-//   and no data-dependent grid => safe inside a cuda-graph capture; update the device tensors in place on
-//   replay.  kv_scale = the model's per-tensor fp8 KV descale (layer.k_scale; 1.0 for a scale-1.0 pool).
-void mla_decode_a16w8_paged_dev_op(const at::Tensor& q_lat, const at::Tensor& q_pe,
-                                      const at::Tensor& kv_pool, at::Tensor& o_lat,
-                                      const at::Tensor& seq_lens, const c10::optional<at::Tensor>& rows,
-                                      const at::Tensor& kv_indices, const at::Tensor& kv_indptr,
-                                      int64_t parts, double scale, double kv_scale, double scale_p) {
-  const int q_len = check_q(q_lat, q_pe, o_lat, "mla_decode_a16w8_paged_dev");
-  if (kv_pool.scalar_type() != at::kFloat8_e4m3fnuz)
-    throw std::invalid_argument("mla_decode_a16w8_paged_dev: kv_pool must be float8_e4m3fnuz");
-  if (kv_pool.size(-1) != kQK)
-    throw std::invalid_argument("mla_decode_a16w8_paged_dev: kv_pool rows must be 576 wide "
-                                "([...,:512]=c_KV, [512:576]=k_pe)");
-  if (seq_lens.scalar_type() != at::kInt || kv_indices.scalar_type() != at::kInt ||
-      kv_indptr.scalar_type() != at::kInt)
-    throw std::invalid_argument(
-        "mla_decode_a16w8_paged_dev: seq_lens/kv_indices/kv_indptr must be int32");
-  const int B = (int)q_lat.size(0);
-  const int H = (int)q_lat.size(q_lat.dim() - 2);
-  const c10::cuda::CUDAGuard g(q_lat.device());
-  const auto stream = (void*)at::cuda::getCurrentCUDAStream(q_lat.device().index()).stream();
-  auto ws = at::empty({(int64_t)mla_decode_a16w8_workspace_bytes()}, q_lat.options().dtype(at::kByte));
-  const void* rows_p = (rows.has_value() && rows->defined()) ? rows->data_ptr() : nullptr;
-  const int rc = launch_mla_decode_a16w8_paged_dev(
-      q_lat.data_ptr(), q_pe.data_ptr(), kv_pool.data_ptr(), o_lat.data_ptr(),
-      seq_lens.data_ptr(), rows_p, kv_indices.data_ptr(), kv_indptr.data_ptr(),
-      B, H, (int)parts, (int)kLat, (int)kRope, (float)scale, (float)kv_scale, (float)scale_p,
-      ws.data_ptr(), stream,
-      // KV working set: one 576-B row per slot. numel() == sum(seq_lens) at page_size=1, so this is the
-      //   true footprint including ragged batches, and it comes from metadata (graph-capture safe).
-      (size_t)kv_indices.numel() * 576ull, q_len);
+// Cross-rank merge, after the DCP all-to-all. Consumes the per-rank (normalized partial, base-2
+// lse) pairs stacked over R ranks and writes this rank's owned H_local heads:
+//   parts_in [R,T,HL,512] bf16, lse_in [R,T,HL] fp32, out [T,HL,512] bf16, lse_out [T,HL] fp32|None.
+void mla_dcp_lse_merge_ranks_op(const at::Tensor& parts_in, const at::Tensor& lse_in,
+                                at::Tensor& out, c10::optional<at::Tensor>& lse_out) {
+  const char* who = "mla_dcp_lse_merge_ranks";
+  if (parts_in.dim() != 4 || parts_in.scalar_type() != at::kBFloat16 || !parts_in.is_contiguous())
+    throw std::invalid_argument(std::string(who) + ": parts_in must be contiguous bf16 [R,T,HL,512]");
+  if (lse_in.dim() != 3 || lse_in.scalar_type() != at::kFloat || !lse_in.is_contiguous())
+    throw std::invalid_argument(std::string(who) + ": lse_in must be contiguous fp32 [R,T,HL]");
+  const int64_t R = parts_in.size(0), T = parts_in.size(1), HL = parts_in.size(2);
+  if (parts_in.size(3) != kLat || lse_in.size(0) != R || lse_in.size(1) != T || lse_in.size(2) != HL)
+    throw std::invalid_argument(std::string(who) + ": parts_in [R,T,HL,512] and lse_in [R,T,HL] must agree");
+  if (R < 1 || R > 16)
+    throw std::invalid_argument(std::string(who) + ": R must be in [1,16]");
+  if (out.dim() != 3 || out.scalar_type() != at::kBFloat16 || !out.is_contiguous() ||
+      out.size(0) != T || out.size(1) != HL || out.size(2) != kLat)
+    throw std::invalid_argument(std::string(who) + ": out must be contiguous bf16 [T,HL,512]");
+  void* lo = nullptr;
+  if (lse_out.has_value()) {
+    if (lse_out->dim() != 2 || lse_out->scalar_type() != at::kFloat || !lse_out->is_contiguous() ||
+        lse_out->size(0) != T || lse_out->size(1) != HL)
+      throw std::invalid_argument(std::string(who) + ": lse_out must be contiguous fp32 [T,HL]");
+    lo = lse_out->data_ptr();
+  }
+  const c10::cuda::CUDAGuard g(parts_in.device());
+  const auto stream = (void*)at::cuda::getCurrentCUDAStream(parts_in.device().index()).stream();
+  const int rc = launch_mla_dcp_lse_merge_ranks(parts_in.data_ptr(), lse_in.data_ptr(),
+                                                out.data_ptr(), lo, (int)R, (int)T, (int)HL, stream);
   if (rc != 0)
-    throw std::runtime_error("launch_mla_decode_a16w8_paged_dev returned error code " +
-                             std::to_string(rc));
-}
-
-int64_t plan_parts_op(int64_t B, int64_t H, int64_t max_seq_len, int64_t lat_dim) {
-  return mla_decode_a16w8_plan_parts((int)B, (int)H, (int)max_seq_len, (int)lat_dim);
-}
-int64_t plan_parts_q_op(int64_t B, int64_t max_seq_len, int64_t q_len, int64_t H) {
-  return mla_decode_a16w8_plan_parts_q((int)B, (int)max_seq_len, (int)q_len, (int)H);
-}
-int64_t plan_parts_capped_op(int64_t B, int64_t H, int64_t max_seq_len, int64_t lat_dim) {
-  return mla_decode_a16w8_plan_parts_capped((int)B, (int)H, (int)max_seq_len, (int)lat_dim);
+    throw std::runtime_error(std::string(who) + " returned error code " + std::to_string(rc));
 }
 
 }  // namespace
@@ -152,29 +157,20 @@ int64_t plan_parts_capped_op(int64_t B, int64_t H, int64_t max_seq_len, int64_t 
 void register_pybind(pybind11::module_& m) {
   namespace py = pybind11;
   m.def("mla_decode_a16w8", &mla_decode_a16w8_op,
-        "CDNA3 A16W8 16-head absorbed-decode MLA (q_len=1): bf16 Q against fp8 KV. ONE fused fp8 "
-        "e4m3-fnuz kv[B,S,576] ([...,:512]=latent, [512:576]=rope) at a single per-tensor kv_scale; Q "
-        "stays bf16 (no q quantization error). Current-stream, no host sync.",
-        py::arg("q_lat"), py::arg("q_pe"), py::arg("kv"), py::arg("o_lat"),
-        py::arg("scale"), py::arg("kv_scale"), py::arg("scale_p"));
-  m.def("mla_decode_a16w8_paged_dev", &mla_decode_a16w8_paged_dev_op,
-        "CDNA3 A16W8 (bf16 Q / fp8 KV) 16-head absorbed-decode MLA, DEVICE-DRIVEN PAGED. ABI-identical "
-        "paged: fused fp8 [num_slots,1,576] pool + flat kv_indices/kv_indptr + "
-        "device seq_lens + FIXED parts; cuda-graph capturable; per-tensor kv_scale.",
-        py::arg("q_lat"), py::arg("q_pe"), py::arg("kv_pool"), py::arg("o_lat"),
-        py::arg("seq_lens"), py::arg("rows"), py::arg("kv_indices"), py::arg("kv_indptr"),
-        py::arg("parts"), py::arg("scale"), py::arg("kv_scale"), py::arg("scale_p"));
-  m.def("mla_decode_a16w8_plan_parts", &plan_parts_op,
-        "FIXED kv-split for an a16w8 16h graph captured at (B,H,max_seq_len)",
-        py::arg("B"), py::arg("H"), py::arg("max_seq_len"), py::arg("lat_dim"));
-  m.def("mla_decode_a16w8_plan_parts_q", &plan_parts_q_op,
-        "q_len-aware FIXED kv-split for an a16w8 graph captured at (B,max_seq_len,q_len). At QLC=1 "
-        "each draft position is its own CTA, so the window multiplies the CTA count and the KV split "
-        "gives parts back to stay inside the grid cap.",
-        py::arg("B"), py::arg("max_seq_len"), py::arg("q_len") = 1, py::arg("H") = 16);
-  m.def("mla_decode_a16w8_plan_parts_capped", &plan_parts_capped_op,
-        "FIXED kv-split for an a16w8 16h graph captured at batch bs, CLAMPED so bs*parts <= MaxCTAs",
-        py::arg("B"), py::arg("H"), py::arg("max_seq_len"), py::arg("lat_dim"));
+        "CDNA3 A16W8 absorbed-decode MLA over a dense paged batch (q_lat/o_lat [B*q_len,H,*]), any "
+        "q_len, H 1..128: bf16 Q against the fused fp8 KV pool, end-aligned causal. Optional DCP: with "
+        "cp_world > 1 the pool is this rank's shard (position p on rank p%cp_world, slot p//cp_world) and "
+        "glen carries the global lengths. Writes normalized o_lat and, if given, the base-2 LSE [B*q_len,H]. "
+        "Cuda-graph capturable.",
+        py::arg("q_lat"), py::arg("q_pe"), py::arg("kv_pool"), py::arg("o_lat"), py::arg("seq_lens"),
+        py::arg("kv_indices"), py::arg("kv_indptr"), py::arg("scale"), py::arg("kv_scale"),
+        py::arg("lse") = py::none(), py::arg("glen") = py::none(), py::arg("cp_rank") = 0,
+        py::arg("cp_world") = 1);
+  m.def("mla_dcp_lse_merge_ranks", &mla_dcp_lse_merge_ranks_op,
+        "Cross-rank log-sum-exp merge of per-rank (normalized partial, base-2 lse) pairs into this "
+        "rank's owned heads, after the DCP all-to-all. parts_in [R,T,HL,512] bf16, lse_in [R,T,HL] "
+        "fp32, out [T,HL,512] bf16, lse_out [T,HL] fp32 (optional).",
+        py::arg("parts_in"), py::arg("lse_in"), py::arg("out"), py::arg("lse_out") = py::none());
 }
 
 }  // namespace moonmath_mla_a16w8
