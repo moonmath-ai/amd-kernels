@@ -1,8 +1,8 @@
 # moonmath-amd
 
-Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward kernel, a
-pair of MLA (DeepSeek-V3) absorbed-decode kernels, and the grouped GEMMs of an
-MXFP4 mixture-of-experts layer.
+Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward kernel, an
+MLA (DeepSeek-V3) absorbed-decode kernel, and the grouped GEMMs of an MXFP4
+mixture-of-experts layer.
 
 **MHA forward** — 8-wave warp-specialized CTA: each wave owns 3 q-tiles (48 q-rows),
 two parked in registers, the third staged through LDS; K streams HBM→LDS by direct
@@ -17,20 +17,12 @@ launch), and is the main reason RTZ now beats AITER on every benchmarked shape.
 
 **MLA absorbed decode** — bf16 Q against fp8 e4m3-fnuz KV. One fused 576-wide KV row
 is BOTH K and V (`W_UK`/`W_UV` absorbed outside), so the KV stream is read once at fp8
-width and every MFMA is `v_mfma_f32_16x16x16bf16_1k`. Two CTA shapes, picked by op
-rather than by argument:
-
-- `mla_decode_a16w8*` — one draft position per CTA, `TileTok=64`, 8 waves split
-  4 consumer / 4 producer. Serves q_len 1..8.
-- `mla_decode_a16w8_multiq*` — a q_len 4..8 draft window resident per CTA
-  (speculative-decode verify), `TileTok=16`, all 8 waves compute and the fp8→bf16
-  unpack happens once per token on the LDS fill rather than per MFMA operand. At
-  q_len 8 with H ≤ 12 the heads pack into six MFMA N-tiles and one CTA takes the
-  whole window in a single pass over KV.
-
-Both serve a contiguous KV slab and a device-driven paged pool (`page_size = 1`)
-whose KV-split is fixed at capture, so the paged path is cuda-graph capturable with
-no host synchronization.
+width and every MFMA is `v_mfma_f32_16x16x16bf16_1k`. One op, `mla_decode_a16w8`, serves
+plain decode, speculative-decode verify and decode context parallelism (DCP): any `q_len`,
+`H` up to 128, over a device-driven paged pool (`page_size = 1`). It plans from tensor
+shapes alone, so it is cuda-graph capturable with no host synchronization, and splits a
+batch's KV by request length. Under DCP it also returns a base-2 LSE, which
+`mla_dcp_lse_merge_ranks` combines across ranks.
 
 **MXFP4 MoE GEMMs** — `mxfp4_moe_gateup` and `mxfp4_moe_down`, the grouped GEMMs of
 an MXFP4 mixture-of-experts layer: E2M1 weight nibbles with one E8M0 scale per 32 k,
@@ -45,7 +37,7 @@ pip install -e .
 ```
 
 That compiles the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ),
-both MLA decode kernels and the MXFP4 MoE GEMMs into the package's `_C` extension.
+the MLA decode kernel and the MXFP4 MoE GEMMs into the package's `_C` extension.
 
 ## Use
 
@@ -79,9 +71,9 @@ CPU tensors are copied to the GPU and back under the hood.
 
 ### MLA decode
 
-`q_lat` / `q_pe` are the absorbed latent and RoPE queries; `kv` holds ONE fused fp8
-row per token (`[..., :512]` latent, `[..., 512:576]` rope) at a single per-tensor
-`kv_scale`. The output is written into `o_lat` in place.
+`q_lat` / `q_pe` are the absorbed latent and RoPE queries, `[B*q_len, H, *]`; the pool holds
+ONE fused fp8 row per token (`[..., :512]` latent, `[..., 512:576]` rope) at a single
+per-tensor `kv_scale`. The output is written into `o_lat` in place.
 
 ```python
 import torch
@@ -89,37 +81,27 @@ import moonmath_amd as ma
 
 B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
 scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
-kv = (torch.randn(B, S, LAT + ROPE, device="cuda") / kv_scale).to(torch.float8_e4m3fnuz)
+pool = (torch.randn(B * S, 1, LAT + ROPE, device="cuda") / kv_scale).to(torch.float8_e4m3fnuz)
+kv_indices = torch.arange(B * S, dtype=torch.int32, device="cuda")  # page_size 1, any permutation
+kv_indptr = torch.arange(B + 1, dtype=torch.int32, device="cuda") * S
+seq_lens = torch.full((B,), S, dtype=torch.int32, device="cuda")
 
-# q_len = 1 — plain decode.
-q_lat = torch.randn(B, H, LAT, dtype=torch.bfloat16, device="cuda")
-q_pe = torch.randn(B, H, ROPE, dtype=torch.bfloat16, device="cuda")
-o_lat = torch.empty_like(q_lat)
-ma.mla_decode_a16w8(q_lat, q_pe, kv, o_lat, scale, kv_scale)
-
-# q_len = 4 — a speculative-decode draft window, resident per CTA. Draft position t
-# attends KV [0, S - q_len + t] inclusive, so the last position sees the whole sequence.
-q_len = 4
-q_lat = torch.randn(B, q_len, H, LAT, dtype=torch.bfloat16, device="cuda")
-q_pe = torch.randn(B, q_len, H, ROPE, dtype=torch.bfloat16, device="cuda")
-o_lat = torch.empty_like(q_lat)
-ma.mla_decode_a16w8_multiq(q_lat, q_pe, kv, o_lat, scale, kv_scale)
+# q_len 1 is plain decode; q_len 4 is a draft window where position t attends KV [0, S - q_len + t].
+for q_len in (1, 4):
+    q_lat = torch.randn(B * q_len, H, LAT, dtype=torch.bfloat16, device="cuda")
+    q_pe = torch.randn(B * q_len, H, ROPE, dtype=torch.bfloat16, device="cuda")
+    o_lat = torch.empty_like(q_lat)
+    ma.mla_decode_a16w8(q_lat, q_pe, pool, o_lat, seq_lens, kv_indices, kv_indptr, scale, kv_scale)
 ```
 
-The paged ops take a `[num_slots, 1, 576]` pool plus device `seq_lens` / `kv_indices`
-/ `kv_indptr`, and a `parts` KV-split count fixed once at graph capture:
+Under DCP, `seq_lens` counts this rank's positions (`p % cp_world == cp_rank`) and `glen`
+the global lengths; pass `lse=` and merge the ranks after the all-to-all:
 
 ```python
-parts = ma.mla_decode_a16w8_multiq_plan_parts_q(B, max_seq_len, q_len, H)
-ma.mla_decode_a16w8_multiq_paged_dev(
-    q_lat, q_pe, pool, o_lat, seq_lens, None, kv_indices, kv_indptr,
-    parts, scale, kv_scale,
-)
+ma.mla_decode_a16w8(q_lat, q_pe, pool, o_lat, seq_lens, kv_indices, kv_indptr, scale, kv_scale,
+                    lse=lse, glen=glen, cp_rank=cp_rank, cp_world=cp_world)
+ma.mla_dcp_lse_merge_ranks(parts_in, lse_in, out, lse_out)
 ```
-
-Passing `q_lens=` (a `[B]` int32 device tensor) gives each request a shorter live
-window inside the padded, still rectangular tensors — a ragged speculative batch.
-Rows past each request's window are left untouched in `o_lat`.
 
 ## Constraints
 
@@ -137,13 +119,8 @@ Rows past each request's window are left untouched in `o_lat`.
 - bf16 Q (`q_lat` `[.., H, 512]`, `q_pe` `[.., H, 64]`) against fp8 e4m3-fnuz KV;
   bf16 output. `kv_lora_rank = 512`, `qk_rope_head_dim = 64`.
 - Fused 576-wide KV rows at ONE per-tensor `kv_scale` — latent and rope share it.
-- `H ≤ 16`.
-- `mla_decode_a16w8`: q_len 1..8. The contiguous entry point is q_len 1; the draft
-  window is paged-only.
-- `mla_decode_a16w8_multiq`: q_len 4..8, capped at `B * groups ≤ 152`, where `groups`
-  is the CTAs one draft window costs — 1 at q_len 4, or at q_len 8 with H ≤ 12 where
-  the whole window fits one CTA, and 2 otherwise. `B ≤ 32` is the tuned range.
-  Below q_len 4, use `mla_decode_a16w8`.
+- `H` 1..128 and any `q_len` (one per batch), capped at `B * ceil(q_len * H / 96) ≤ 304`.
+- DCP needs `glen` whenever `cp_world > 1`.
 - Paged pools are `page_size = 1`, so `kv_indices` is a flat per-token slot list and
   any permutation or subset of it is legal.
 - gfx942 / MI300X only (CDNA3).
@@ -155,9 +132,9 @@ handling is bit- and position-identical with AITER for every rounding mode
 (canonical `0x7FFF` NaN output), and every finite output element is within
 1 bf16 ULP of AITER's. Outputs are deterministic run-to-run.
 
-The MLA decode kernels are deterministic too: the KV-split is fixed at capture and
+The MLA decode kernel is deterministic too: its KV split is a function of the inputs and
 the fp32 partial merge sums in a fixed association. Against an fp32 reference over
-the same dequantized KV (B=2, S=8192, H=16, q_len 4) they land at **2.6e-3**
+the same dequantized KV (B=2, S=8192, H=16, q_len 4) it lands at **2.5e-3**
 relative error, against AITER's own a16w8 asm kernel at 6.3e-3 on those same inputs.
 `benchmark/bench_mla.py` prints both before it times anything.
 
@@ -226,8 +203,7 @@ both kernels against a dense reference that never sees the repacked weights.
 ## Layout / build internals
 
 - `csrc/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
-- `csrc/mla_decode_a16w8.hip` — MLA absorbed decode, one draft position per CTA.
-- `csrc/mla_decode_a16w8_multiq.hip` — MLA absorbed decode, q_len 4..8 window.
+- `csrc/mla_decode_a16w8.hip` — MLA absorbed decode, any q_len, optional DCP.
 - `csrc/mxfp4_moe_gateup.hip`, `csrc/mxfp4_moe_down.hip` — the MoE GEMMs.
 - `csrc/*_api.cpp` — the torch bindings for each.
 - `moonmath_amd/` — Python package (ctypes wrapper around the `.so`).
@@ -236,9 +212,9 @@ both kernels against a dense reference that never sees the repacked weights.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
 - `benchmark/bench_mla.py` — MLA decode vs AITER's a16w8 ASM kernel, CUDA-graph timed.
 - `benchmark/bench_moe.py` — MXFP4 MoE GEMMs vs AITER's Triton MXFP4 kernel.
-- `tests/test_mla_decode.py` — the MLA ops against an fp32 reference built from the
-  same dequantized KV: both CTA shapes, contiguous and paged, the end-aligned causal
-  window, the `rows` remap, the ragged `q_lens` window and the domain rejections.
+- `tests/test_mla_decode.py` — the MLA op against an fp32 reference built from the
+  same dequantized KV: every draft length, the end-aligned causal window, the length
+  split, DCP ranks, the cross-rank merge, CUDA-graph replay and the domain rejections.
 - `tests/test_moe.py` — the MoE GEMMs against a dense reference built from the
   dequantized stock weights, plus the repack, tile-shape and domain contracts.
 
@@ -342,7 +318,7 @@ HIP and AITER timing loops have finished, so its runtime cannot perturb them.
 
 ### Results — MLA decode, MI300X, bf16 Q / fp8 KV, H = 16, q\_len = 4
 
-`mla_decode_a16w8_multiq` against AITER's `a16w8` MLA decode ASM kernel — the only
+`mla_decode_a16w8` against AITER's `a16w8` MLA decode ASM kernel — the only
 AITER cell with our dtypes. Both sides run in one process on one shared paged fp8 KV
 pool, same Q, same softmax scale, same end-aligned causal mask, same `page_size = 1`
 shuffled slot permutation (a kernel that assumed contiguous slots would fail the
@@ -354,14 +330,14 @@ timed once per round in alternating order, median over rounds. Speedups are
 
 | Shape (B, S) | KV (MB) | Ours (µs) | AITER a16w8 (µs) | Speedup | Ours (TB/s) | AITER (TB/s) |
 |---|---|---|---|---|---|---|
-| (1, 150000) | 86 | **87.6** | 134.9 | 1.54× | 0.99 | 0.64 |
-| (2, 150000) | 173 | **124.2** | 164.1 | 1.32× | 1.39 | 1.05 |
-| (8, 8192) | 38 | **53.0** | 59.0 | 1.11× | 0.71 | 0.64 |
-| (8, 32768) | 151 | **113.7** | 131.9 | 1.16× | 1.33 | 1.14 |
-| (8, 65536) | 302 | **208.5** | 246.4 | 1.18× | 1.45 | 1.23 |
-| (8, 150000) | 691 | **444.0** | 524.9 | 1.18× | 1.56 | 1.32 |
-| (16, 150000) | 1382 | **868.4** | 1027.9 | 1.18× | 1.59 | 1.34 |
-| (32, 8192) | 151 | **117.4** | 137.6 | 1.17× | 1.29 | 1.10 |
+| (1, 150000) | 86 | **76.8** | 133.4 | 1.74× | 1.13 | 0.65 |
+| (2, 150000) | 173 | **112.4** | 157.0 | 1.40× | 1.54 | 1.10 |
+| (8, 8192) | 38 | **51.8** | 57.7 | 1.12× | 0.73 | 0.65 |
+| (8, 32768) | 151 | **101.8** | 133.9 | 1.32× | 1.48 | 1.13 |
+| (8, 65536) | 302 | **180.4** | 247.8 | 1.37× | 1.67 | 1.22 |
+| (8, 150000) | 691 | **394.2** | 531.6 | 1.35× | 1.75 | 1.30 |
+| (16, 150000) | 1382 | **811.1** | 1045.4 | 1.29× | 1.70 | 1.32 |
+| (32, 8192) | 151 | **104.1** | 139.2 | 1.34× | 1.45 | 1.08 |
 
 AITER's `a16w8` kernel asserts `nhead == 16`, and rejects q_len > 4 on fp8 KV, so
 H = 12 (a DSV3 TP8 shard) and q_len 8 have no like-for-like AITER cell at all. That is
