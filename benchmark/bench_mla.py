@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""MLA a16w8 multi-query decode vs AITER's a16w8 MLA decode ASM kernel.
+"""MLA a16w8 decode vs AITER's a16w8 MLA decode ASM kernel.
 
 AITER's a16w8 kernel (bf16 Q against fp8 KV) is the only cell in its nhead=16 decode
 surface with our dtypes, so it is the like-for-like bar. Both sides run in ONE process
@@ -92,12 +92,12 @@ class Case:
         self.seq_lens = torch.full((B,), S, device=dev, dtype=torch.int32)
         torch.cuda.synchronize()
 
-        self.parts = ma.mla_decode_a16w8_multiq_plan_parts_q(B, S, Q_LEN, H)
-
     def run(self):
-        ma.mla_decode_a16w8_multiq_paged_dev(
-            self.q_lat, self.q_pe, self.pool, self.o_lat, self.seq_lens, None,
-            self.kv_indices, self.kv_indptr, self.parts, SCALE, KV_SCALE)
+        T = self.B * Q_LEN
+        ma.mla_decode_a16w8(
+            self.q_lat.view(T, H, LAT), self.q_pe.view(T, H, ROPE), self.pool,
+            self.o_lat.view(T, H, LAT), self.seq_lens, self.kv_indices, self.kv_indptr,
+            SCALE, KV_SCALE)
 
     def out(self):
         return self.o_lat
