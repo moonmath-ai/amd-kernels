@@ -198,7 +198,7 @@ struct KArgs {
 
   int B, q_len, H;
   int rows;                              // rows per CTA: NTiles * 16
-  int slices, nparts;                    // uniform across requests, both chosen on the host
+  int slices, nparts;                    // chosen on the host; B * nparts KV units per slice
   int cp_rank, cp_world;
   float scale_log2e;
   float kv_scale;
@@ -210,6 +210,63 @@ struct KArgs {
 __device__ __forceinline__ int local_causal_end(const KArgs& args, int global_len, int qpos) {
   const int global_end = global_len - (args.q_len - 1 - qpos);
   return global_end <= args.cp_rank ? 0 : cdiv(global_end - args.cp_rank, args.cp_world);
+}
+
+// ── KV split ── request i gets 1 + (tiles_i - 1) * (U - B) / sum_j (tiles_j - 1) of a slice's
+// U = B * nparts units, at most tiles_i, so long requests don't stall the batch.
+constexpr int MaxSplitTiles = 1 << 20;             // keeps the sums in 32 bits
+
+__device__ __forceinline__ int split_tiles(int kv_len) {
+  const int t = cdiv(kv_len, TileTokens);
+  return t < 1 ? 1 : min(t, MaxSplitTiles);
+}
+
+struct KvSplit {
+  const int* __restrict__ seq_lens;
+  int B, units_total, spare_tiles;                 // U, sum_j (tiles_j - 1)
+
+  __device__ __forceinline__ int units(int i) const {
+    const int t = split_tiles(seq_lens[i]);
+    const int n = spare_tiles > 0 ? 1 + (t - 1) * (units_total - B) / spare_tiles : 1;
+    return min(n, t);
+  }
+
+  // First unit of `req` in its slice.
+  __device__ __forceinline__ int first_unit(int req) const {
+    int acc = 0;
+    for (int i = (int)__lane_id(); i < req; i += WaveSize) acc += units(i);
+    return __builtin_amdgcn_readfirstlane(wave_all_reduce(acc, [](int x, int y) { return x + y; }));
+  }
+
+  // Request owning `unit` (B if unused), with its first unit and unit count.
+  __device__ __forceinline__ int owner(int unit, int& first, int& count) const {
+    const int l = (int)__lane_id();
+    first = count = 0;
+    for (int base = 0; base < B; base += WaveSize) {
+      const int i = base + l, mine = i < B ? units(i) : 0;
+      int upto = mine;                               // units of requests base..i
+      for (int m = 1; m < WaveSize; m <<= 1) {
+        const int up = __shfl_up(upto, m, WaveSize); // not under the ternary: it would read inactive lanes
+        upto += (l >= m) ? up : 0;
+      }
+      const unsigned long long past = __ballot(upto > unit - first);
+      if (past) {
+        const int L = (int)__builtin_ctzll(past);
+        count = __builtin_amdgcn_readlane(mine, L);
+        first += __builtin_amdgcn_readlane(upto - mine, L);
+        return base + L;
+      }
+      first += __builtin_amdgcn_readlane(upto, WaveSize - 1);
+    }
+    return B;
+  }
+};
+
+__device__ __forceinline__ KvSplit make_kv_split(const int* seq_lens, int B, int nparts) {
+  int spare = 0;
+  for (int i = (int)__lane_id(); i < B; i += WaveSize) spare += split_tiles(seq_lens[i]) - 1;
+  spare = wave_all_reduce(spare, [](int x, int y) { return x + y; });
+  return KvSplit{seq_lens, B, B * nparts, __builtin_amdgcn_readfirstlane(spare)};
 }
 
 // Four tokens' bf16 pairs -> one dim across four tokens: the V operand of the PV. Passed by
@@ -228,7 +285,7 @@ __device__ __forceinline__ bf16x4 transpose_odd(uint32_t t0, uint32_t t1, uint32
 // called in one fixed order from `step` near the bottom.
 template <int NT, bool IsFill, bool AllTilesLive>
 __device__ __forceinline__ void wave_body(
-    int wave, int req, int slice, int part, int live_rows, const KArgs& args,
+    int wave, int req, int slice, int part, int nparts, int live_rows, const KArgs& args,
     bf16 (&s_kv)[2][TileTokens][KvRowElems],            // ring: the slot being read, the filling one
     bf16x4 (&s_prob)[2][NT][WaveSize],                  // softmax -> PV, published a step ahead
     float (&s_rescale)[2][MfmaTile][RescaleStride]) {   // per (row, tile) rescale; 1.0f == no move
@@ -259,7 +316,7 @@ __device__ __forceinline__ void wave_body(
 
   // This CTA's slice of the KV stream: whole tiles per part, so no part starts mid-tile.
   const int kv_len = args.seq_lens[req], pool_base = args.kv_indptr[req];
-  const int per_part = cdiv(kv_len, args.nparts * TileTokens) * TileTokens;
+  const int per_part = cdiv(kv_len, nparts * TileTokens) * TileTokens;
   const int win_lo = part * per_part, win_hi = min(kv_len, win_lo + per_part);
   const int kv_tiles = win_hi > win_lo ? cdiv(win_hi - win_lo, TileTokens) : 0;
 
@@ -570,25 +627,29 @@ __global__ void __launch_bounds__(CtaThreads, 1) mla_decode_a16w8_kernel(KArgs a
   __shared__ __align__(16) float s_rescale[2][MfmaTile][RescaleStride];
   static_assert(sizeof(s_kv) + sizeof(s_prob) + sizeof(s_rescale) <= 65536, "LDS");
 
-  // Dense (slice, request, part) grid: no device plan, no scan, no table. The `slices` CTAs sharing
-  // a (request, part) read the same KV, and MI300X sends workgroup i to XCD i % 8, so `slice` is the
+  // (slice, unit) grid; the KV split maps units to (request, part). The `slices` CTAs sharing a
+  // (request, part) read the same KV, and MI300X sends workgroup i to XCD i % 8, so `slice` is the
   // slowest index and lands them on one XCD's L2.
   const int cta = (int)blockIdx.x, ctas_per_slice = args.B * args.nparts;
-  const int slice = cta / ctas_per_slice, within_slice = cta - slice * ctas_per_slice;
-  const int req = within_slice / args.nparts, part = within_slice - req * args.nparts;
+  const int slice = cta / ctas_per_slice, unit = cta - slice * ctas_per_slice;
   const int rows_left = args.q_len * args.H - slice * (NT * MfmaTile);
   const int live_rows = min(rows_left, NT * MfmaTile);
   if (live_rows <= 0) return;
+
+  int first_unit, nparts;
+  const int req = make_kv_split(args.seq_lens, args.B, args.nparts).owner(unit, first_unit, nparts);
+  if (req >= args.B) return;                        // unused unit
+  const int part = unit - first_unit;
 
   const int wave = (int)threadIdx.x / WaveSize;
   // With only two fill waves, a priority bump keeps them a step ahead of the contract waves.
   if (wave >= NT && NumWaves - NT < 4) asm volatile("s_setprio 1" ::: "memory");
 
   if (wave < NT)
-    wave_body<NT, false, AllTilesLive>(wave, req, slice, part, live_rows, args,
+    wave_body<NT, false, AllTilesLive>(wave, req, slice, part, nparts, live_rows, args,
                                        s_kv, s_prob, s_rescale);
   else
-    wave_body<NT, true, AllTilesLive>(wave, req, slice, part, live_rows, args,
+    wave_body<NT, true, AllTilesLive>(wave, req, slice, part, nparts, live_rows, args,
                                       s_kv, s_prob, s_rescale);
 }
 
@@ -599,7 +660,7 @@ constexpr int MaxParts = NumCU;                    // one part per CU at most; s
 template <int DimSplit>
 __global__ void __launch_bounds__(MergeThreads) mla_decode_a16w8_merge(
     float* __restrict__ partials, bf16* __restrict__ o_lat, float* __restrict__ lse,
-    int H, int q_len, int rows_per_cta, int slices, int nparts, int n_ctas) {
+    const int* __restrict__ seq_lens, int B, int H, int q_len, int rows_per_cta, int grid_parts, int n_ctas) {
   constexpr int Threads = MergeThreads, Waves = Threads / WaveSize;
   constexpr int PartsPerThread = cdiv(MaxParts, Threads);
   constexpr int DimsPerCta = LatDim / DimSplit, DimsPerLane = 8;
@@ -614,8 +675,10 @@ __global__ void __launch_bounds__(MergeThreads) mla_decode_a16w8_merge(
   const int rows_per_req = q_len * H;
   const int req = row_id / rows_per_req, row = row_id - req * rows_per_req;
   const int slice = row / rows_per_cta, slot = row - slice * rows_per_cta;
-  const int ctas_per_slice = n_ctas / slices;   // B * nparts; the grid's order makes parts adjacent
-  const size_t cta0 = (size_t)slice * ctas_per_slice + (size_t)req * nparts;
+  // This request's parts, as decode laid them out.
+  const KvSplit split = make_kv_split(seq_lens, B, grid_parts);
+  const int nparts = split.units(req);
+  const size_t cta0 = (size_t)slice * (B * grid_parts) + (size_t)split.first_unit(req);
   const size_t out_row = row_id;                       // o_lat is [B*q_len, H, 512], packed the same
   __shared__ float weight[MaxParts];
   __shared__ float s_max[Waves], s_sum[Waves], s_fold[(Waves - 1) * DimsPerCta];
@@ -796,7 +859,7 @@ __host__ inline void launch_merge(int dim_split, int units, int n_ctas, const KA
       launch_merge<D * 2>(dim_split, units, n_ctas, a, o_lat, lse, stream); return;
     }
     mla_decode_a16w8_merge<D><<<dim3(units * D), dim3(MergeThreads), 0, stream>>>(
-        a.partials, (bf16*)o_lat, lse, a.H, a.q_len, a.rows, a.slices, a.nparts, n_ctas);
+        a.partials, (bf16*)o_lat, lse, a.seq_lens, a.B, a.H, a.q_len, a.rows, a.nparts, n_ctas);
   }
 }
 
@@ -856,7 +919,7 @@ extern "C" __host__ int launch_mla_decode_a16w8(
   a.scale_log2e = Log2E * scale;  a.kv_scale = kv_scale;
   a.non_temporal = want_non_temporal(kv_bytes, a.slices);
 
-  const int grid = B * a.slices * a.nparts;         // exact: every CTA has work
+  const int grid = B * a.slices * a.nparts;         // unused units return at once
   // The one case where a CTA owns rows that do not exist: a single slice `rows` does not divide.
   const bool partial_tail = (a.slices == 1) && (q_len * H % a.rows != 0);
   launch_decode<>(ntiles, grid, partial_tail, a, stream);

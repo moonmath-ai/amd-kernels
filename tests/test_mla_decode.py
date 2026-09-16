@@ -198,6 +198,22 @@ def test_decode_matches_reference(device, q_len, H):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("q_len", [1, 4])
+@pytest.mark.parametrize(
+    "glen",
+    [[60000] + [100] * 31,
+     list(range(4, 36)),
+     [40000 if b in (3, 70) else 50 + b for b in range(100)]],
+    ids=["one_long", "all_short", "two_waves"],
+)
+def test_decode_kv_split_follows_lengths(device, q_len, glen):
+    """Skewed lengths: KV units are split by length."""
+    case = _build_case(len(glen), q_len, 16, 1, 0, glen, device, seed=len(glen) + q_len)
+    o_lat, lse = _decode(case, 0, 1, device)
+    _check(case, o_lat, lse, 1, 0)
+
+
+@pytest.mark.gpu
 def test_decode_causal_window_is_end_aligned(device):
     """Position t must see exactly S - q_len + t + 1 tokens, not the whole sequence.
 
