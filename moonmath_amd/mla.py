@@ -26,6 +26,7 @@ from ._arch import gfx942_op
 __all__ = [
     "mla_decode_a16w8",
     "mla_dcp_lse_merge_ranks",
+    "dsv4_sparse_decode",
 ]
 
 
@@ -90,3 +91,38 @@ def mla_dcp_lse_merge_ranks(
     lse_out:  [T, HL] fp32 or None — the merged base-2 log-sum-exp.
     """
     gfx942_op("mla_dcp_lse_merge_ranks")(parts_in, lse_in, out, lse_out)
+
+
+def dsv4_sparse_decode(
+    q: torch.Tensor,
+    pool_main: torch.Tensor,
+    page_tokens_main: int,
+    pool_extra: torch.Tensor,
+    page_tokens_extra: int,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    attn_sink: torch.Tensor | None = None,
+) -> None:
+    """DeepSeek-V4 sparse attention decode, the MLA kernel's pipeline over V4's KV caches.
+
+    q:          [B, H, 512] bf16 — one decode row per request: 448 nope dims, then 64 rope.
+                out matches it and is written in place.
+    pool_main / pool_extra: the two paged caches, [pages, ...] of any byte-sized dtype. A page
+                holds page_tokens tokens as [page_tokens x 576 data bytes][page_tokens x 8 scale
+                bytes]; a token is 448 fp8 e4m3-fnuz values in seven 64-wide tiles, each scaled by
+                one E8M0 byte, then 64 bf16 rope values. Each row is both K and V.
+    kv_indices: int32 device — request b's slots at [kv_indptr[b], kv_indptr[b] + seq_lens[b]).
+                Bit 30 picks pool_extra; the low 30 bits are the token index in that cache.
+    kv_indptr:  [B+1] int32 device; seq_lens: [B] int32 device — live slots per request.
+    scale:      softmax scale.
+    attn_sink:  [H] fp32 or None — exp(sink[h]) joins head h's softmax denominator.
+
+    A request with no live slots comes out zero. Cuda-graph capturable.
+    """
+    gfx942_op("dsv4_sparse_decode")(
+        q, pool_main, int(page_tokens_main), pool_extra, int(page_tokens_extra), kv_indices,
+        kv_indptr, seq_lens, float(scale), attn_sink, out,
+    )

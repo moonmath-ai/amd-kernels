@@ -47,6 +47,9 @@ MODULES = {
             "mla_decode_a16w8.hip",      # a16w8 absorbed decode on a DENSE paged batch, any q_len, H 1..128,
                                          #   optional DCP: (position, head) rows in 16..96-row query tiles
                                          #   versus a 16-token KV tile, with a first-class base-2 LSE
+            # ── DeepSeek-V4 sparse attention decode (from the MLA kernel) ──
+            "dsv4_sparse_decode_api.cpp",  # exposes dsv4_sparse_decode
+            "dsv4_sparse_decode.hip",      # two paged E8M0-fp8 caches, CSR slot lists, attention sink
             # ── MXFP4 MoE GEMMs ──
             "mxfp4_moe_api.cpp",         # exposes mxfp4_moe_gateup / _down and their planners
             "mxfp4_moe_gateup.hip",      # gate/up projection, 16/32/48 tiles, EPI_NONE or SituGLU

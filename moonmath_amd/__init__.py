@@ -13,6 +13,7 @@ Every op dispatches on the live GPU's architecture; see moonmath_amd._arch.
 from ._kernel import VarlenPlan, forward, forward_lite, forward_paged, forward_varlen
 from .lite import LiteAttention
 from .mla import (
+    dsv4_sparse_decode,
     mla_dcp_lse_merge_ranks,
     mla_decode_a16w8,
 )
@@ -33,7 +34,7 @@ from .moe import (
 
 __all__ = [
     "forward", "forward_lite", "forward_varlen", "forward_paged", "VarlenPlan", "LiteAttention",
-    "mla_decode_a16w8", "mla_dcp_lse_merge_ranks",
+    "mla_decode_a16w8", "mla_dcp_lse_merge_ranks", "dsv4_sparse_decode",
     "repack_mxfp4", "repack_mxfp4_scales",
     "mxfp4_moe_gateup", "mxfp4_moe_down",
     "mxfp4_moe_gateup_block_m", "mxfp4_moe_gateup_supports_k",

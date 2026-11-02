@@ -438,6 +438,7 @@ namespace moonmath_mla_a16w8 { void register_pybind(pybind11::module_& m); }
 
 // MXFP4 MoE GEMM op registration — defined in mxfp4_moe_api.cpp
 namespace moonmath_mxfp4_moe { void register_pybind(pybind11::module_& m); }
+namespace moonmath_dsv4_sparse_decode { void register_pybind(pybind11::module_& m); }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "moonmath_amd: ROCm CDNA3 (MI300X) attention and MXFP4 MoE kernels";
@@ -471,4 +472,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   moonmath_mla_a16w8::register_pybind(m);   // a16w8 absorbed decode (bf16 Q + fp8 KV), any q_len, H <= 128, optional DCP
   moonmath_mxfp4_moe::register_pybind(m);   // MXFP4 MoE gate/up + down GEMMs
+  moonmath_dsv4_sparse_decode::register_pybind(m);   // DeepSeek-V4 sparse attention decode
 }
