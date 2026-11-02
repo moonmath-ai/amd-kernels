@@ -27,6 +27,7 @@ __all__ = [
     "mla_decode_a16w8",
     "mla_dcp_lse_merge_ranks",
     "dsv4_sparse_decode",
+    "dsv4_fp4_indexer_logits",
 ]
 
 
@@ -126,3 +127,19 @@ def dsv4_sparse_decode(
         q, pool_main, int(page_tokens_main), pool_extra, int(page_tokens_extra), kv_indices,
         kv_indptr, seq_lens, float(scale), attn_sink, out,
     )
+
+
+def dsv4_fp4_indexer_logits(q, q_scale, k_payload, k_scale, weights, page_table, lens, out,
+                            weight_scale: float, rows: int = 4) -> None:
+    """DeepSeek-V4 FP4 indexer logits, in place:
+    out[r, j] = weight_scale * sum_h weights[r, h] * relu(q[r, h] . k[page_table[r, j // 64], j % 64])
+    for j < lens[r]; entries past a row's length are left unwritten.
+
+    q:          [T, H, 64] E2M1 byte pairs (H 32 or 64), any byte dtype.
+    q_scale:    [T, 4, 16, qs_pad] E8M0, aiter's shuffled layout (head m*16 + i at [., i, m]).
+    k_payload / k_scale: the paged index-K cache, [pages, 1, 4, 64, 16] / [pages, 1, 4, 64].
+    weights:    [T, H] bf16; page_table: [T, width] int32; lens: [T] int32; out: fp32 [T, >= width*64].
+    rows:       query rows per workgroup (4 or 8); rows of one request share each K page.
+    """
+    gfx942_op("dsv4_fp4_indexer_logits")(q, q_scale, k_payload, k_scale, weights, page_table, lens,
+                                         out, float(weight_scale), int(rows))
