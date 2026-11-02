@@ -12,7 +12,8 @@
 //
 // The pipeline, split and merge are the MLA kernel's: 8 waves, NT contract query tiles of 16
 // rows against 16-token KV tiles, the rest stage KV HBM -> LDS; split-K partials rebased by the
-// merge kernel. Domain: H 1..128, B * slices <= 304 CTAs.
+// merge kernel. Domain: H 1..128, any B: past 304 CTAs each request runs as one part, which
+// serves prefill, one query token per request.
 #include <hip/hip_runtime.h>
 
 namespace {
@@ -233,8 +234,12 @@ struct KvSplit {
     return min(n, t);
   }
 
+  // One part per request (prefill-sized B): a unit is its request, no scan.
+  __device__ __forceinline__ bool one_part() const { return units_total == B; }
+
   // First unit of `req` in its slice.
   __device__ __forceinline__ int first_unit(int req) const {
+    if (one_part()) return req;
     int acc = 0;
     for (int i = (int)__lane_id(); i < req; i += WaveSize) acc += units(i);
     return __builtin_amdgcn_readfirstlane(wave_all_reduce(acc, [](int x, int y) { return x + y; }));
@@ -242,6 +247,11 @@ struct KvSplit {
 
   // Request owning `unit` (B if unused), with its first unit and unit count.
   __device__ __forceinline__ int owner(int unit, int& first, int& count) const {
+    if (one_part()) {
+      first = unit;
+      count = 1;
+      return unit < B ? unit : B;
+    }
     const int l = (int)__lane_id();
     first = count = 0;
     for (int base = 0; base < B; base += WaveSize) {
@@ -265,6 +275,7 @@ struct KvSplit {
 };
 
 __device__ __forceinline__ KvSplit make_kv_split(const int* seq_lens, int B, int nparts) {
+  if (nparts == 1) return KvSplit{seq_lens, B, B, 0};   // every request is one unit
   int spare = 0;
   for (int i = (int)__lane_id(); i < B; i += WaveSize) spare += split_tiles(seq_lens[i]) - 1;
   spare = wave_all_reduce(spare, [](int x, int y) { return x + y; });
@@ -802,8 +813,7 @@ __host__ inline int pick_tile(int q_len, int H, int B, int kv_len) {
 
   for (int nt = 1; nt <= MaxNTiles; ++nt) {
     const int slices = slices_of(q_len, H, nt * MfmaTile);
-    if ((long long)B * slices > NumCU) continue;
-
+    // Past one CTA per CU, parts_for is 1 and the one-part split serves any B.
     const float tiles = kv / (float)(TileTokens * parts_for(B, slices));
     const float cost = tiles * (16.0f * busiest_simd(nt) + StepOverhead) + CtaOverhead * nt;
     if (!best || cost < best_cost) {
@@ -855,7 +865,6 @@ extern "C" __host__ size_t dsv4_sparse_decode_workspace_for(int B, int H) {
   size_t worst = 0;
   for (int nt = 1; nt <= MaxNTiles; ++nt) {
     const int rows = nt * MfmaTile, slices = slices_of(1, h, rows);
-    if ((long long)b * slices > NumCU) continue;           // never picked, never needs room
     const size_t n_ctas = (size_t)b * slices * parts_for(b, slices);
     const size_t need = (slab_floats(n_ctas, rows) + (size_t)rows * 2 * n_ctas) * sizeof(float);
     worst = need > worst ? need : worst;
