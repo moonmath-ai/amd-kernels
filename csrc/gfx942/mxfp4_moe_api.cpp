@@ -34,7 +34,7 @@ void moe_gateup_launch(
     long stride_be, long stride_bkg, long stride_bn,
     long stride_se, long stride_skg, long stride_sn,
     long stride_cm, long stride_cn,
-    int mul_routed_weight, float situ_beta, float situ_linear_beta, void* stream);
+    int mul_routed_weight, float situ_beta, float situ_linear_beta, int k_splits, void* stream);
 
 int  moe_down_block_m(int num_valid_tokens, int num_active_experts, int K);
 int  moe_down_nt(int num_valid_tokens, int num_active_experts);
@@ -102,7 +102,7 @@ void gateup_op(const at::Tensor& A, const at::Tensor& B, const at::Tensor& Bs, a
                const at::Tensor& num_tokens_post_padded,
                int64_t num_m_blocks, int64_t block_m, int64_t num_valid_tokens, int64_t top_k,
                int64_t epilogue, bool mul_routed_weight,
-               double situ_beta, double situ_linear_beta) {
+               double situ_beta, double situ_linear_beta, int64_t k_splits) {
   check_common(A, B, Bs, C, sorted_token_ids, expert_ids, num_tokens_post_padded,
                "mxfp4_moe_gateup");
   if (epilogue != 0 && epilogue != 1)
@@ -124,6 +124,14 @@ void gateup_op(const at::Tensor& A, const at::Tensor& B, const at::Tensor& Bs, a
                                 std::to_string(want_n) + " for this epilogue; got " +
                                 std::to_string(B.size(2)));
 
+  //  Split-K partials stack along C's rows: split z owns rows [z*num_valid_tokens, ...).
+  if (k_splits < 1 || (K / 128) % (2 * k_splits) != 0)
+    throw std::invalid_argument("mxfp4_moe_gateup: k_splits must divide K/128 into even slab runs");
+  if (k_splits > 1 && epilogue != 0)
+    throw std::invalid_argument("mxfp4_moe_gateup: k_splits > 1 needs epilogue 0 (partials are summed later)");
+  if (C.size(0) < k_splits * num_valid_tokens)
+    throw std::invalid_argument("mxfp4_moe_gateup: C needs k_splits * num_valid_tokens rows");
+
   const c10::cuda::CUDAGuard g(A.device());
   const auto stream = (void*)at::cuda::getCurrentCUDAStream(A.device().index()).stream();
   moe_gateup_launch(
@@ -135,7 +143,7 @@ void gateup_op(const at::Tensor& A, const at::Tensor& B, const at::Tensor& Bs, a
       B.stride(0), B.stride(1), B.stride(2),
       Bs.stride(0), Bs.stride(1), Bs.stride(2),
       C.stride(0), C.stride(1),
-      mul_routed_weight ? 1 : 0, (float)situ_beta, (float)situ_linear_beta, stream);
+      mul_routed_weight ? 1 : 0, (float)situ_beta, (float)situ_linear_beta, (int)k_splits, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +226,7 @@ void register_pybind(pybind11::module_& m) {
         py::arg("num_tokens_post_padded"), py::arg("num_m_blocks"), py::arg("block_m"),
         py::arg("num_valid_tokens"), py::arg("top_k"), py::arg("epilogue") = 0,
         py::arg("mul_routed_weight") = false, py::arg("situ_beta") = 1.0,
-        py::arg("situ_linear_beta") = 1.0);
+        py::arg("situ_linear_beta") = 1.0, py::arg("k_splits") = 1);
 
   m.def("mxfp4_moe_down", &down_op,
         "CDNA3 MXFP4 MoE down-projection GEMM. One workgroup stages its whole A tile in LDS and "

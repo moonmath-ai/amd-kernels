@@ -199,7 +199,8 @@ def mxfp4_moe_gateup(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torc
                      expert_ids: torch.Tensor, num_tokens_post_padded: torch.Tensor,
                      num_m_blocks: int, block_m: int, num_valid_tokens: int, top_k: int,
                      epilogue: int = EPI_NONE, mul_routed_weight: bool = False,
-                     situ_beta: float = 1.0, situ_linear_beta: float = 1.0) -> None:
+                     situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+                     k_splits: int = 1) -> None:
     """Gate/up projection, writing into ``C`` in place.
 
     ``A`` is ``[rows, K]`` bf16, ``C`` is ``[rows, N]`` bf16.  With
@@ -211,10 +212,17 @@ def mxfp4_moe_gateup(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torc
     ``num_tokens_post_padded`` is read on the device by every workgroup, so it
     must be the live int32 device tensor the alignment produced, not a host
     scalar.
+
+    ``k_splits > 1`` (EPI_NONE only) splits K across workgroups for small M,
+    where one expert's column tiles alone leave most CUs idle. ``C`` is then
+    ``[k_splits * rows, N]``: split ``z`` writes its partial sum to rows
+    ``[z * rows, (z + 1) * rows)``, and the caller adds them. ``K / 128`` must
+    divide into ``k_splits`` even runs.
     """
     gfx942_op("mxfp4_moe_gateup")(A, B, Bs, C, topk_weights, sorted_token_ids, expert_ids,
                                   num_tokens_post_padded, num_m_blocks, block_m, num_valid_tokens,
-                                  top_k, epilogue, mul_routed_weight, situ_beta, situ_linear_beta)
+                                  top_k, epilogue, mul_routed_weight, situ_beta, situ_linear_beta,
+                                  k_splits)
 
 
 def mxfp4_moe_down(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.Tensor,

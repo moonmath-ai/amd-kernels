@@ -114,7 +114,7 @@ __global__ __launch_bounds__(NTHR, 2) void kernel(
     long stride_be, long stride_bkg, long stride_bn,
     long stride_se, long stride_skg, long stride_sn,
     long stride_cm, long stride_cn,
-    int mul_routed_weight, float situ_beta, float situ_linear_beta)
+    int mul_routed_weight, float situ_beta, float situ_linear_beta, int k_splits)
 {
     //  The 16-row tile issues its A granule a body early; see slab_body.
     constexpr bool A_EARLY = (BM <= 16);
@@ -230,7 +230,8 @@ __global__ __launch_bounds__(NTHR, 2) void kernel(
 
     const long a_bytes = (long)((num_valid_tokens - 1) / top_k + 1) * stride_am * 2;
     const auto a_rsrc  = make_buffer(A, records(a_bytes));
-    const auto c_rsrc  = make_buffer(C, c_records);
+    //  Split-K: workgroup z writes its own partial of C, num_valid_tokens rows further on.
+    const auto c_rsrc  = make_buffer(C + (long)blockIdx.z * num_valid_tokens * stride_cm, c_records);
 
     // -- B addressing -------------------------------------------------------
     //  One granule per lane per slab per column tile: column (n_base + col),
@@ -247,7 +248,10 @@ __global__ __launch_bounds__(NTHR, 2) void kernel(
     const u32  b_voff = (u32)(n_col * stride_bn + (long)k_quarter * stride_bkg);
     const u32  s_voff = (u32)(n_col * stride_sn + (long)k_quarter * stride_skg);
 
-    const int nslabs = K / BK;
+    //  Split-K: z walks its own run of K / BK / k_splits slabs, an even count (see the
+    //  rungs below), from slab z * nslabs.
+    const int nslabs = K / BK / k_splits;
+    const int slab0  = (int)blockIdx.z * nslabs;
 
     // -- accumulators -------------------------------------------------------
     f32x4 acc[NT][ROW_TILES];
@@ -270,10 +274,10 @@ __global__ __launch_bounds__(NTHR, 2) void kernel(
     //  a 64-bit multiply on the load's own chain. Nothing clamps them at the
     //  end of K: the last two bodies prefetch past it to keep the rungs
     //  constant, and each SRD covers only this expert, so it reads zero.
-    u32 a_cursor = 0, b_cursor = 0, s_cursor = 0;
     constexpr int ASTEP = BK * 2;
     const u32 b_kstep = (u32)((BK / 32) * stride_bkg);
     const u32 s_kstep = (u32)((BK / 32) * stride_skg);
+    u32 a_cursor = (u32)slab0 * ASTEP, b_cursor = (u32)slab0 * b_kstep, s_cursor = (u32)slab0 * s_kstep;
 
     auto issue_a = [&](int slot) {
 #pragma unroll
@@ -487,7 +491,7 @@ extern "C" void moe_gateup_launch(
     long stride_be, long stride_bkg, long stride_bn,
     long stride_se, long stride_skg, long stride_sn,
     long stride_cm, long stride_cn,
-    int mul_routed_weight, float situ_beta, float situ_linear_beta, void* stream)
+    int mul_routed_weight, float situ_beta, float situ_linear_beta, int k_splits, void* stream)
 {
     using namespace gateup;
 
@@ -519,7 +523,7 @@ extern "C" void moe_gateup_launch(
             if (columns_covered(c) == columns_covered(NT_NARROW)) { nt_pick = c; break; }
 
     const int  BNs = waves_per_proj * nt_pick * 16;
-    const dim3 grid((N + BNs - 1) / BNs, num_m_blocks);
+    const dim3 grid((N + BNs - 1) / BNs, num_m_blocks, k_splits);
     auto st = static_cast<hipStream_t>(stream);
 
     auto go = [&](auto epi, auto bm, auto nt) {
@@ -532,7 +536,7 @@ extern "C" void moe_gateup_launch(
                 (const bf16*)topk_weights, (const int*)sorted_token_ids, (const int*)expert_ids,
                 (const int*)num_tokens_post_padded, N, K, num_valid_tokens, top_k, stride_am,
                 stride_be, stride_bkg, stride_bn, stride_se, stride_skg, stride_sn,
-                stride_cm, stride_cn, mul_routed_weight, situ_beta, situ_linear_beta);
+                stride_cm, stride_cn, mul_routed_weight, situ_beta, situ_linear_beta, k_splits);
         }
     };
 
